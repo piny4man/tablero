@@ -71,9 +71,18 @@ pub fn snapshot_from_json(
 /// Pure mapping, so the translation is unit-testable without a compositor. The
 /// wildcard arm keeps a forward-compatible [`Command`] (it is `#[non_exhaustive]`)
 /// from breaking the build — an unknown command is simply ignored.
+///
+/// The request targets Hyprland 0.55+'s Lua-config IPC: a `dispatch <expr>`
+/// request is evaluated as `return hl.dispatch(<expr>)`, where `<expr>` must be a
+/// dispatcher object built from the `hl.dsp.*` namespace. Workspace switching
+/// uses `hl.dsp.focus({ workspace = N })` — the same dispatcher Hyprland's own
+/// keybindings invoke. The legacy `dispatch workspace N` string form no longer
+/// parses under the Lua config (it becomes invalid Lua).
 pub fn dispatch_request(command: &Command) -> Option<String> {
     match command {
-        Command::SwitchWorkspace(id) => Some(format!("dispatch workspace {id}")),
+        Command::SwitchWorkspace(id) => {
+            Some(format!("dispatch hl.dsp.focus({{ workspace = {id} }})"))
+        }
         _ => None,
     }
 }
@@ -291,9 +300,12 @@ mod tests {
 
     #[test]
     fn switch_workspace_maps_to_a_dispatch_request() {
+        // Hyprland 0.55+ evaluates `dispatch <expr>` as `return hl.dispatch(<expr>)`,
+        // so the payload must be the `hl.dsp.focus` dispatcher object, not the
+        // legacy `workspace N` string form.
         assert_eq!(
             dispatch_request(&Command::SwitchWorkspace(4)).as_deref(),
-            Some("dispatch workspace 4")
+            Some("dispatch hl.dsp.focus({ workspace = 4 })")
         );
     }
 }
