@@ -28,8 +28,9 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use tablero_core::blit::write_argb8888;
-use tablero_core::clock::{format_clock, millis_until_next_second};
-use tablero_core::render::render_text;
+use tablero_core::clock::millis_until_next_second;
+use tablero_core::render::{Bounds, RenderContext};
+use tablero_core::widget::{ClockWidget, Dashboard, Msg};
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -69,6 +70,10 @@ struct Bar {
     layer: LayerSurface,
     width: u32,
     height: u32,
+    /// Widgets composing the bar, plus the dirty-flag redraw policy over them.
+    dashboard: Dashboard,
+    /// Reused software-render target (font machinery + pixmap).
+    ctx: RenderContext,
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
@@ -76,7 +81,18 @@ struct Bar {
 }
 
 impl Bar {
-    /// Render the current clock and commit it through the shared-memory buffer.
+    /// Apply a message to the dashboard; redraw only if a widget reported a
+    /// visible change. This is the steady-state redraw policy: the loop stays
+    /// idle when an update changes nothing on screen.
+    fn handle(&mut self, msg: &Msg) {
+        if self.dashboard.update(msg) {
+            self.draw();
+        }
+    }
+
+    /// Render the current dashboard state and commit it through the
+    /// shared-memory buffer. Called on a visible change or when the Wayland
+    /// lifecycle (first configure, resize) requires a fresh frame regardless.
     fn draw(&mut self) {
         if !self.configured {
             return;
@@ -99,9 +115,10 @@ impl Bar {
             }
         };
 
-        let text = format_clock();
-        let rgba = render_text(&text, width, height);
-        write_argb8888(&rgba, canvas);
+        self.ctx.resize(width, height);
+        self.dashboard.layout(width, height);
+        self.dashboard.draw(&mut self.ctx);
+        write_argb8888(self.ctx.pixels(), canvas);
 
         let surface = self.layer.wl_surface();
         surface.damage_buffer(0, 0, width as i32, height as i32);
@@ -142,6 +159,10 @@ pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
 
     let pool = SlotPool::new((INITIAL_WIDTH * config.height * 4) as usize, &shm)?;
 
+    let clock = ClockWidget::new(Bounds::new(0, 0, INITIAL_WIDTH, config.height));
+    let dashboard = Dashboard::new(vec![Box::new(clock)]);
+    let ctx = RenderContext::new(INITIAL_WIDTH, config.height);
+
     let mut bar = Bar {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -150,6 +171,8 @@ pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
         layer,
         width: INITIAL_WIDTH,
         height: config.height,
+        dashboard,
+        ctx,
         configured: false,
         exit: false,
     };
@@ -163,7 +186,7 @@ pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
     // A timer aligned to the wall-clock second wakes the loop for each tick.
     let timer = Timer::from_duration(Duration::from_millis(millis_until_next_second()));
     handle.insert_source(timer, |_deadline, _, bar| {
-        bar.draw();
+        bar.handle(&Msg::tick_now());
         TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_second()))
     })?;
 
@@ -286,6 +309,9 @@ impl LayerShellHandler for Bar {
         let first = !self.configured;
         self.configured = true;
         if first {
+            // Lifecycle-forced frame: seed the clock so the bar shows the time
+            // immediately, then draw regardless of the dirty flag.
+            self.dashboard.update(&Msg::tick_now());
             self.draw();
         }
     }

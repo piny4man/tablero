@@ -1,8 +1,16 @@
-use chrono::Local;
+use chrono::{DateTime, Local};
+
+/// Format a local timestamp as "HH:MM:SS".
+///
+/// Pure over its input so widget update logic can be tested deterministically
+/// without reaching for the wall clock.
+pub fn format_time(now: DateTime<Local>) -> String {
+    now.format("%H:%M:%S").to_string()
+}
 
 /// Format the current local time as "HH:MM:SS".
 pub fn format_clock() -> String {
-    Local::now().format("%H:%M:%S").to_string()
+    format_time(Local::now())
 }
 
 /// Milliseconds until the next whole wall-clock second.
@@ -23,6 +31,13 @@ fn millis_to_next_second(subsec_millis: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn format_time_is_zero_padded_hh_mm_ss() {
+        let dt = Local.with_ymd_and_hms(2026, 6, 27, 9, 5, 3).unwrap();
+        assert_eq!(format_time(dt), "09:05:03");
+    }
 
     #[test]
     fn format_clock_returns_hh_mm_ss() {
