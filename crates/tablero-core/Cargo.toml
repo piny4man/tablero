@@ -1,0 +1,9 @@
+[package]
+name = "tablero-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cosmic-text = { version = "0.19", default-features = false, features = ["swash", "std"] }
+tiny-skia = "0.11"
