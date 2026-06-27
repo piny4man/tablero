@@ -5,10 +5,13 @@
 //! redraws from a [`calloop`] timer so the loop only wakes for clock ticks,
 //! compositor events (configure), or shutdown — never a busy redraw loop.
 
+pub mod producer;
+
 use std::error::Error;
 use std::time::Duration;
 
 use calloop::EventLoop;
+use calloop::channel::Event as ChannelEvent;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
 use log::{error, info};
@@ -31,6 +34,8 @@ use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_second;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::widget::{ClockWidget, Dashboard, Msg};
+
+use crate::producer::{Producer, ProducerBridge};
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -131,7 +136,25 @@ impl Bar {
 }
 
 /// Open the bar and run its event loop until the compositor closes the surface.
+///
+/// Equivalent to [`run_with_producers`] with no async producers — the bar is
+/// driven solely by its synchronous clock timer and compositor events.
 pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
+    run_with_producers(config, Vec::new())
+}
+
+/// Open the bar and run its event loop, additionally driving `producers` on an
+/// off-thread Tokio runtime.
+///
+/// The render loop stays fully synchronous: it owns the dashboard, rendering,
+/// and Wayland commits. Each producer runs on the [`ProducerBridge`] runtime and
+/// reaches the loop only by sending [`Msg`]s through a calloop channel, which is
+/// dispatched into [`Bar::handle`] exactly like the clock timer. With an empty
+/// `producers` list no runtime is started at all.
+pub fn run_with_producers(
+    config: SurfaceConfig,
+    producers: Vec<Box<dyn Producer>>,
+) -> Result<(), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn)?;
     let qh = event_queue.handle();
@@ -189,6 +212,28 @@ pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
         bar.handle(&Msg::tick_now());
         TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_second()))
     })?;
+
+    // Bring up the async producer bridge only when there is async work to do.
+    // The bridge owns the Tokio runtime and must outlive the loop, so it is held
+    // in `_bridge` until the function returns.
+    let _bridge = if producers.is_empty() {
+        None
+    } else {
+        let (bridge, channel) = ProducerBridge::new()?;
+        handle.insert_source(channel, |event, _, bar| {
+            // Producer messages cross the channel into the same synchronous
+            // app-state update path the clock timer uses.
+            if let ChannelEvent::Msg(msg) = event {
+                bar.handle(&msg);
+            }
+        })?;
+        let count = producers.len();
+        for producer in producers {
+            bridge.spawn(producer);
+        }
+        info!("producer bridge started with {count} producer(s)");
+        Some(bridge)
+    };
 
     info!(
         "tablero bar started: {}px tall, exclusive_zone={}",
