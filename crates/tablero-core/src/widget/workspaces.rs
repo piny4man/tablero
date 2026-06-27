@@ -7,7 +7,14 @@
 
 use crate::render::{Bounds, FG, RenderContext};
 
-use super::{Msg, Widget};
+use super::{Command, Msg, Widget};
+
+/// Width, in pixels, of each workspace item's clickable/rendered cell.
+///
+/// Items are packed left-to-right from the widget's origin, each in a cell this
+/// wide. Only these cells are interactive; the rest of the widget's slot is
+/// empty space that ignores clicks.
+const ITEM_WIDTH: u32 = 36;
 
 /// A normalized snapshot of the Hyprland workspace set.
 ///
@@ -92,6 +99,34 @@ impl WorkspaceWidget {
             .map(Workspaces::label)
             .unwrap_or_default()
     }
+
+    /// The per-item cells: each `(id, bounds)` pair is one workspace's slot.
+    ///
+    /// Items are laid out left-to-right from the widget origin in [`ITEM_WIDTH`]
+    /// cells, clipped to the widget's slot. Both [`draw`](Widget::draw) and
+    /// [`on_click`](Widget::on_click) read this, so what is painted and what is
+    /// clickable are the same regions by construction.
+    fn item_cells(&self) -> Vec<(i32, Bounds)> {
+        let Some(state) = &self.state else {
+            return Vec::new();
+        };
+        if self.bounds.width == 0 || self.bounds.height == 0 {
+            return Vec::new();
+        }
+
+        let right = self.bounds.x + self.bounds.width;
+        let mut cells = Vec::new();
+        for (i, &id) in state.ids().iter().enumerate() {
+            let x = self.bounds.x + ITEM_WIDTH * i as u32;
+            if x >= right {
+                // Ran out of room in the widget's slot; stop placing items.
+                break;
+            }
+            let width = ITEM_WIDTH.min(right - x);
+            cells.push((id, Bounds::new(x, self.bounds.y, width, self.bounds.height)));
+        }
+        cells
+    }
 }
 
 impl Widget for WorkspaceWidget {
@@ -109,7 +144,16 @@ impl Widget for WorkspaceWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        ctx.draw_text(&self.label(), self.bounds, FG);
+        let active = self.state.as_ref().map(Workspaces::active);
+        for (id, cell) in self.item_cells() {
+            // The active workspace is bracketed to set it apart from the rest.
+            let text = if Some(id) == active {
+                format!("[{id}]")
+            } else {
+                id.to_string()
+            };
+            ctx.draw_text(&text, cell, FG);
+        }
     }
 
     fn bounds(&self) -> Bounds {
@@ -118,6 +162,13 @@ impl Widget for WorkspaceWidget {
 
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
+    }
+
+    fn on_click(&self, px: u32, py: u32) -> Option<Command> {
+        self.item_cells()
+            .into_iter()
+            .find(|(_, cell)| cell.contains(px, py))
+            .map(|(id, _)| Command::SwitchWorkspace(id))
     }
 }
 
@@ -189,5 +240,52 @@ mod tests {
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1));
         widget.set_bounds(Bounds::new(10, 0, 200, 32));
         assert_eq!(widget.bounds(), Bounds::new(10, 0, 200, 32));
+    }
+
+    #[test]
+    fn click_on_an_item_switches_to_that_workspace() {
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
+        widget.update(&ws([1, 2, 3], 1));
+        // Items are 36px-wide cells packed from the origin: 1 -> [0,36),
+        // 2 -> [36,72), 3 -> [72,108).
+        assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(1)));
+        assert_eq!(widget.on_click(50, 16), Some(Command::SwitchWorkspace(2)));
+        assert_eq!(widget.on_click(80, 31), Some(Command::SwitchWorkspace(3)));
+    }
+
+    #[test]
+    fn click_on_empty_space_past_the_items_is_ignored() {
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
+        widget.update(&ws([1, 2, 3], 1));
+        // Past the third item's cell (ends at 108) there is only empty slot.
+        assert_eq!(widget.on_click(200, 16), None);
+    }
+
+    #[test]
+    fn click_before_the_first_snapshot_is_ignored() {
+        let widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.on_click(0, 0), None);
+    }
+
+    #[test]
+    fn click_respects_the_widget_offset() {
+        let mut widget = WorkspaceWidget::new(Bounds::new(100, 0, 220, 32));
+        widget.update(&ws([1, 2], 1));
+        // Cells start at the widget origin: 1 -> [100,136), 2 -> [136,172).
+        assert_eq!(widget.on_click(90, 0), None);
+        assert_eq!(widget.on_click(110, 0), Some(Command::SwitchWorkspace(1)));
+        assert_eq!(widget.on_click(150, 0), Some(Command::SwitchWorkspace(2)));
+    }
+
+    #[test]
+    fn items_are_clipped_to_the_widget_slot() {
+        // A slot only wide enough for one-and-a-bit cells drops the overflow.
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 40, 32));
+        widget.update(&ws([1, 2, 3], 1));
+        assert_eq!(widget.on_click(10, 0), Some(Command::SwitchWorkspace(1)));
+        // Second item would start at x=36, within the 40px slot, clipped to 4px.
+        assert_eq!(widget.on_click(38, 0), Some(Command::SwitchWorkspace(2)));
+        // Third item would start at x=72, past the slot: never placed.
+        assert_eq!(widget.on_click(39, 0), Some(Command::SwitchWorkspace(2)));
     }
 }

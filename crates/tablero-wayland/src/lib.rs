@@ -5,6 +5,7 @@
 //! redraws from a [`calloop`] timer so the loop only wakes for clock ticks,
 //! compositor events (configure), or shutdown — never a busy redraw loop.
 
+pub mod command;
 pub mod hyprland;
 pub mod producer;
 
@@ -15,13 +16,18 @@ use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
-use log::{error, info};
+use log::{error, info, warn};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -36,12 +42,13 @@ use tablero_core::clock::millis_until_next_second;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::widget::{ClockWidget, Dashboard, Msg, WorkspaceWidget};
 
+use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
 use crate::producer::{Producer, ProducerBridge};
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 /// Configuration for the layer-shell bar surface.
@@ -72,6 +79,7 @@ const INITIAL_WIDTH: u32 = 1920;
 struct Bar {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
@@ -81,6 +89,11 @@ struct Bar {
     dashboard: Dashboard,
     /// Reused software-render target (font machinery + pixmap).
     ctx: RenderContext,
+    /// The seat's pointer, created once the seat advertises the capability.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Outbound command channel into the producer runtime, present only when the
+    /// bridge is running. Clicks are dropped when this is `None`.
+    commands: Option<CommandSender>,
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
@@ -94,6 +107,26 @@ impl Bar {
     fn handle(&mut self, msg: &Msg) {
         if self.dashboard.update(msg) {
             self.draw();
+        }
+    }
+
+    /// Route a left-button press at surface coordinates `(x, y)` to the
+    /// dashboard, dispatching any resulting [`Command`](tablero_core::widget::Command)
+    /// into the producer runtime. Clicks that hit no interactive region — empty
+    /// space, display-only widgets, or off-surface negative coordinates — are
+    /// ignored. With no command channel (no producer bridge) clicks are dropped.
+    fn on_click(&mut self, x: f64, y: f64) {
+        if x < 0.0 || y < 0.0 {
+            return;
+        }
+        // Floor to whole pixels for the widgets' half-open hit-test.
+        let Some(command) = self.dashboard.on_click(x as u32, y as u32) else {
+            return;
+        };
+        if let Some(commands) = &self.commands
+            && commands.send(command).is_err()
+        {
+            warn!("command channel closed; dropping click command");
         }
     }
 
@@ -197,6 +230,7 @@ pub fn run_with_producers(
     let mut bar = Bar {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
         shm,
         pool,
         layer,
@@ -204,6 +238,8 @@ pub fn run_with_producers(
         height: config.height,
         dashboard,
         ctx,
+        pointer: None,
+        commands: None,
         configured: false,
         exit: false,
     };
@@ -239,6 +275,11 @@ pub fn run_with_producers(
         for producer in producers {
             bridge.spawn(producer);
         }
+        // The reverse path: clicks become commands the executor runs against the
+        // compositor. The loop holds the sender; the executor drains the rest.
+        let (command_tx, command_rx) = command_channel();
+        bridge.spawn_task("hyprland-commands", hyprland::run_commands(command_rx));
+        bar.commands = Some(command_tx);
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
@@ -376,15 +417,82 @@ impl ShmHandler for Bar {
     }
 }
 
+impl SeatHandler for Bar {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        // Bind the pointer once, when the seat first advertises one. The bar is
+        // pointer-only; keyboard and touch capabilities are ignored.
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(e) => error!("failed to create pointer: {e}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.pointer = None;
+        }
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    }
+}
+
+impl PointerHandler for Bar {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        // Compare against an owned handle so the click dispatch can borrow
+        // `self` mutably inside the loop.
+        let surface = self.layer.wl_surface().clone();
+        for event in events {
+            if event.surface != surface {
+                continue;
+            }
+            if let PointerEventKind::Press { button, .. } = event.kind
+                && button == BTN_LEFT
+            {
+                let (x, y) = event.position;
+                self.on_click(x, y);
+            }
+        }
+    }
+}
+
 impl ProvidesRegistryState for Bar {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_compositor!(Bar);
 delegate_output!(Bar);
 delegate_shm!(Bar);
 delegate_layer!(Bar);
+delegate_seat!(Bar);
+delegate_pointer!(Bar);
 delegate_registry!(Bar);

@@ -23,8 +23,9 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use tablero_core::widget::{Msg, Workspaces};
+use tablero_core::widget::{Command, Msg, Workspaces};
 
+use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
 /// One element of the `j/workspaces` array; only the id is needed.
@@ -62,6 +63,40 @@ pub fn snapshot_from_json(
     let ids = parse_workspaces(workspaces_json)?;
     let active = parse_active(active_json)?;
     Ok(Workspaces::new(ids, active))
+}
+
+/// Translate a typed [`Command`] into the Hyprland `.socket.sock` request that
+/// carries it out, or `None` for a command this source does not handle.
+///
+/// Pure mapping, so the translation is unit-testable without a compositor. The
+/// wildcard arm keeps a forward-compatible [`Command`] (it is `#[non_exhaustive]`)
+/// from breaking the build — an unknown command is simply ignored.
+pub fn dispatch_request(command: &Command) -> Option<String> {
+    match command {
+        Command::SwitchWorkspace(id) => Some(format!("dispatch workspace {id}")),
+        _ => None,
+    }
+}
+
+/// Drain `commands` from the render loop and execute each over Hyprland IPC.
+///
+/// Runs on the producer bridge as the executor end of the
+/// [command channel](crate::command). Resolves the socket directory once, then
+/// dispatches each command to `.socket.sock`. A failed dispatch is logged and
+/// skipped — one bad command never ends the stream. Returns `Ok(())` when the
+/// render loop drops its [`CommandSender`](crate::command::CommandSender) and the
+/// channel closes.
+pub async fn run_commands(mut commands: CommandReceiver) -> ProducerResult {
+    let dir = resolve_socket_dir()?;
+    while let Some(command) = commands.recv().await {
+        let Some(request) = dispatch_request(&command) else {
+            continue;
+        };
+        if let Err(e) = query(&dir, &request).await {
+            warn!("hyprland: command {request:?} failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// The directory holding Hyprland's IPC sockets for `signature` under `base`.
@@ -252,5 +287,13 @@ mod tests {
         assert!(!is_workspace_event("activewindow>>class,title"));
         assert!(!is_workspace_event("openwindow>>0x55,2,class,title"));
         assert!(!is_workspace_event("submap>>resize"));
+    }
+
+    #[test]
+    fn switch_workspace_maps_to_a_dispatch_request() {
+        assert_eq!(
+            dispatch_request(&Command::SwitchWorkspace(4)).as_deref(),
+            Some("dispatch workspace 4")
+        );
     }
 }

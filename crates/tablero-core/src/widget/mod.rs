@@ -46,6 +46,21 @@ impl Msg {
     }
 }
 
+/// An outbound action a widget requests in response to input.
+///
+/// Where [`Msg`] flows *in* (data sources update widgets), a `Command` flows
+/// *out*: a widget turns a click into an intent, and the host loop hands it to
+/// whatever can execute it (for workspace switches, the Hyprland command
+/// socket). Keeping the intent typed and execution-free here means click
+/// handling stays a pure, testable decision. Marked `#[non_exhaustive]` for the
+/// same forward-compatibility reason as [`Msg`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Switch the compositor to the workspace with this id.
+    SwitchWorkspace(i32),
+}
+
 /// A drawable, message-driven component of the bar.
 ///
 /// The contract is deliberately small but complete for an event loop that only
@@ -71,6 +86,16 @@ pub trait Widget {
 
     /// Reposition the widget into a new layout slot.
     fn set_bounds(&mut self, bounds: Bounds);
+
+    /// Handle a click at surface pixel `(px, py)`.
+    ///
+    /// Returns a [`Command`] when the widget owns an interactive region at that
+    /// pixel, or `None` when it does not. The default is non-interactive, so a
+    /// widget opts into input only by overriding this — clicks on display-only
+    /// widgets (and on empty space) are ignored safely.
+    fn on_click(&self, _px: u32, _py: u32) -> Option<Command> {
+        None
+    }
 }
 
 /// The set of widgets composing the bar, plus the redraw policy over them.
@@ -135,6 +160,17 @@ impl Dashboard {
             widget.draw(ctx);
         }
     }
+
+    /// Route a click at surface pixel `(px, py)` to the widgets.
+    ///
+    /// Returns the [`Command`] of the first widget (in draw order) that claims
+    /// the pixel, or `None` if none do — clicks on empty space or display-only
+    /// widgets produce nothing.
+    pub fn on_click(&self, px: u32, py: u32) -> Option<Command> {
+        self.widgets
+            .iter()
+            .find_map(|widget| widget.on_click(px, py))
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +222,28 @@ mod tests {
         // so the two columns tile the full width without overlap or gaps.
         assert_eq!(dash.widgets[0].bounds(), Bounds::new(0, 0, 50, 32));
         assert_eq!(dash.widgets[1].bounds(), Bounds::new(50, 0, 51, 32));
+    }
+
+    #[test]
+    fn on_click_routes_to_the_interactive_widget() {
+        // A clock (display-only) beside a workspace widget: a click in the
+        // workspace column yields its command, a click in the clock column none.
+        let mut workspaces = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1));
+        workspaces.update(&Msg::Workspaces(Workspaces::new([1, 2], 1)));
+        let mut dash = Dashboard::new(vec![
+            Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1))),
+            Box::new(workspaces),
+        ]);
+        dash.layout(200, 32);
+        // Clock owns the left column [0,100); workspaces own [100,200).
+        assert_eq!(dash.on_click(10, 16), None);
+        assert_eq!(dash.on_click(110, 16), Some(Command::SwitchWorkspace(1)));
+    }
+
+    #[test]
+    fn on_click_on_empty_dashboard_is_none() {
+        let dash = Dashboard::new(vec![]);
+        assert_eq!(dash.on_click(0, 0), None);
     }
 
     #[test]

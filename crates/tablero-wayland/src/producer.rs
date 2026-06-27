@@ -181,6 +181,25 @@ impl ProducerBridge {
             }
         });
     }
+
+    /// Spawn a bare named future onto the runtime.
+    ///
+    /// Like [`spawn`](Self::spawn) but for a task that is not a [`Producer`] —
+    /// for example the command executor that drains the [command
+    /// channel](crate::command) and acts on the compositor. Errors are logged,
+    /// never propagated, with the same isolation guarantee as producers.
+    pub fn spawn_task<F>(&self, name: impl Into<String>, future: F)
+    where
+        F: Future<Output = ProducerResult> + Send + 'static,
+    {
+        let name = name.into();
+        self.runtime.spawn(async move {
+            match future.await {
+                Ok(()) => debug!("task {name} finished"),
+                Err(e) => error!("task {name} failed: {e}"),
+            }
+        });
+    }
 }
 
 #[cfg(test)]
