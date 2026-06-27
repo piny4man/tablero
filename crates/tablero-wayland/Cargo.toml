@@ -10,4 +10,6 @@ smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
 wayland-client = "0.31"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

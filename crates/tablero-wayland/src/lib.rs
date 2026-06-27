@@ -5,6 +5,7 @@
 //! redraws from a [`calloop`] timer so the loop only wakes for clock ticks,
 //! compositor events (configure), or shutdown — never a busy redraw loop.
 
+pub mod hyprland;
 pub mod producer;
 
 use std::error::Error;
@@ -33,8 +34,9 @@ use smithay_client_toolkit::{
 use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_second;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{ClockWidget, Dashboard, Msg};
+use tablero_core::widget::{ClockWidget, Dashboard, Msg, WorkspaceWidget};
 
+use crate::hyprland::HyprlandProducer;
 use crate::producer::{Producer, ProducerBridge};
 use wayland_client::{
     Connection, QueueHandle,
@@ -137,10 +139,12 @@ impl Bar {
 
 /// Open the bar and run its event loop until the compositor closes the surface.
 ///
-/// Equivalent to [`run_with_producers`] with no async producers — the bar is
-/// driven solely by its synchronous clock timer and compositor events.
+/// Wires the default producer set — currently the Hyprland workspace source — so
+/// the bar shows live workspaces alongside the clock. The clock itself is still
+/// driven by the synchronous tick timer; see [`run_with_producers`] to supply a
+/// custom producer set.
 pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
-    run_with_producers(config, Vec::new())
+    run_with_producers(config, vec![Box::new(HyprlandProducer::new())])
 }
 
 /// Open the bar and run its event loop, additionally driving `producers` on an
@@ -182,8 +186,12 @@ pub fn run_with_producers(
 
     let pool = SlotPool::new((INITIAL_WIDTH * config.height * 4) as usize, &shm)?;
 
-    let clock = ClockWidget::new(Bounds::new(0, 0, INITIAL_WIDTH, config.height));
-    let dashboard = Dashboard::new(vec![Box::new(clock)]);
+    // Workspaces on the left, clock on the right; `Dashboard::layout` tiles them
+    // into columns each frame, so these initial bounds are just placeholders.
+    let full = Bounds::new(0, 0, INITIAL_WIDTH, config.height);
+    let workspaces = WorkspaceWidget::new(full);
+    let clock = ClockWidget::new(full);
+    let dashboard = Dashboard::new(vec![Box::new(workspaces), Box::new(clock)]);
     let ctx = RenderContext::new(INITIAL_WIDTH, config.height);
 
     let mut bar = Bar {

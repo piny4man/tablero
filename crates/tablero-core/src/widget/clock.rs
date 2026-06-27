@@ -42,6 +42,7 @@ impl Widget for ClockWidget {
                 self.text = next;
                 true
             }
+            _ => false,
         }
     }
 

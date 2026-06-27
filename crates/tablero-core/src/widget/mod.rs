@@ -16,8 +16,10 @@ use chrono::{DateTime, Local};
 use crate::render::{Bounds, RenderContext};
 
 pub mod clock;
+pub mod workspaces;
 
 pub use clock::ClockWidget;
+pub use workspaces::{WorkspaceWidget, Workspaces};
 
 /// Every state update a widget can react to.
 ///
@@ -30,6 +32,8 @@ pub use clock::ClockWidget;
 pub enum Msg {
     /// The wall clock advanced; carries the current local time.
     Tick(DateTime<Local>),
+    /// The Hyprland workspace set or active workspace changed.
+    Workspaces(Workspaces),
 }
 
 impl Msg {
@@ -100,13 +104,27 @@ impl Dashboard {
 
     /// Assign layout slots for a `width * height` surface.
     ///
-    /// The v1 bar holds a single widget, so every widget is given the full
-    /// surface. This is the seam a real layout engine will replace; the widget
-    /// contract ([`Widget::set_bounds`]) already supports it.
+    /// Widgets are placed left-to-right in equal-width columns, in construction
+    /// order, so multiple widgets never overlap. A single widget therefore still
+    /// gets the full surface. This is the seam a content-aware layout engine
+    /// will replace; the widget contract ([`Widget::set_bounds`]) already
+    /// supports arbitrary slots.
     pub fn layout(&mut self, width: u32, height: u32) {
-        let full = Bounds::new(0, 0, width, height);
-        for widget in &mut self.widgets {
-            widget.set_bounds(full);
+        let count = self.widgets.len() as u32;
+        if count == 0 {
+            return;
+        }
+        let column = width / count;
+        for (i, widget) in self.widgets.iter_mut().enumerate() {
+            let x = column * i as u32;
+            // The last column absorbs any rounding remainder so the row spans
+            // the full width.
+            let w = if i as u32 == count - 1 {
+                width - x
+            } else {
+                column
+            };
+            widget.set_bounds(Bounds::new(x, 0, w, height));
         }
     }
 
@@ -155,6 +173,19 @@ mod tests {
         dash.update(&at(12, 0, 0));
         dash.draw(&mut ctx);
         assert_eq!(ctx.pixels().len(), 1920 * 32 * 4);
+    }
+
+    #[test]
+    fn layout_splits_the_surface_into_equal_columns() {
+        let mut dash = Dashboard::new(vec![
+            Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1))),
+            Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1))),
+        ]);
+        dash.layout(101, 32);
+        // First column is floor(101/2); the last absorbs the rounding remainder
+        // so the two columns tile the full width without overlap or gaps.
+        assert_eq!(dash.widgets[0].bounds(), Bounds::new(0, 0, 50, 32));
+        assert_eq!(dash.widgets[1].bounds(), Bounds::new(50, 0, 51, 32));
     }
 
     #[test]
