@@ -1,0 +1,12 @@
+[package]
+name = "tablero-wayland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tablero-core = { path = "../tablero-core" }
+log = "0.4"
+smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
+wayland-client = "0.31"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
