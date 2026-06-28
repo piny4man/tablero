@@ -412,13 +412,25 @@ async fn ensure_watcher(conn: &Connection) -> zbus::Result<()> {
         items: Arc::new(Mutex::new(HashSet::new())),
     };
     conn.object_server().at(WATCHER_PATH, watcher).await?;
-    match conn
+    let reply = conn
         .request_name_with_flags(WATCHER_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())
-        .await
-    {
-        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => Ok(()),
-        // Another watcher owns the name: defer to it.
-        Ok(_) => Ok(()),
+        .await;
+    interpret_watcher_name(reply)
+}
+
+/// Decide whether requesting the watcher name leaves us in a usable state.
+///
+/// Owning the name (primary or already-owner) means *we* are the watcher. Any
+/// other outcome means an external watcher already holds the name, and we defer
+/// to it — including the `DoNotQueue` "name exists" case, which zbus surfaces as
+/// [`NameTaken`](zbus::Error::NameTaken) rather than an `Ok` reply. Only a
+/// genuine bus error (lost connection, malformed reply) is propagated, since the
+/// producer cannot proceed without the bus.
+fn interpret_watcher_name(reply: zbus::Result<RequestNameReply>) -> zbus::Result<()> {
+    match reply {
+        // We own it, or someone else already does — both are fine: we host or
+        // defer, then drive everything through the watcher proxy regardless.
+        Ok(_) | Err(zbus::Error::NameTaken) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -553,6 +565,25 @@ async fn activate(conn: &Connection, key: &str) -> zbus::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owning_the_watcher_name_is_usable() {
+        assert!(interpret_watcher_name(Ok(RequestNameReply::PrimaryOwner)).is_ok());
+        assert!(interpret_watcher_name(Ok(RequestNameReply::AlreadyOwner)).is_ok());
+    }
+
+    #[test]
+    fn an_existing_external_watcher_is_deferred_to_not_fatal() {
+        // zbus reports the DoNotQueue "name exists" outcome as NameTaken; the
+        // producer must treat it as "defer to the external watcher", not crash.
+        assert!(interpret_watcher_name(Err(zbus::Error::NameTaken)).is_ok());
+        assert!(interpret_watcher_name(Ok(RequestNameReply::Exists)).is_ok());
+    }
+
+    #[test]
+    fn a_genuine_bus_error_propagates() {
+        assert!(interpret_watcher_name(Err(zbus::Error::Unsupported)).is_err());
+    }
 
     #[test]
     fn bare_bus_name_uses_the_default_item_path() {
