@@ -41,7 +41,7 @@ RUST_LOG=info cargo run -p tablero
   architecture, each repainting only when its visible state actually changes:
   - **Workspaces** — the Hyprland workspace set, active one bracketed and drawn
     in the accent color. **Click a workspace to switch to it.**
-  - **Clock** — a live local clock (`HH:MM:SS`).
+  - **Clock** — a live local clock (`HH:MM`).
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
   - **System** — CPU and memory load sampled from procfs.
