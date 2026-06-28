@@ -3,31 +3,54 @@
 use crate::clock::format_time;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget};
+use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+
+/// Default clock glyph: Nerd Font "clock" (`nf-fa-clock_o`).
+const CLOCK_GLYPH: &str = "\u{f017}";
 
 /// A live clock rendered through the widget architecture.
 ///
 /// Holds the currently displayed text so [`update`](Widget::update) can report a
 /// visible change only when the formatted minute actually differs — ticks within
 /// the same minute format identically and are reported as unchanged, so the host
-/// loop stays idle between visible flips.
+/// loop stays idle between visible flips. Its resolved [`WidgetStyle`] decides
+/// the glyph, the optional pill, and the colors it draws with.
 pub struct ClockWidget {
     bounds: Bounds,
     text: String,
+    style: WidgetStyle,
 }
 
 impl ClockWidget {
-    /// Create a clock occupying `bounds`, with no text until its first tick.
+    /// Create a clock occupying `bounds`, with no text until its first tick and
+    /// the default (flat, glyph-on) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             text: String::new(),
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](ClockWidget::new) at build time.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The currently displayed clock text (empty before the first tick).
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The full pill text: the configured glyph joined to the clock readout, or
+    /// empty before the first tick (so the widget reserves no slot).
+    fn display_text(&self) -> String {
+        if self.text.is_empty() {
+            return String::new();
+        }
+        glyph_label(self.style.glyph(CLOCK_GLYPH), &self.text)
     }
 }
 
@@ -47,8 +70,17 @@ impl Widget for ClockWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        let fg = ctx.foreground();
-        ctx.draw_text(&self.text, self.bounds, fg);
+        draw_text_pill(
+            ctx,
+            &self.style,
+            self.bounds,
+            &self.display_text(),
+            self.style.base_colors(),
+        );
+    }
+
+    fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
+        measure_text_pill(ctx, &self.style, &self.display_text())
     }
 
     fn bounds(&self) -> Bounds {

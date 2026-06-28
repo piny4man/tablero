@@ -1,5 +1,5 @@
-//! Integration coverage: a configuration drives the *initialized* widget order
-//! and the render settings the bar paints with.
+//! Integration coverage: a configuration drives the *initialized* widget
+//! placement across zones, and the render settings the bar paints with.
 //!
 //! These exercise the public assembly path the host loop uses —
 //! [`Config::build_dashboard`] and [`Config::render_settings`] — so a change in
@@ -10,37 +10,65 @@ use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::widget::{Command, Dashboard, Msg, Workspaces};
 
-/// Build the dashboard a TOML document describes over a 200x32 surface, laid out
-/// and seeded with a one-workspace snapshot so the workspace widget exposes a
-/// clickable cell at its column origin.
+/// Build the dashboard a TOML document describes over a 200x32 surface, seed it
+/// with a one-workspace snapshot, then lay it out.
+///
+/// The seed comes *before* layout on purpose: each widget is packed to the size
+/// of its current content, so the workspace widget only reserves (and exposes a
+/// clickable cell for) its column once it actually holds a workspace. This
+/// mirrors the host loop, which updates from its data sources and then lays the
+/// surface out before painting.
 fn laid_out(toml: &str) -> Dashboard {
     let config = Config::from_toml_str(toml).expect("valid config");
     let mut dash = config.build_dashboard(Bounds::new(0, 0, 200, 32), None);
-    dash.layout(200, 32);
     dash.update(&Msg::Workspaces(Workspaces::new([1], 1)));
+    let mut ctx = RenderContext::new(200, 32);
+    dash.layout(&mut ctx, 200, 32);
     dash
 }
 
 #[test]
-fn widget_order_in_config_places_widgets_left_to_right() {
-    // Clock then workspaces: clock owns the left column, workspaces the right.
-    let dash = laid_out(r#"widgets = ["clock", "workspaces"]"#);
-    // The left column is the display-only clock: a click there commands nothing.
-    assert_eq!(dash.on_click(10, 16), None);
-    // The right column is the workspace switcher: a click there switches.
-    assert_eq!(dash.on_click(110, 16), Some(Command::SwitchWorkspace(1)));
+fn zone_placement_packs_widgets_to_their_configured_edges() {
+    // Workspaces on the left edge: its lone square (32px) cell sits at the
+    // origin, so a click near the left switches, and the empty middle commands
+    // nothing (the clock, never ticked, holds nothing clickable).
+    let left = laid_out(
+        r#"
+        [bar]
+        modules-left = ["workspaces"]
+        modules-center = []
+        modules-right = ["clock"]
+        "#,
+    );
+    assert_eq!(left.on_click(10, 16), Some(Command::SwitchWorkspace(1)));
+    assert_eq!(left.on_click(100, 16), None);
 
-    // Reversing the configured order moves the interactive column to the left.
-    let reversed = laid_out(r#"widgets = ["workspaces", "clock"]"#);
-    assert_eq!(reversed.on_click(10, 16), Some(Command::SwitchWorkspace(1)));
-    assert_eq!(reversed.on_click(110, 16), None);
+    // Moving workspaces to the right edge moves its clickable cell with it: the
+    // single cell packs flush against the far edge at [168, 200).
+    let right = laid_out(
+        r#"
+        [bar]
+        modules-left = ["clock"]
+        modules-center = []
+        modules-right = ["workspaces"]
+        "#,
+    );
+    assert_eq!(right.on_click(180, 16), Some(Command::SwitchWorkspace(1)));
+    assert_eq!(right.on_click(10, 16), None);
 }
 
 #[test]
-fn config_with_one_widget_resolves_to_a_single_column() {
-    // A config naming a single widget builds exactly that widget, spanning the
-    // whole surface — clicking anywhere in it switches.
-    let dash = laid_out(r#"widgets = ["workspaces"]"#);
+fn a_single_widget_builds_just_that_widget() {
+    // A config naming a single widget builds exactly that widget, packed at the
+    // origin — clicking its cell switches.
+    let dash = laid_out(
+        r#"
+        [bar]
+        modules-left = ["workspaces"]
+        modules-center = []
+        modules-right = []
+        "#,
+    );
     assert_eq!(dash.on_click(0, 0), Some(Command::SwitchWorkspace(1)));
 }
 
@@ -59,11 +87,12 @@ fn config_theme_drives_render_settings_and_painted_pixels() {
     )
     .expect("valid config");
 
-    // The resolved settings carry the configured theme verbatim.
+    // The resolved settings carry the configured theme verbatim (opaque alpha,
+    // since the colors are written as six-digit hex).
     let settings = config.render_settings();
-    assert_eq!(settings.background, (0x0a, 0x0b, 0x0c));
-    assert_eq!(settings.foreground, (0x10, 0x20, 0x30));
-    assert_eq!(settings.accent, (0xdd, 0xee, 0xff));
+    assert_eq!(settings.background, (0x0a, 0x0b, 0x0c, 0xFF));
+    assert_eq!(settings.foreground, (0x10, 0x20, 0x30, 0xFF));
+    assert_eq!(settings.accent, (0xdd, 0xee, 0xff, 0xFF));
     assert_eq!(settings.font_size, 20.0);
 
     // And those settings actually reach pixels: a cleared frame is the configured
@@ -71,4 +100,23 @@ fn config_theme_drives_render_settings_and_painted_pixels() {
     let mut ctx = RenderContext::with_settings(20, 8, settings);
     ctx.fill_background();
     assert_eq!(&ctx.pixels()[0..4], &[0x0a, 0x0b, 0x0c, 0xFF]);
+}
+
+#[test]
+fn bar_background_overrides_the_theme_for_painted_pixels() {
+    // A [bar] background takes precedence over the theme background in what the
+    // bar actually clears to — the seam that lets the bar go translucent.
+    let config = Config::from_toml_str(
+        r##"
+        [theme]
+        background = "#0a0b0c"
+
+        [bar]
+        background = "#204060"
+        "##,
+    )
+    .expect("valid config");
+
+    let settings = config.render_settings();
+    assert_eq!(settings.background, (0x20, 0x40, 0x60, 0xFF));
 }

@@ -10,7 +10,10 @@
 
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget};
+use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+
+/// Default system glyph: Nerd Font "microchip" (`nf-fa-microchip`).
+const SYSTEM_GLYPH: &str = "\u{f2db}";
 
 /// A normalized snapshot of system pressure: CPU and memory load, each a whole
 /// percent.
@@ -75,25 +78,46 @@ fn normalize_percent(value: f64) -> u8 {
 /// a visible change only when the normalized snapshot actually differs — a
 /// repeated identical sample keeps the loop idle. The snapshot is an [`Option`]:
 /// `None` is the pre-first-sample state, which renders as empty space, so the
-/// widget shows nothing until the first reading arrives.
+/// widget shows nothing until the first reading arrives. Its resolved
+/// [`WidgetStyle`] decides the glyph, the optional pill, and the colors it draws
+/// with.
 pub struct SystemWidget {
     bounds: Bounds,
     state: Option<SystemStats>,
+    style: WidgetStyle,
 }
 
 impl SystemWidget {
     /// Create a system-stats widget occupying `bounds`, empty until its first
-    /// [`Msg::System`](super::Msg::System).
+    /// [`Msg::System`](super::Msg::System) and carrying the default (flat,
+    /// glyph-on) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             state: None,
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](SystemWidget::new) at build time.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The currently displayed label (empty before the first sample).
     pub fn label(&self) -> String {
         self.state.map(SystemStats::label).unwrap_or_default()
+    }
+
+    /// The full pill text: the configured glyph joined to the load readout, or
+    /// empty before the first sample (so the widget reserves no slot).
+    fn display_text(&self) -> String {
+        match self.state {
+            Some(stats) => glyph_label(self.style.glyph(SYSTEM_GLYPH), &stats.label()),
+            None => String::new(),
+        }
     }
 }
 
@@ -112,12 +136,19 @@ impl Widget for SystemWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // Before the first sample the widget draws nothing: the dashboard has
-        // already cleared the background, so the slot is left blank.
-        if let Some(stats) = self.state {
-            let fg = ctx.foreground();
-            ctx.draw_text(&stats.label(), self.bounds, fg);
-        }
+        // Before the first sample `display_text` is empty, so the pill paints
+        // nothing: the dashboard has already cleared the background.
+        draw_text_pill(
+            ctx,
+            &self.style,
+            self.bounds,
+            &self.display_text(),
+            self.style.base_colors(),
+        );
+    }
+
+    fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
+        measure_text_pill(ctx, &self.style, &self.display_text())
     }
 
     fn bounds(&self) -> Bounds {
@@ -212,5 +243,26 @@ mod tests {
         let mut widget = SystemWidget::new(Bounds::new(0, 0, 1, 1));
         widget.set_bounds(Bounds::new(10, 0, 200, 32));
         assert_eq!(widget.bounds(), Bounds::new(10, 0, 200, 32));
+    }
+
+    #[test]
+    fn display_text_prefixes_the_system_glyph() {
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
+        // Nothing to show before the first sample: no glyph, no slot.
+        assert_eq!(widget.display_text(), "");
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(
+            widget.display_text(),
+            format!("{SYSTEM_GLYPH} CPU 12% MEM 47%")
+        );
+    }
+
+    #[test]
+    fn no_sample_measures_zero_a_sampled_one_reserves_a_slot() {
+        let mut ctx = RenderContext::new(320, 32);
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.measure(&mut ctx, 32), 0);
+        widget.update(&stats(12.0, 47.0));
+        assert!(widget.measure(&mut ctx, 32) > 0);
     }
 }

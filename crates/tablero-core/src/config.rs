@@ -1,5 +1,5 @@
-//! TOML configuration for the bar's visual theme, dimensions, fonts, spacing,
-//! and widget order.
+//! TOML configuration for the bar's visual theme, dimensions, fonts, zone
+//! layout, and per-widget styling.
 //!
 //! The whole tree deserializes from a single TOML document via [`Config::from_toml_str`]
 //! (or [`Config::load_from_path`] to read a file), and every field has a
@@ -9,13 +9,23 @@
 //! malformed color) is a hard [`ConfigError`] rather than a silent fallback.
 //!
 //! Every field has a documented default, so an absent config file renders the
-//! full default bar:
+//! full default bar. Placement (which zone a widget sits in) lives in `[bar]`;
+//! per-widget *styling* lives in separate `[widget.<name>]` tables, so moving a
+//! widget between zones never disturbs its colors. Colors are `#rrggbb` or
+//! `#rrggbbaa` hex (the eight-digit form adds an alpha channel for translucency):
 //!
 //! ```toml
-//! height  = 32
-//! spacing = 0
-//! padding = 0
-//! widgets = ["workspaces", "clock", "battery", "system", "network"]
+//! height = 32
+//!
+//! [bar]
+//! # margin insets the whole pill row; gap separates adjacent pills in a zone.
+//! # Both are 0 by default (a flush, edge-to-edge bar).
+//! margin = 0
+//! gap    = 0
+//! modules-left   = ["workspaces"]
+//! modules-center = ["clock"]
+//! modules-right  = ["battery", "system", "network"]
+//! # background = "#181818cc"  # optional; overrides [theme] background (translucent bar)
 //!
 //! [theme]
 //! background = "#181818"
@@ -23,8 +33,27 @@
 //! accent     = "#eaeaea"
 //!
 //! [font]
-//! # family is unset by default (the system default font is used)
+//! # family is unset by default (the system default font is used; a Nerd Font is
+//! # recommended so widget glyph icons render).
 //! size = 16.0
+//!
+//! # Per-widget styling is opt-in; an absent [widget.<name>] table leaves that
+//! # widget flat (no pill). For example, a translucent rounded clock pill:
+//! [widget.clock]
+//! background = "#2e3440cc"
+//! radius     = 10
+//!
+//! # Per-monitor overrides: a [[monitor]] block restyles or re-lays-out one
+//! # output, matched by connector name. Every field except `name` is optional and
+//! # inherits the global config; a [monitor.bar] zone replaces the global list
+//! # wholesale, a [monitor.widget.*] table folds onto the global widget style.
+//! [[monitor]]
+//! name = "DP-1"
+//! height = 40
+//! [monitor.bar]
+//! modules-center = ["clock", "system"]
+//! [monitor.widget.battery]
+//! background = "#3b4252"
 //! ```
 
 use std::fmt;
@@ -38,8 +67,8 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BatteryWidget, ClockWidget, Dashboard, NetworkWidget, SystemWidget, TrayWidget, Widget,
-    WorkspaceWidget,
+    BatteryWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget, StateColors, SystemWidget,
+    TrayWidget, Widget, WidgetStyle, WorkspaceWidget,
 };
 
 /// Default bar height in pixels.
@@ -62,7 +91,11 @@ const MAX_FONT_SIZE: f32 = 512.0;
 /// Largest accepted widget spacing/padding, in pixels.
 const MAX_GAP: u32 = 4096;
 
-/// An RGB color, parsed from a `"#rrggbb"` (or bare `"rrggbb"`) hex string.
+/// An RGBA color, parsed from a `"#rrggbb"` (opaque) or `"#rrggbbaa"` hex string.
+///
+/// The leading `#` is optional in either form. Six hex digits yield an opaque
+/// color; eight carry an explicit alpha channel, which is what makes transparent
+/// bars and translucent pills expressible in the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     /// Red channel.
@@ -71,33 +104,48 @@ pub struct Color {
     pub g: u8,
     /// Blue channel.
     pub b: u8,
+    /// Alpha channel; `0xFF` is fully opaque, `0x00` fully transparent.
+    pub a: u8,
 }
 
 impl Color {
-    /// Construct a color from its channels.
+    /// Construct an opaque color from its RGB channels.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
+        Self { r, g, b, a: 0xFF }
     }
 
-    /// The color as an `(r, g, b)` tuple, the form the renderer consumes.
+    /// Construct a color from its RGBA channels.
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    /// The color as an `(r, g, b)` tuple, dropping alpha.
     pub fn to_rgb(self) -> (u8, u8, u8) {
         (self.r, self.g, self.b)
     }
 
-    /// Parse a `#rrggbb` or `rrggbb` hex string into a color.
+    /// The color as an `(r, g, b, a)` tuple, the form the renderer consumes.
+    pub fn to_rgba(self) -> (u8, u8, u8, u8) {
+        (self.r, self.g, self.b, self.a)
+    }
+
+    /// Parse a `#rrggbb` / `#rrggbbaa` hex string (the `#` is optional) into a color.
     ///
-    /// The leading `#` is optional; exactly six hex digits are required. Returns
-    /// a human-readable message on anything else, so a typo surfaces as a clear
-    /// configuration error rather than a wrong-but-silent color.
+    /// Six hex digits give an opaque color (alpha `0xFF`); eight set an explicit
+    /// alpha. Any other length, or a non-hex digit, returns a human-readable
+    /// message, so a typo surfaces as a clear configuration error rather than a
+    /// wrong-but-silent color.
     pub fn parse_hex(s: &str) -> Result<Color, String> {
         let hex = s.strip_prefix('#').unwrap_or(s);
-        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let valid_len = hex.len() == 6 || hex.len() == 8;
+        if !valid_len || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!(
-                "invalid color {s:?}: expected a \"#rrggbb\" hex string"
+                "invalid color {s:?}: expected a \"#rrggbb\" or \"#rrggbbaa\" hex string"
             ));
         }
         let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex");
-        Ok(Color::rgb(channel(0), channel(2), channel(4)))
+        let a = if hex.len() == 8 { channel(6) } else { 0xFF };
+        Ok(Color::rgba(channel(0), channel(2), channel(4), a))
     }
 }
 
@@ -173,15 +221,244 @@ pub enum WidgetKind {
     Tray,
 }
 
-/// The default left-to-right widget order, matching the pre-config bar.
-fn default_widgets() -> Vec<WidgetKind> {
-    vec![
-        WidgetKind::Workspaces,
-        WidgetKind::Clock,
-        WidgetKind::Battery,
-        WidgetKind::System,
-        WidgetKind::Network,
-    ]
+/// The bar layout: which widgets populate each of the three zones, plus the
+/// bar-wide spacing and an optional background that overrides the theme's.
+///
+/// Placement lives here; per-widget *styling* lives in the separate
+/// [`WidgetStyles`] tables — so moving a widget between zones never disturbs its
+/// colors, and restyling never disturbs its position. The default zones
+/// reproduce a conventional bar: workspaces at the left, clock centered, the
+/// status cluster (battery, system, network) at the right; the tray is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bar {
+    /// Bar background; `None` inherits the theme's background. An `#rrggbbaa`
+    /// value with a non-opaque alpha makes the bar (the space between pills)
+    /// transparent.
+    pub background: Option<Color>,
+    /// Inset around the whole pill row, in logical pixels — the gutter that lets
+    /// pills float clear of the screen edge.
+    pub margin: u32,
+    /// Gap between adjacent pills within a zone, in logical pixels.
+    pub gap: u32,
+    /// Widgets clustered at the left edge.
+    #[serde(rename = "modules-left")]
+    pub modules_left: Vec<WidgetKind>,
+    /// Widgets centered in the bar.
+    #[serde(rename = "modules-center")]
+    pub modules_center: Vec<WidgetKind>,
+    /// Widgets clustered at the right edge.
+    #[serde(rename = "modules-right")]
+    pub modules_right: Vec<WidgetKind>,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self {
+            background: None,
+            margin: 0,
+            gap: 0,
+            modules_left: vec![WidgetKind::Workspaces],
+            modules_center: vec![WidgetKind::Clock],
+            modules_right: vec![
+                WidgetKind::Battery,
+                WidgetKind::System,
+                WidgetKind::Network,
+            ],
+        }
+    }
+}
+
+/// Optional colors for one widget *state* (the warn or attention pill).
+///
+/// Each channel is optional and inherits the built-in alert colors when unset,
+/// so a `[widget.battery.warn]` table that sets only `foreground` keeps the
+/// default red pill behind it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StateColorConfig {
+    /// Pill fill for this state, if overridden.
+    pub background: Option<Color>,
+    /// Text/glyph color for this state, if overridden.
+    pub foreground: Option<Color>,
+}
+
+impl StateColorConfig {
+    /// Copy each set channel of this override onto `base`, leaving unset ones
+    /// untouched — the config-on-config merge a `[monitor.widget.*]` table uses.
+    fn apply(&self, base: &mut StateColorConfig) {
+        if self.background.is_some() {
+            base.background = self.background;
+        }
+        if self.foreground.is_some() {
+            base.foreground = self.foreground;
+        }
+    }
+}
+
+/// A `[widget.<name>]` style table: every field optional, folded onto the theme
+/// (and built-in defaults) by [`resolve`](WidgetStyleConfig::resolve).
+///
+/// An entirely-absent table resolves to a flat widget — no pill, theme
+/// foreground — which is what keeps the default bar looking like today's.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WidgetStyleConfig {
+    /// Normal-state pill fill; absent means *no pill* (text floats on the bar).
+    pub background: Option<Color>,
+    /// Normal-state text/glyph color; inherits the theme foreground when unset.
+    pub foreground: Option<Color>,
+    /// Emphasis color (e.g. the active workspace); inherits the theme accent.
+    pub accent: Option<Color>,
+    /// Pill corner radius in logical pixels.
+    pub radius: Option<u32>,
+    /// Inset between a pill edge and its text, in logical pixels.
+    pub padding: Option<u32>,
+    /// Glyph override: absent keeps the widget's built-in glyph, `"none"`
+    /// disables it, any other string is used verbatim.
+    pub icon: Option<String>,
+    /// Percent below which a discharging battery shows its warn colors.
+    #[serde(rename = "warn-threshold")]
+    pub warn_threshold: Option<u32>,
+    /// Colors for the warn state (e.g. low battery).
+    pub warn: StateColorConfig,
+    /// Colors for the attention state (e.g. a tray item needing attention).
+    pub attention: StateColorConfig,
+}
+
+impl WidgetStyleConfig {
+    /// Resolve this table against `theme` into a concrete [`WidgetStyle`].
+    ///
+    /// Unset colors fall back to the theme (foreground/accent) or to the
+    /// built-in alert colors (warn/attention); unset geometry falls back to
+    /// [`WidgetStyle::default`]; an unset `background` resolves to `None`, which
+    /// the widgets read as "draw no pill".
+    fn resolve(&self, theme: &Theme) -> WidgetStyle {
+        let defaults = WidgetStyle::default();
+        WidgetStyle {
+            background: self.background.map(Color::to_rgba),
+            foreground: self
+                .foreground
+                .map(Color::to_rgba)
+                .unwrap_or_else(|| theme.foreground.to_rgba()),
+            accent: self
+                .accent
+                .map(Color::to_rgba)
+                .unwrap_or_else(|| theme.accent.to_rgba()),
+            radius: self.radius.unwrap_or(defaults.radius),
+            padding: self.padding.unwrap_or(defaults.padding),
+            icon: resolve_icon(self.icon.as_deref()),
+            warn_threshold: self.warn_threshold.unwrap_or(defaults.warn_threshold),
+            warn: resolve_state(self.warn, defaults.warn),
+            attention: resolve_state(self.attention, defaults.attention),
+        }
+    }
+
+    /// Copy each set field of this override onto `base`, leaving unset ones
+    /// untouched.
+    ///
+    /// This is the field-level merge a `[monitor.widget.<name>]` table uses to
+    /// refine the global widget style for one output: a monitor that sets only
+    /// `background` keeps the global foreground, radius, glyph, and so on. The
+    /// merge happens on the still-unresolved [`WidgetStyleConfig`] (before
+    /// [`resolve`](WidgetStyleConfig::resolve)), so theme fallbacks are applied
+    /// once, afterwards, to the already-merged table.
+    fn apply(&self, base: &mut WidgetStyleConfig) {
+        if self.background.is_some() {
+            base.background = self.background;
+        }
+        if self.foreground.is_some() {
+            base.foreground = self.foreground;
+        }
+        if self.accent.is_some() {
+            base.accent = self.accent;
+        }
+        if self.radius.is_some() {
+            base.radius = self.radius;
+        }
+        if self.padding.is_some() {
+            base.padding = self.padding;
+        }
+        if self.icon.is_some() {
+            base.icon = self.icon.clone();
+        }
+        if self.warn_threshold.is_some() {
+            base.warn_threshold = self.warn_threshold;
+        }
+        self.warn.apply(&mut base.warn);
+        self.attention.apply(&mut base.attention);
+    }
+}
+
+/// The per-widget style tables, one named field per widget kind.
+///
+/// A closed struct rather than a map, so `[widget.<unknown>]` is rejected by
+/// `deny_unknown_fields` exactly like any other typo.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WidgetStyles {
+    /// Style for the workspaces widget.
+    pub workspaces: WidgetStyleConfig,
+    /// Style for the clock widget.
+    pub clock: WidgetStyleConfig,
+    /// Style for the battery widget.
+    pub battery: WidgetStyleConfig,
+    /// Style for the system widget.
+    pub system: WidgetStyleConfig,
+    /// Style for the network widget.
+    pub network: WidgetStyleConfig,
+    /// Style for the tray widget.
+    pub tray: WidgetStyleConfig,
+}
+
+impl WidgetStyles {
+    /// The style table for `kind`.
+    fn get(&self, kind: WidgetKind) -> &WidgetStyleConfig {
+        match kind {
+            WidgetKind::Workspaces => &self.workspaces,
+            WidgetKind::Clock => &self.clock,
+            WidgetKind::Battery => &self.battery,
+            WidgetKind::System => &self.system,
+            WidgetKind::Network => &self.network,
+            WidgetKind::Tray => &self.tray,
+        }
+    }
+
+    /// Fold each widget's set style fields from this override onto `base`,
+    /// per-widget and per-field (see [`WidgetStyleConfig::apply`]).
+    fn apply(&self, base: &mut WidgetStyles) {
+        self.workspaces.apply(&mut base.workspaces);
+        self.clock.apply(&mut base.clock);
+        self.battery.apply(&mut base.battery);
+        self.system.apply(&mut base.system);
+        self.network.apply(&mut base.network);
+        self.tray.apply(&mut base.tray);
+    }
+}
+
+/// Map an `icon` config value to its resolved [`IconSetting`]: absent keeps the
+/// widget's built-in glyph, `"none"` disables it, any other string overrides it.
+fn resolve_icon(icon: Option<&str>) -> IconSetting {
+    match icon {
+        None => IconSetting::Default,
+        Some("none") => IconSetting::None,
+        Some(custom) => IconSetting::Custom(custom.to_string()),
+    }
+}
+
+/// Fold an optional [`StateColorConfig`] onto the built-in `default` alert
+/// colors, taking each set channel and inheriting the rest.
+fn resolve_state(config: StateColorConfig, default: StateColors) -> StateColors {
+    StateColors {
+        background: match config.background {
+            Some(color) => Some(color.to_rgba()),
+            None => default.background,
+        },
+        foreground: config
+            .foreground
+            .map(Color::to_rgba)
+            .unwrap_or(default.foreground),
+    }
 }
 
 /// Per-channel theme overrides for one monitor.
@@ -239,6 +516,56 @@ impl FontOverride {
     }
 }
 
+/// Per-field bar overrides for one monitor: a `[monitor.bar]` table.
+///
+/// Every field is optional (see [`ThemeOverride`] for the inherit-when-unset
+/// rationale). A set zone list *replaces* the global one wholesale — a monitor
+/// states the entire zone it wants, not a delta — while an unset zone inherits
+/// the global layout. Spacing and background follow the same set-replaces rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BarOverride {
+    /// Bar background, if overridden.
+    pub background: Option<Color>,
+    /// Pill-row inset, if overridden.
+    pub margin: Option<u32>,
+    /// Inter-pill gap, if overridden.
+    pub gap: Option<u32>,
+    /// Left zone, if overridden (replaces the global list wholesale).
+    #[serde(rename = "modules-left")]
+    pub modules_left: Option<Vec<WidgetKind>>,
+    /// Center zone, if overridden (replaces the global list wholesale).
+    #[serde(rename = "modules-center")]
+    pub modules_center: Option<Vec<WidgetKind>>,
+    /// Right zone, if overridden (replaces the global list wholesale).
+    #[serde(rename = "modules-right")]
+    pub modules_right: Option<Vec<WidgetKind>>,
+}
+
+impl BarOverride {
+    /// Apply the set fields onto `base`, leaving unset ones untouched.
+    fn apply(&self, base: &mut Bar) {
+        if self.background.is_some() {
+            base.background = self.background;
+        }
+        if let Some(margin) = self.margin {
+            base.margin = margin;
+        }
+        if let Some(gap) = self.gap {
+            base.gap = gap;
+        }
+        if let Some(left) = &self.modules_left {
+            base.modules_left = left.clone();
+        }
+        if let Some(center) = &self.modules_center {
+            base.modules_center = center.clone();
+        }
+        if let Some(right) = &self.modules_right {
+            base.modules_right = right.clone();
+        }
+    }
+}
+
 /// A per-monitor configuration override, matched to an output by connector name.
 ///
 /// Every field except [`name`](MonitorConfig::name) is optional and inherits the
@@ -251,16 +578,14 @@ pub struct MonitorConfig {
     pub name: String,
     /// Bar height override.
     pub height: Option<u32>,
-    /// Widget-column spacing override.
-    pub spacing: Option<u32>,
-    /// Widget-column padding override.
-    pub padding: Option<u32>,
-    /// Widget order override.
-    pub widgets: Option<Vec<WidgetKind>>,
     /// Theme channel overrides.
     pub theme: ThemeOverride,
     /// Font field overrides.
     pub font: FontOverride,
+    /// Bar layout overrides: per-zone module lists, spacing, and background.
+    pub bar: BarOverride,
+    /// Per-widget style overrides, folded onto the global widget tables.
+    pub widget: WidgetStyles,
 }
 
 /// The fully-resolved bar configuration.
@@ -279,12 +604,10 @@ pub struct Config {
     pub theme: Theme,
     /// Font selection.
     pub font: Font,
-    /// Horizontal gap between adjacent widget columns, in pixels.
-    pub spacing: u32,
-    /// Inner padding inset on each widget column, in pixels.
-    pub padding: u32,
-    /// Widgets to render, left to right.
-    pub widgets: Vec<WidgetKind>,
+    /// Bar layout: zone module lists, spacing, and optional background.
+    pub bar: Bar,
+    /// Per-widget style tables.
+    pub widget: WidgetStyles,
     /// Per-monitor overrides, matched to outputs by connector name.
     #[serde(rename = "monitor")]
     pub monitors: Vec<MonitorConfig>,
@@ -296,9 +619,8 @@ impl Default for Config {
             height: DEFAULT_HEIGHT,
             theme: Theme::default(),
             font: Font::default(),
-            spacing: 0,
-            padding: 0,
-            widgets: default_widgets(),
+            bar: Bar::default(),
+            widget: WidgetStyles::default(),
             monitors: Vec::new(),
         }
     }
@@ -350,7 +672,7 @@ impl Config {
 
     /// Validate the resolved values, rejecting ones that deserialize fine but
     /// would render a blank or broken bar: an out-of-range height or font size,
-    /// an absurd spacing/padding, or a `[[monitor]]` override with no name (it
+    /// an absurd bar margin or gap, or a `[[monitor]]` override with no name (it
     /// can never match an output). Returns a message naming the first offending
     /// field.
     ///
@@ -359,8 +681,8 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         validate_range("height", self.height, MIN_HEIGHT, MAX_HEIGHT)?;
         validate_font_size("font.size", self.font.size)?;
-        validate_range("spacing", self.spacing, 0, MAX_GAP)?;
-        validate_range("padding", self.padding, 0, MAX_GAP)?;
+        validate_range("bar.margin", self.bar.margin, 0, MAX_GAP)?;
+        validate_range("bar.gap", self.bar.gap, 0, MAX_GAP)?;
 
         for monitor in &self.monitors {
             if monitor.name.trim().is_empty() {
@@ -378,33 +700,37 @@ impl Config {
                     MAX_HEIGHT,
                 )?;
             }
-            if let Some(spacing) = monitor.spacing {
-                validate_range(&format!("monitor {who:?} spacing"), spacing, 0, MAX_GAP)?;
-            }
-            if let Some(padding) = monitor.padding {
-                validate_range(&format!("monitor {who:?} padding"), padding, 0, MAX_GAP)?;
-            }
             if let Some(size) = monitor.font.size {
                 validate_font_size(&format!("monitor {who:?} font.size"), size)?;
+            }
+            if let Some(margin) = monitor.bar.margin {
+                validate_range(&format!("monitor {who:?} bar.margin"), margin, 0, MAX_GAP)?;
+            }
+            if let Some(gap) = monitor.bar.gap {
+                validate_range(&format!("monitor {who:?} bar.gap"), gap, 0, MAX_GAP)?;
             }
         }
         Ok(())
     }
 
-    /// The widget kinds to build, in display order, with duplicates removed
-    /// (first occurrence wins).
+    /// The widgets each zone builds, with duplicates removed across *all three*
+    /// zones (first occurrence wins).
     ///
-    /// This is the single widget-order resolution both the dashboard builder and
-    /// the tests rely on: a config that lists a widget twice still renders it
-    /// once, in the position of its first mention.
-    pub fn resolved_widgets(&self) -> Vec<WidgetKind> {
-        let mut resolved: Vec<WidgetKind> = Vec::new();
-        for &kind in &self.widgets {
-            if !resolved.contains(&kind) {
-                resolved.push(kind);
-            }
+    /// A widget is a single live instance, so naming it in two zones would
+    /// otherwise build it twice; cross-zone de-duplication keeps the first
+    /// mention and drops the rest, mirroring the within-zone rule. This is the
+    /// single zone resolution both [`build_dashboard`](Config::build_dashboard)
+    /// and the tests rely on.
+    pub fn resolved_zones(&self) -> ResolvedZones {
+        let mut seen: Vec<WidgetKind> = Vec::new();
+        let left = dedup_zone(&self.bar.modules_left, &mut seen);
+        let center = dedup_zone(&self.bar.modules_center, &mut seen);
+        let right = dedup_zone(&self.bar.modules_right, &mut seen);
+        ResolvedZones {
+            left,
+            center,
+            right,
         }
-        resolved
     }
 
     /// Resolve the effective config for one output, by connector name.
@@ -430,20 +756,40 @@ impl Config {
         if let Some(height) = monitor.height {
             resolved.height = height;
         }
-        if let Some(spacing) = monitor.spacing {
-            resolved.spacing = spacing;
-        }
-        if let Some(padding) = monitor.padding {
-            resolved.padding = padding;
-        }
-        if let Some(widgets) = &monitor.widgets {
-            resolved.widgets = widgets.clone();
-        }
         monitor.theme.apply(&mut resolved.theme);
         monitor.font.apply(&mut resolved.font);
+        monitor.bar.apply(&mut resolved.bar);
+        monitor.widget.apply(&mut resolved.widget);
 
         resolved
     }
+}
+
+/// The widgets to build for each zone, after cross-zone de-duplication.
+///
+/// Returned by [`Config::resolved_zones`] and consumed by
+/// [`Config::build_dashboard`]; each list is in display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedZones {
+    /// Widgets clustered at the left edge.
+    pub left: Vec<WidgetKind>,
+    /// Widgets centered in the bar.
+    pub center: Vec<WidgetKind>,
+    /// Widgets clustered at the right edge.
+    pub right: Vec<WidgetKind>,
+}
+
+/// Append the not-yet-seen widgets of `zone` to a fresh list, recording each in
+/// `seen` so later zones skip any already placed (first-mention-wins).
+fn dedup_zone(zone: &[WidgetKind], seen: &mut Vec<WidgetKind>) -> Vec<WidgetKind> {
+    let mut resolved = Vec::new();
+    for &kind in zone {
+        if !seen.contains(&kind) {
+            seen.push(kind);
+            resolved.push(kind);
+        }
+    }
+    resolved
 }
 
 /// Reject a `u32` field outside `min..=max`, with a message naming the field.
@@ -469,23 +815,24 @@ fn validate_font_size(field: &str, size: f32) -> Result<(), String> {
 }
 
 impl WidgetKind {
-    /// Construct the widget this kind names, occupying `bounds`.
+    /// Construct the widget this kind names, occupying `bounds` and carrying its
+    /// resolved `style`.
     ///
     /// The bounds are a placeholder seed; real per-column slots are assigned by
     /// [`Dashboard::layout`] each frame. `monitor` is the connector name of the
     /// output this dashboard serves, threaded to the workspace widget so it
     /// shows only that monitor's workspaces; `None` builds the global fallback.
-    pub fn build(self, bounds: Bounds, monitor: Option<&str>) -> Box<dyn Widget> {
+    pub fn build(self, bounds: Bounds, style: WidgetStyle, monitor: Option<&str>) -> Box<dyn Widget> {
         match self {
             WidgetKind::Workspaces => match monitor {
-                Some(name) => Box::new(WorkspaceWidget::for_monitor(bounds, name)),
-                None => Box::new(WorkspaceWidget::new(bounds)),
+                Some(name) => Box::new(WorkspaceWidget::for_monitor(bounds, name).with_style(style)),
+                None => Box::new(WorkspaceWidget::new(bounds).with_style(style)),
             },
-            WidgetKind::Clock => Box::new(ClockWidget::new(bounds)),
-            WidgetKind::Battery => Box::new(BatteryWidget::new(bounds)),
-            WidgetKind::System => Box::new(SystemWidget::new(bounds)),
-            WidgetKind::Network => Box::new(NetworkWidget::new(bounds)),
-            WidgetKind::Tray => Box::new(TrayWidget::new(bounds)),
+            WidgetKind::Clock => Box::new(ClockWidget::new(bounds).with_style(style)),
+            WidgetKind::Battery => Box::new(BatteryWidget::new(bounds).with_style(style)),
+            WidgetKind::System => Box::new(SystemWidget::new(bounds).with_style(style)),
+            WidgetKind::Network => Box::new(NetworkWidget::new(bounds).with_style(style)),
+            WidgetKind::Tray => Box::new(TrayWidget::new(bounds).with_style(style)),
         }
     }
 }
@@ -498,11 +845,12 @@ impl Config {
     /// [`scaled_render_settings`](Config::scaled_render_settings).
     pub fn render_settings(&self) -> RenderSettings {
         RenderSettings {
-            background: self.theme.background.to_rgb(),
-            foreground: self.theme.foreground.to_rgb(),
-            accent: self.theme.accent.to_rgb(),
+            background: self.bar.background.unwrap_or(self.theme.background).to_rgba(),
+            foreground: self.theme.foreground.to_rgba(),
+            accent: self.theme.accent.to_rgba(),
             font_size: self.font.size,
             font_family: self.font.family.clone(),
+            scale: 1,
         }
     }
 
@@ -517,6 +865,7 @@ impl Config {
     pub fn scaled_render_settings(&self, scale: Scale) -> RenderSettings {
         RenderSettings {
             font_size: scale.scale_font(self.font.size),
+            scale: scale.get(),
             ..self.render_settings()
         }
     }
@@ -533,18 +882,28 @@ impl Config {
 
     /// Build the dashboard this configuration describes for one output.
     ///
-    /// The resolved widgets are constructed in order, each seeded at `bounds`,
-    /// and the dashboard carries the configured spacing and padding so its
-    /// [`layout`](Dashboard::layout) tiles them as configured. `monitor` is the
-    /// output's connector name, threaded to the workspace widget so it shows
-    /// only that monitor's workspaces; pass `None` for the global fallback.
+    /// Each zone's widgets are constructed in order, seeded at `bounds` and
+    /// carrying their resolved per-widget [`WidgetStyle`], and the dashboard
+    /// carries the bar margin and inter-pill gap so its
+    /// [`layout`](Dashboard::layout) packs the three zones as configured.
+    /// `monitor` is the output's connector name, threaded to the workspace
+    /// widget so it shows only that monitor's workspaces; pass `None` for the
+    /// global fallback.
     pub fn build_dashboard(&self, bounds: Bounds, monitor: Option<&str>) -> Dashboard {
-        let widgets = self
-            .resolved_widgets()
-            .into_iter()
-            .map(|kind| kind.build(bounds, monitor))
-            .collect();
-        Dashboard::new(widgets).with_layout(self.spacing, self.padding)
+        let zones = self.resolved_zones();
+        let build_zone = |kinds: &[WidgetKind]| -> Vec<Box<dyn Widget>> {
+            kinds
+                .iter()
+                .map(|&kind| {
+                    let style = self.widget.get(kind).resolve(&self.theme);
+                    kind.build(bounds, style, monitor)
+                })
+                .collect()
+        };
+        let left = build_zone(&zones.left);
+        let center = build_zone(&zones.center);
+        let right = build_zone(&zones.right);
+        Dashboard::with_zones(left, center, right).with_spacing(self.bar.margin, self.bar.gap)
     }
 }
 
@@ -617,18 +976,21 @@ mod tests {
     fn default_is_the_documented_baseline() {
         let config = Config::default();
         assert_eq!(config.height, 32);
-        assert_eq!(config.spacing, 0);
-        assert_eq!(config.padding, 0);
+        assert_eq!(config.bar.margin, 0);
+        assert_eq!(config.bar.gap, 0);
+        assert_eq!(config.bar.background, None);
         assert_eq!(config.theme.background, Color::rgb(0x18, 0x18, 0x18));
         assert_eq!(config.theme.foreground, Color::rgb(0xEA, 0xEA, 0xEA));
         assert_eq!(config.theme.accent, Color::rgb(0xEA, 0xEA, 0xEA));
         assert_eq!(config.font.family, None);
         assert_eq!(config.font.size, 16.0);
+        // The default zones: workspaces left, clock centered, the status cluster
+        // right; the tray stays opt-in.
+        assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
         assert_eq!(
-            config.widgets,
+            config.bar.modules_right,
             vec![
-                WidgetKind::Workspaces,
-                WidgetKind::Clock,
                 WidgetKind::Battery,
                 WidgetKind::System,
                 WidgetKind::Network,
@@ -643,11 +1005,25 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_config_parses_to_the_defaults() {
+        // The example file documents the defaults: its uncommented body must stay
+        // a valid document that resolves to exactly Config::default(). This is the
+        // guard that keeps the shipped example from silently drifting out of sync
+        // with the schema — as it had when the old flat `widgets`/`spacing` keys
+        // were replaced by [bar] zones.
+        let example = include_str!("../../../config.example.toml");
+        let parsed = Config::from_toml_str(example).expect("example config parses");
+        assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
     fn partial_document_overrides_only_named_fields() {
         let config = Config::from_toml_str(
             r##"
             height = 40
-            spacing = 6
+
+            [bar]
+            margin = 6
 
             [theme]
             accent = "#ff8800"
@@ -657,12 +1033,14 @@ mod tests {
 
         // Overridden fields take the new value...
         assert_eq!(config.height, 40);
-        assert_eq!(config.spacing, 6);
+        assert_eq!(config.bar.margin, 6);
         assert_eq!(config.theme.accent, Color::rgb(0xFF, 0x88, 0x00));
-        // ...everything unmentioned keeps its default.
-        assert_eq!(config.padding, 0);
+        // ...everything unmentioned keeps its default, including the zone lists a
+        // partial [bar] table did not restate.
+        assert_eq!(config.bar.gap, 0);
+        assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
         assert_eq!(config.theme.background, Color::rgb(0x18, 0x18, 0x18));
-        assert_eq!(config.widgets, default_widgets());
     }
 
     #[test]
@@ -670,9 +1048,14 @@ mod tests {
         let config = Config::from_toml_str(
             r##"
             height = 28
-            spacing = 4
-            padding = 2
-            widgets = ["clock", "workspaces"]
+
+            [bar]
+            margin = 4
+            gap = 2
+            background = "#101010cc"
+            modules-left = ["clock"]
+            modules-center = []
+            modules-right = ["workspaces"]
 
             [theme]
             background = "#000000"
@@ -682,22 +1065,31 @@ mod tests {
             [font]
             family = "JetBrains Mono"
             size = 14.0
+
+            [widget.clock]
+            background = "#222222"
+            radius = 10
+            icon = "none"
             "##,
         )
         .unwrap();
 
         assert_eq!(config.height, 28);
-        assert_eq!(config.spacing, 4);
-        assert_eq!(config.padding, 2);
+        assert_eq!(config.bar.margin, 4);
+        assert_eq!(config.bar.gap, 2);
+        assert_eq!(config.bar.background, Some(Color::rgba(0x10, 0x10, 0x10, 0xCC)));
         assert_eq!(config.theme.background, Color::rgb(0, 0, 0));
         assert_eq!(config.theme.foreground, Color::rgb(0xFF, 0xFF, 0xFF));
         assert_eq!(config.theme.accent, Color::rgb(0, 0xFF, 0));
         assert_eq!(config.font.family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(config.font.size, 14.0);
-        assert_eq!(
-            config.widgets,
-            vec![WidgetKind::Clock, WidgetKind::Workspaces]
-        );
+        assert_eq!(config.bar.modules_left, vec![WidgetKind::Clock]);
+        assert!(config.bar.modules_center.is_empty());
+        assert_eq!(config.bar.modules_right, vec![WidgetKind::Workspaces]);
+        // The per-widget style table is captured verbatim.
+        assert_eq!(config.widget.clock.background, Some(Color::rgb(0x22, 0x22, 0x22)));
+        assert_eq!(config.widget.clock.radius, Some(10));
+        assert_eq!(config.widget.clock.icon.as_deref(), Some("none"));
     }
 
     #[test]
@@ -709,6 +1101,17 @@ mod tests {
         assert_eq!(
             Color::parse_hex("1a2b3c").unwrap(),
             Color::rgb(0x1A, 0x2B, 0x3C)
+        );
+        // Six digits are opaque: alpha defaults to 0xFF.
+        assert_eq!(Color::parse_hex("#1a2b3c").unwrap().a, 0xFF);
+        // Eight digits carry an explicit alpha channel.
+        assert_eq!(
+            Color::parse_hex("#1a2b3c80").unwrap(),
+            Color::rgba(0x1A, 0x2B, 0x3C, 0x80)
+        );
+        assert_eq!(
+            Color::parse_hex("00ff0040").unwrap(),
+            Color::rgba(0x00, 0xFF, 0x00, 0x40)
         );
     }
 
@@ -736,17 +1139,42 @@ mod tests {
 
     #[test]
     fn tray_is_an_opt_in_widget_name() {
-        // The tray is not in the default set, but naming it is valid and builds.
-        assert!(!default_widgets().contains(&WidgetKind::Tray));
-        let config = Config::from_toml_str(r#"widgets = ["tray", "clock"]"#).unwrap();
-        assert_eq!(config.widgets, vec![WidgetKind::Tray, WidgetKind::Clock]);
+        // The tray is in none of the default zones, but naming it in one is valid
+        // and builds.
+        let bar = Bar::default();
+        let in_default_zones = bar
+            .modules_left
+            .iter()
+            .chain(&bar.modules_center)
+            .chain(&bar.modules_right)
+            .any(|&kind| kind == WidgetKind::Tray);
+        assert!(!in_default_zones);
+
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["tray", "clock"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.bar.modules_right,
+            vec![WidgetKind::Tray, WidgetKind::Clock]
+        );
+
         // It constructs a widget without panicking.
-        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32), None);
+        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32), WidgetStyle::default(), None);
     }
 
     #[test]
     fn unknown_widget_name_is_an_error() {
-        let err = Config::from_toml_str(r#"widgets = ["clock", "weather"]"#).unwrap_err();
+        let err = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-left = ["clock", "weather"]
+            "#,
+        )
+        .unwrap_err();
         // serde reports the unknown variant; the loader wraps it as invalid config.
         assert!(err.to_string().contains("invalid config"));
     }
@@ -759,25 +1187,41 @@ mod tests {
     }
 
     #[test]
-    fn resolved_widgets_dedupes_preserving_first_position() {
+    fn resolved_zones_dedupe_across_zones_first_position_wins() {
+        // A widget named in two zones is built once, at its first mention; the
+        // duplicate in a later zone is dropped.
         let config = Config::from_toml_str(
-            r#"widgets = ["clock", "battery", "clock", "workspaces", "battery"]"#,
+            r#"
+            [bar]
+            modules-left = ["clock", "battery", "clock"]
+            modules-center = ["battery", "workspaces"]
+            modules-right = ["clock", "network"]
+            "#,
         )
         .unwrap();
-        assert_eq!(
-            config.resolved_widgets(),
-            vec![
-                WidgetKind::Clock,
-                WidgetKind::Battery,
-                WidgetKind::Workspaces
-            ]
-        );
+        let zones = config.resolved_zones();
+        assert_eq!(zones.left, vec![WidgetKind::Clock, WidgetKind::Battery]);
+        // `battery` already appeared on the left, so center keeps only workspaces.
+        assert_eq!(zones.center, vec![WidgetKind::Workspaces]);
+        // `clock` already appeared, so the right keeps only network.
+        assert_eq!(zones.right, vec![WidgetKind::Network]);
     }
 
     #[test]
-    fn resolved_widgets_on_empty_list_is_empty() {
-        let config = Config::from_toml_str("widgets = []").unwrap();
-        assert!(config.resolved_widgets().is_empty());
+    fn resolved_zones_on_empty_zones_are_empty() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-left = []
+            modules-center = []
+            modules-right = []
+            "#,
+        )
+        .unwrap();
+        let zones = config.resolved_zones();
+        assert!(zones.left.is_empty());
+        assert!(zones.center.is_empty());
+        assert!(zones.right.is_empty());
     }
 
     #[test]
@@ -821,10 +1265,12 @@ mod tests {
         .unwrap();
 
         let scaled = config.scaled_render_settings(Scale::new(2));
-        // The font size doubles to physical pixels...
+        // The font size doubles to physical pixels, and the scale factor is
+        // recorded so widget geometry (radius/padding/gap) can follow it...
         assert_eq!(scaled.font_size, 32.0);
+        assert_eq!(scaled.scale, 2);
         // ...while everything scale-independent is carried verbatim.
-        assert_eq!(scaled.foreground, (0x10, 0x20, 0x30));
+        assert_eq!(scaled.foreground, (0x10, 0x20, 0x30, 0xFF));
         assert_eq!(scaled.font_family.as_deref(), Some("JetBrains Mono"));
     }
 
@@ -843,10 +1289,17 @@ mod tests {
     fn no_monitor_overrides_resolves_to_the_base_config() {
         // With no [[monitor]] tables, every output resolves to the global config,
         // and the resolved config carries no leftover monitor list.
-        let config = Config::from_toml_str("height = 30\nwidgets = [\"clock\"]").unwrap();
+        let config = Config::from_toml_str(
+            r#"
+            height = 30
+            [bar]
+            modules-left = ["clock"]
+            "#,
+        )
+        .unwrap();
         let resolved = config.resolve_for_output(Some("DP-1"));
         assert_eq!(resolved.height, 30);
-        assert_eq!(resolved.widgets, vec![WidgetKind::Clock]);
+        assert_eq!(resolved.bar.modules_left, vec![WidgetKind::Clock]);
         assert!(resolved.monitors.is_empty());
     }
 
@@ -870,7 +1323,6 @@ mod tests {
         let config = Config::from_toml_str(
             r##"
             height = 32
-            widgets = ["workspaces", "clock", "battery"]
 
             [theme]
             background = "#111111"
@@ -879,7 +1331,6 @@ mod tests {
             [[monitor]]
             name = "HDMI-A-1"
             height = 28
-            widgets = ["clock"]
             [monitor.theme]
             background = "#000000"
             "##,
@@ -889,12 +1340,11 @@ mod tests {
         let resolved = config.resolve_for_output(Some("HDMI-A-1"));
         // Overridden fields take the monitor's value...
         assert_eq!(resolved.height, 28);
-        assert_eq!(resolved.widgets, vec![WidgetKind::Clock]);
         assert_eq!(resolved.theme.background, Color::rgb(0, 0, 0));
         // ...and fields the monitor left unset inherit from the base config,
         // including theme channels the override did not mention.
         assert_eq!(resolved.theme.foreground, Color::rgb(0xEE, 0xEE, 0xEE));
-        assert_eq!(resolved.spacing, 0);
+        assert_eq!(resolved.bar.modules_left, vec![WidgetKind::Workspaces]);
     }
 
     #[test]
@@ -913,26 +1363,112 @@ mod tests {
     }
 
     #[test]
-    fn monitor_font_and_spacing_overrides_apply() {
+    fn monitor_font_overrides_apply() {
         let config = Config::from_toml_str(
             r##"
-            spacing = 2
             [font]
             size = 16.0
 
             [[monitor]]
             name = "DP-2"
-            spacing = 8
             [monitor.font]
             size = 20.0
             "##,
         )
         .unwrap();
         let resolved = config.resolve_for_output(Some("DP-2"));
-        assert_eq!(resolved.spacing, 8);
         assert_eq!(resolved.font.size, 20.0);
         // The font family the override did not set still inherits the base.
         assert_eq!(resolved.font.family, None);
+    }
+
+    #[test]
+    fn monitor_zone_override_replaces_only_the_named_zone() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-left   = ["workspaces"]
+            modules-center = ["clock"]
+            modules-right  = ["battery"]
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.bar]
+            modules-center = ["system", "network"]
+            "#,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        // The named zone is replaced wholesale by the monitor's list...
+        assert_eq!(
+            resolved.bar.modules_center,
+            vec![WidgetKind::System, WidgetKind::Network]
+        );
+        // ...and the zones the monitor left unset inherit the global layout.
+        assert_eq!(resolved.bar.modules_left, vec![WidgetKind::Workspaces]);
+        assert_eq!(resolved.bar.modules_right, vec![WidgetKind::Battery]);
+        // And the replacement reaches the de-duplicated zones the dashboard builds.
+        assert_eq!(
+            resolved.resolved_zones().center,
+            vec![WidgetKind::System, WidgetKind::Network]
+        );
+    }
+
+    #[test]
+    fn monitor_widget_override_merges_per_field_onto_the_global_style() {
+        let config = Config::from_toml_str(
+            r##"
+            [widget.battery]
+            foreground = "#eeeeee"
+            radius = 6
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.battery]
+            background = "#bf616aff"
+            "##,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        let battery = &resolved.widget.battery;
+        // The monitor's set field lands on the resolved widget style...
+        assert_eq!(battery.background, Some(Color::rgba(0xBF, 0x61, 0x6A, 0xFF)));
+        // ...while the global fields the monitor left unset are preserved, not
+        // reset to the bare default.
+        assert_eq!(battery.foreground, Some(Color::rgb(0xEE, 0xEE, 0xEE)));
+        assert_eq!(battery.radius, Some(6));
+        // A widget the monitor never mentioned is untouched by the merge.
+        assert_eq!(resolved.widget.clock, WidgetStyleConfig::default());
+    }
+
+    #[test]
+    fn monitor_bar_background_and_spacing_override_apply() {
+        let config = Config::from_toml_str(
+            r##"
+            [bar]
+            margin = 4
+            gap    = 4
+            background = "#181818"
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.bar]
+            background = "#00000080"
+            margin = 8
+            "##,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        // The set bar fields take the monitor's values...
+        assert_eq!(resolved.bar.margin, 8);
+        assert_eq!(resolved.bar.background, Some(Color::rgba(0, 0, 0, 0x80)));
+        // ...and the gap the monitor left unset inherits the global bar.
+        assert_eq!(resolved.bar.gap, 4);
+        // The translucent background reaches the render settings this output clears to.
+        assert_eq!(resolved.render_settings().background, (0, 0, 0, 0x80));
     }
 
     #[test]
