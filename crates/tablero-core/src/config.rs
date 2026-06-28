@@ -173,11 +173,92 @@ fn default_widgets() -> Vec<WidgetKind> {
     ]
 }
 
+/// Per-channel theme overrides for one monitor.
+///
+/// Each channel is optional: a set channel replaces the base theme's, an unset
+/// one inherits it. This field-level merge is why a monitor that overrides only
+/// `background` keeps the global `foreground` and `accent` rather than resetting
+/// them to the [`Theme`] defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeOverride {
+    /// Background fill, if overridden.
+    pub background: Option<Color>,
+    /// Text color, if overridden.
+    pub foreground: Option<Color>,
+    /// Emphasis color, if overridden.
+    pub accent: Option<Color>,
+}
+
+impl ThemeOverride {
+    /// Apply the set channels onto `base`, leaving unset ones untouched.
+    fn apply(self, base: &mut Theme) {
+        if let Some(background) = self.background {
+            base.background = background;
+        }
+        if let Some(foreground) = self.foreground {
+            base.foreground = foreground;
+        }
+        if let Some(accent) = self.accent {
+            base.accent = accent;
+        }
+    }
+}
+
+/// Per-field font overrides for one monitor (see [`ThemeOverride`] for the
+/// inherit-when-unset rationale).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FontOverride {
+    /// Font family, if overridden.
+    pub family: Option<String>,
+    /// Text size, if overridden.
+    pub size: Option<f32>,
+}
+
+impl FontOverride {
+    /// Apply the set fields onto `base`, leaving unset ones untouched.
+    fn apply(&self, base: &mut Font) {
+        if let Some(family) = &self.family {
+            base.family = Some(family.clone());
+        }
+        if let Some(size) = self.size {
+            base.size = size;
+        }
+    }
+}
+
+/// A per-monitor configuration override, matched to an output by connector name.
+///
+/// Every field except [`name`](MonitorConfig::name) is optional and inherits the
+/// global [`Config`] when unset, so a monitor entry only states what differs.
+/// Resolved by [`Config::resolve_for_output`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorConfig {
+    /// The output connector name this override applies to (e.g. `"DP-1"`).
+    pub name: String,
+    /// Bar height override.
+    pub height: Option<u32>,
+    /// Widget-column spacing override.
+    pub spacing: Option<u32>,
+    /// Widget-column padding override.
+    pub padding: Option<u32>,
+    /// Widget order override.
+    pub widgets: Option<Vec<WidgetKind>>,
+    /// Theme channel overrides.
+    pub theme: ThemeOverride,
+    /// Font field overrides.
+    pub font: FontOverride,
+}
+
 /// The fully-resolved bar configuration.
 ///
 /// Build one with [`from_toml_str`](Config::from_toml_str) or
 /// [`load_from_path`](Config::load_from_path); [`Config::default`] is the
-/// documented baseline every field falls back to.
+/// documented baseline every field falls back to. On a multi-monitor setup,
+/// [`resolve_for_output`](Config::resolve_for_output) folds any matching
+/// [`MonitorConfig`] into a per-output config.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -193,6 +274,9 @@ pub struct Config {
     pub padding: u32,
     /// Widgets to render, left to right.
     pub widgets: Vec<WidgetKind>,
+    /// Per-monitor overrides, matched to outputs by connector name.
+    #[serde(rename = "monitor")]
+    pub monitors: Vec<MonitorConfig>,
 }
 
 impl Default for Config {
@@ -204,6 +288,7 @@ impl Default for Config {
             spacing: 0,
             padding: 0,
             widgets: default_widgets(),
+            monitors: Vec::new(),
         }
     }
 }
@@ -251,6 +336,44 @@ impl Config {
                 resolved.push(kind);
             }
         }
+        resolved
+    }
+
+    /// Resolve the effective config for one output, by connector name.
+    ///
+    /// The first [`MonitorConfig`] whose `name` matches `output` is folded onto a
+    /// clone of the base config: each `Some` override replaces the corresponding
+    /// field, each unset one inherits the global value (field-level merge — see
+    /// [`ThemeOverride`]). When `output` is `None`, or no monitor entry matches,
+    /// the global defaults stand. The returned config carries an empty
+    /// [`monitors`](Config::monitors) list — it is already specialized for one
+    /// output and is not resolved again.
+    pub fn resolve_for_output(&self, output: Option<&str>) -> Config {
+        let mut resolved = self.clone();
+        resolved.monitors = Vec::new();
+
+        let Some(name) = output else {
+            return resolved;
+        };
+        let Some(monitor) = self.monitors.iter().find(|m| m.name == name) else {
+            return resolved;
+        };
+
+        if let Some(height) = monitor.height {
+            resolved.height = height;
+        }
+        if let Some(spacing) = monitor.spacing {
+            resolved.spacing = spacing;
+        }
+        if let Some(padding) = monitor.padding {
+            resolved.padding = padding;
+        }
+        if let Some(widgets) = &monitor.widgets {
+            resolved.widgets = widgets.clone();
+        }
+        monitor.theme.apply(&mut resolved.theme);
+        monitor.font.apply(&mut resolved.font);
+
         resolved
     }
 }
@@ -601,6 +724,119 @@ mod tests {
             config.scaled_render_settings(Scale::ONE),
             config.render_settings()
         );
+    }
+
+    #[test]
+    fn no_monitor_overrides_resolves_to_the_base_config() {
+        // With no [[monitor]] tables, every output resolves to the global config,
+        // and the resolved config carries no leftover monitor list.
+        let config = Config::from_toml_str("height = 30\nwidgets = [\"clock\"]").unwrap();
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        assert_eq!(resolved.height, 30);
+        assert_eq!(resolved.widgets, vec![WidgetKind::Clock]);
+        assert!(resolved.monitors.is_empty());
+    }
+
+    #[test]
+    fn an_output_with_no_name_resolves_to_the_base_config() {
+        let config = Config::from_toml_str(
+            r#"
+            height = 30
+            [[monitor]]
+            name = "DP-1"
+            height = 40
+            "#,
+        )
+        .unwrap();
+        // An output the compositor gave no connector name falls back to global.
+        assert_eq!(config.resolve_for_output(None).height, 30);
+    }
+
+    #[test]
+    fn a_matching_monitor_overrides_only_its_named_fields() {
+        let config = Config::from_toml_str(
+            r##"
+            height = 32
+            widgets = ["workspaces", "clock", "battery"]
+
+            [theme]
+            background = "#111111"
+            foreground = "#eeeeee"
+
+            [[monitor]]
+            name = "HDMI-A-1"
+            height = 28
+            widgets = ["clock"]
+            [monitor.theme]
+            background = "#000000"
+            "##,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("HDMI-A-1"));
+        // Overridden fields take the monitor's value...
+        assert_eq!(resolved.height, 28);
+        assert_eq!(resolved.widgets, vec![WidgetKind::Clock]);
+        assert_eq!(resolved.theme.background, Color::rgb(0, 0, 0));
+        // ...and fields the monitor left unset inherit from the base config,
+        // including theme channels the override did not mention.
+        assert_eq!(resolved.theme.foreground, Color::rgb(0xEE, 0xEE, 0xEE));
+        assert_eq!(resolved.spacing, 0);
+    }
+
+    #[test]
+    fn a_non_matching_output_name_resolves_to_the_base_config() {
+        let config = Config::from_toml_str(
+            r#"
+            height = 32
+            [[monitor]]
+            name = "DP-1"
+            height = 50
+            "#,
+        )
+        .unwrap();
+        // An output whose name matches no [[monitor]] entry uses global defaults.
+        assert_eq!(config.resolve_for_output(Some("eDP-1")).height, 32);
+    }
+
+    #[test]
+    fn monitor_font_and_spacing_overrides_apply() {
+        let config = Config::from_toml_str(
+            r##"
+            spacing = 2
+            [font]
+            size = 16.0
+
+            [[monitor]]
+            name = "DP-2"
+            spacing = 8
+            [monitor.font]
+            size = 20.0
+            "##,
+        )
+        .unwrap();
+        let resolved = config.resolve_for_output(Some("DP-2"));
+        assert_eq!(resolved.spacing, 8);
+        assert_eq!(resolved.font.size, 20.0);
+        // The font family the override did not set still inherits the base.
+        assert_eq!(resolved.font.family, None);
+    }
+
+    #[test]
+    fn duplicate_monitor_entries_resolve_to_the_first_match() {
+        let config = Config::from_toml_str(
+            r#"
+            [[monitor]]
+            name = "DP-1"
+            height = 40
+            [[monitor]]
+            name = "DP-1"
+            height = 99
+            "#,
+        )
+        .unwrap();
+        // First-match wins, mirroring widget de-duplication's first-wins rule.
+        assert_eq!(config.resolve_for_output(Some("DP-1")).height, 40);
     }
 
     #[test]
