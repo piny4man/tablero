@@ -7,6 +7,7 @@
 
 pub mod hyprland;
 pub mod producer;
+pub mod upower;
 
 use std::error::Error;
 use std::time::Duration;
@@ -34,10 +35,11 @@ use smithay_client_toolkit::{
 use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_second;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{ClockWidget, Dashboard, Msg, WorkspaceWidget};
+use tablero_core::widget::{BatteryWidget, ClockWidget, Dashboard, Msg, WorkspaceWidget};
 
 use crate::hyprland::HyprlandProducer;
 use crate::producer::{Producer, ProducerBridge};
+use crate::upower::UPowerProducer;
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -139,12 +141,18 @@ impl Bar {
 
 /// Open the bar and run its event loop until the compositor closes the surface.
 ///
-/// Wires the default producer set — currently the Hyprland workspace source — so
-/// the bar shows live workspaces alongside the clock. The clock itself is still
-/// driven by the synchronous tick timer; see [`run_with_producers`] to supply a
-/// custom producer set.
+/// Wires the default producer set — the Hyprland workspace source and the UPower
+/// battery source — so the bar shows live workspaces and battery state alongside
+/// the clock. The clock itself is still driven by the synchronous tick timer; see
+/// [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
-    run_with_producers(config, vec![Box::new(HyprlandProducer::new())])
+    run_with_producers(
+        config,
+        vec![
+            Box::new(HyprlandProducer::new()),
+            Box::new(UPowerProducer::new()),
+        ],
+    )
 }
 
 /// Open the bar and run its event loop, additionally driving `producers` on an
@@ -186,12 +194,17 @@ pub fn run_with_producers(
 
     let pool = SlotPool::new((INITIAL_WIDTH * config.height * 4) as usize, &shm)?;
 
-    // Workspaces on the left, clock on the right; `Dashboard::layout` tiles them
-    // into columns each frame, so these initial bounds are just placeholders.
+    // Workspaces, clock, then battery, left to right; `Dashboard::layout` tiles
+    // them into columns each frame, so these initial bounds are just placeholders.
     let full = Bounds::new(0, 0, INITIAL_WIDTH, config.height);
     let workspaces = WorkspaceWidget::new(full);
     let clock = ClockWidget::new(full);
-    let dashboard = Dashboard::new(vec![Box::new(workspaces), Box::new(clock)]);
+    let battery = BatteryWidget::new(full);
+    let dashboard = Dashboard::new(vec![
+        Box::new(workspaces),
+        Box::new(clock),
+        Box::new(battery),
+    ]);
     let ctx = RenderContext::new(INITIAL_WIDTH, config.height);
 
     let mut bar = Bar {
