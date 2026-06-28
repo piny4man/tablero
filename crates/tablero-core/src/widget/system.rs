@@ -8,7 +8,7 @@
 //! compact `CPU x% MEM y%` the user reads at a glance — basic system pressure
 //! without opening another tool.
 
-use crate::render::{Bounds, FG, RenderContext};
+use crate::render::{Bounds, RenderContext};
 
 use super::{Msg, Widget};
 
@@ -115,7 +115,8 @@ impl Widget for SystemWidget {
         // Before the first sample the widget draws nothing: the dashboard has
         // already cleared the background, so the slot is left blank.
         if let Some(stats) = self.state {
-            ctx.draw_text(&stats.label(), self.bounds, FG);
+            let fg = ctx.foreground();
+            ctx.draw_text(&stats.label(), self.bounds, fg);
         }
     }
 

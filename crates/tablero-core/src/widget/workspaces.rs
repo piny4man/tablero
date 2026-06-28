@@ -5,7 +5,7 @@
 //! repainting only when the visible workspace set or the active workspace
 //! actually changes.
 
-use crate::render::{Bounds, FG, RenderContext};
+use crate::render::{Bounds, RenderContext};
 
 use super::{Command, Msg, Widget};
 
@@ -145,14 +145,17 @@ impl Widget for WorkspaceWidget {
 
     fn draw(&self, ctx: &mut RenderContext) {
         let active = self.state.as_ref().map(Workspaces::active);
+        let foreground = ctx.foreground();
+        let accent = ctx.accent();
         for (id, cell) in self.item_cells() {
-            // The active workspace is bracketed to set it apart from the rest.
-            let text = if Some(id) == active {
-                format!("[{id}]")
+            // The active workspace is bracketed and painted in the accent color to
+            // set it apart from the rest.
+            let (text, color) = if Some(id) == active {
+                (format!("[{id}]"), accent)
             } else {
-                id.to_string()
+                (id.to_string(), foreground)
             };
-            ctx.draw_text(&text, cell, FG);
+            ctx.draw_text(&text, cell, color);
         }
     }
 

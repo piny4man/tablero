@@ -1,7 +1,7 @@
 //! The clock widget: an `HH:MM:SS` readout driven by [`Msg::Tick`].
 
 use crate::clock::format_time;
-use crate::render::{Bounds, FG, RenderContext};
+use crate::render::{Bounds, RenderContext};
 
 use super::{Msg, Widget};
 
@@ -47,7 +47,8 @@ impl Widget for ClockWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        ctx.draw_text(&self.text, self.bounds, FG);
+        let fg = ctx.foreground();
+        ctx.draw_text(&self.text, self.bounds, fg);
     }
 
     fn bounds(&self) -> Bounds {

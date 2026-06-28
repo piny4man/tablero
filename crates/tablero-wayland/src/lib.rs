@@ -41,10 +41,9 @@ use smithay_client_toolkit::{
 };
 use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_second;
+use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{
-    BatteryWidget, ClockWidget, Dashboard, Msg, SystemWidget, WorkspaceWidget,
-};
+use tablero_core::widget::{Dashboard, Msg};
 
 use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
@@ -57,26 +56,8 @@ use wayland_client::{
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
-/// Configuration for the layer-shell bar surface.
-#[derive(Debug, Clone)]
-pub struct SurfaceConfig {
-    /// Layer-shell namespace (also the compositor-visible surface name).
-    pub namespace: String,
-    /// Bar height in pixels. The width spans the output (anchored left+right).
-    pub height: u32,
-    /// Exclusive zone reserved so other windows don't overlap the bar.
-    pub exclusive_zone: i32,
-}
-
-impl Default for SurfaceConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "tablero".to_string(),
-            height: 32,
-            exclusive_zone: 32,
-        }
-    }
-}
+/// Layer-shell namespace (also the compositor-visible surface name).
+const NAMESPACE: &str = "tablero";
 
 /// Assumed width (px) for the initial shared-memory pool, before the compositor
 /// reports the real output width via the first configure event.
@@ -178,12 +159,14 @@ impl Bar {
 
 /// Open the bar and run its event loop until the compositor closes the surface.
 ///
-/// Wires the default producer set — the Hyprland workspace source, the UPower
-/// battery source, and the procfs system-stats source — so the bar shows live
-/// workspaces, battery, and CPU/memory load alongside the clock. The clock itself
-/// is still driven by the synchronous tick timer; see [`run_with_producers`] to
-/// supply a custom producer set.
-pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
+/// The bar's height, theme, font, spacing, and widget order all come from
+/// `config` (see [`tablero_core::config::Config`]). Wires the default producer
+/// set — the Hyprland workspace source, the UPower battery source, and the
+/// procfs system-stats source — so the bar shows live workspaces, battery, and
+/// CPU/memory load alongside the clock. The clock itself is still driven by the
+/// synchronous tick timer; see [`run_with_producers`] to supply a custom
+/// producer set.
+pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     run_with_producers(
         config,
         vec![
@@ -203,9 +186,13 @@ pub fn run(config: SurfaceConfig) -> Result<(), Box<dyn Error>> {
 /// dispatched into [`Bar::handle`] exactly like the clock timer. With an empty
 /// `producers` list no runtime is started at all.
 pub fn run_with_producers(
-    config: SurfaceConfig,
+    config: Config,
     producers: Vec<Box<dyn Producer>>,
 ) -> Result<(), Box<dyn Error>> {
+    // The bar reserves exactly its own height so windows tile beneath it.
+    let height = config.height;
+    let exclusive_zone = height as i32;
+
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn)?;
     let qh = event_queue.handle();
@@ -219,35 +206,27 @@ pub fn run_with_producers(
         &qh,
         surface,
         Layer::Top,
-        Some(config.namespace.clone()),
+        Some(NAMESPACE.to_string()),
         None,
     );
     // Top bar spanning the full output width.
     layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     // Width 0 with left+right anchors lets the compositor stretch us to fit.
-    layer.set_size(0, config.height);
-    layer.set_exclusive_zone(config.exclusive_zone);
+    layer.set_size(0, height);
+    layer.set_exclusive_zone(exclusive_zone);
     // Initial commit with no buffer; the compositor replies with a configure.
     layer.commit();
 
-    let pool = SlotPool::new((INITIAL_WIDTH * config.height * 4) as usize, &shm)?;
+    let pool = SlotPool::new((INITIAL_WIDTH * height * 4) as usize, &shm)?;
 
-    // Workspaces, clock, battery, then system stats, left to right;
-    // `Dashboard::layout` tiles them into columns each frame, so these initial
-    // bounds are just placeholders.
-    let full = Bounds::new(0, 0, INITIAL_WIDTH, config.height);
-    let workspaces = WorkspaceWidget::new(full);
-    let clock = ClockWidget::new(full);
-    let battery = BatteryWidget::new(full);
-    let system = SystemWidget::new(full);
-    let dashboard = Dashboard::new(vec![
-        Box::new(workspaces),
-        Box::new(clock),
-        Box::new(battery),
-        Box::new(system),
-    ]);
-    let ctx = RenderContext::new(INITIAL_WIDTH, config.height);
+    // The configured widget order drives which widgets are built and in what
+    // order; `Dashboard::layout` tiles them into columns each frame, so these
+    // initial bounds are just placeholders. The theme and font reach the
+    // renderer through the context's settings.
+    let full = Bounds::new(0, 0, INITIAL_WIDTH, height);
+    let dashboard = config.build_dashboard(full);
+    let ctx = RenderContext::with_settings(INITIAL_WIDTH, height, config.render_settings());
 
     let mut bar = Bar {
         registry_state: RegistryState::new(&globals),
@@ -257,7 +236,7 @@ pub fn run_with_producers(
         pool,
         layer,
         width: INITIAL_WIDTH,
-        height: config.height,
+        height,
         dashboard,
         ctx,
         pointer: None,
@@ -306,10 +285,7 @@ pub fn run_with_producers(
         Some(bridge)
     };
 
-    info!(
-        "tablero bar started: {}px tall, exclusive_zone={}",
-        config.height, config.exclusive_zone
-    );
+    info!("tablero bar started: {height}px tall, exclusive_zone={exclusive_zone}");
 
     let signal = event_loop.get_signal();
     event_loop.run(None, &mut bar, move |bar| {
