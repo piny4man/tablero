@@ -320,7 +320,13 @@ impl Widget for TrayWidget {
     fn update(&mut self, msg: &Msg) -> bool {
         match msg {
             Msg::Tray(next) => {
-                if self.state.as_ref() == Some(next) {
+                // The never-populated widget renders nothing, exactly like an
+                // empty snapshot, so an empty first update is not a change.
+                let unchanged = match &self.state {
+                    Some(current) => current == next,
+                    None => next.is_empty(),
+                };
+                if unchanged {
                     return false;
                 }
                 self.state = Some(next.clone());
@@ -473,6 +479,17 @@ mod tests {
         let tick = Msg::tick_now();
         assert!(!widget.update(&tick));
         assert_eq!(widget.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_first_snapshot_is_not_a_visible_change() {
+        // A fresh widget already renders nothing, so an empty tray snapshot
+        // matches what is on screen and must not force a repaint.
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(!widget.update(&Msg::Tray(TrayState::default())));
+        assert!(widget.is_empty());
+        // But the first non-empty snapshot is a change.
+        assert!(widget.update(&Msg::Tray(TrayState::new([item(":1.1", "a")]))));
     }
 
     #[test]

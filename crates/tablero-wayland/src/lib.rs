@@ -15,6 +15,7 @@ pub mod command;
 pub mod hyprland;
 pub mod networkmanager;
 pub mod producer;
+pub mod sni;
 pub mod sysmon;
 pub mod upower;
 
@@ -57,6 +58,7 @@ use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
 use crate::producer::{Producer, ProducerBridge};
+use crate::sni::SniHostProducer;
 use crate::sysmon::SystemProducer;
 use crate::upower::UPowerProducer;
 use wayland_client::{
@@ -95,9 +97,12 @@ struct Bar {
     ctx: RenderContext,
     /// The seat's pointer, created once the seat advertises the capability.
     pointer: Option<wl_pointer::WlPointer>,
-    /// Outbound command channel into the producer runtime, present only when the
-    /// bridge is running. Clicks are dropped when this is `None`.
-    commands: Option<CommandSender>,
+    /// Outbound command channels into the producer runtime, one per command
+    /// executor (Hyprland workspace switching, SNI tray activation). A click's
+    /// command is fanned out to every executor; each ignores the commands it does
+    /// not handle. Empty when no bridge is running, in which case clicks are
+    /// dropped.
+    commands: Vec<CommandSender>,
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
@@ -134,7 +139,7 @@ impl Bar {
     /// dashboard, dispatching any resulting [`Command`](tablero_core::widget::Command)
     /// into the producer runtime. Clicks that hit no interactive region — empty
     /// space, display-only widgets, or off-surface negative coordinates — are
-    /// ignored. With no command channel (no producer bridge) clicks are dropped.
+    /// ignored. With no command channels (no producer bridge) clicks are dropped.
     fn on_click(&mut self, x: f64, y: f64) {
         if x < 0.0 || y < 0.0 {
             return;
@@ -147,10 +152,13 @@ impl Bar {
         let Some(command) = self.dashboard.on_click((x * s) as u32, (y * s) as u32) else {
             return;
         };
-        if let Some(commands) = &self.commands
-            && commands.send(command).is_err()
-        {
-            warn!("command channel closed; dropping click command");
+        // Fan the command out to every executor; each runs the commands it
+        // handles and ignores the rest, so a single click reaches whichever
+        // backend owns it without the loop needing to know which that is.
+        for sender in &self.commands {
+            if sender.send(command.clone()).is_err() {
+                warn!("command channel closed; dropping click command");
+            }
         }
     }
 
@@ -204,10 +212,11 @@ impl Bar {
 /// The bar's height, theme, font, spacing, and widget order all come from
 /// `config` (see [`tablero_core::config::Config`]). Wires the default producer
 /// set — the Hyprland workspace source, the UPower battery source, the procfs
-/// system-stats source, and the NetworkManager connectivity source — so the bar
-/// shows live workspaces, battery, CPU/memory load, and network state alongside
-/// the clock. The clock itself is still driven by the synchronous tick timer;
-/// see [`run_with_producers`] to supply a custom producer set.
+/// system-stats source, the NetworkManager connectivity source, and the
+/// StatusNotifierItem tray host — so the bar shows live workspaces, battery,
+/// CPU/memory load, network state, and tray icons alongside the clock. The clock
+/// itself is still driven by the synchronous tick timer; see
+/// [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     run_with_producers(
         config,
@@ -216,6 +225,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(UPowerProducer::new()),
             Box::new(SystemProducer::new()),
             Box::new(NetworkProducer::new()),
+            Box::new(SniHostProducer::new()),
         ],
     )
 }
@@ -288,7 +298,7 @@ pub fn run_with_producers(
         dashboard,
         ctx,
         pointer: None,
-        commands: None,
+        commands: Vec::new(),
         configured: false,
         exit: false,
     };
@@ -324,11 +334,16 @@ pub fn run_with_producers(
         for producer in producers {
             bridge.spawn(producer);
         }
-        // The reverse path: clicks become commands the executor runs against the
-        // compositor. The loop holds the sender; the executor drains the rest.
-        let (command_tx, command_rx) = command_channel();
-        bridge.spawn_task("hyprland-commands", hyprland::run_commands(command_rx));
-        bar.commands = Some(command_tx);
+        // The reverse path: clicks become commands the executors run against the
+        // compositor and the session bus. The loop holds a sender per executor and
+        // fans each command out to all of them; an executor ignores commands it
+        // does not handle, so workspace switches reach Hyprland and tray
+        // activations reach the SNI items without the loop routing them.
+        let (hypr_tx, hypr_rx) = command_channel();
+        bridge.spawn_task("hyprland-commands", hyprland::run_commands(hypr_rx));
+        let (sni_tx, sni_rx) = command_channel();
+        bridge.spawn_task("sni-commands", sni::run_commands(sni_rx));
+        bar.commands = vec![hypr_tx, sni_tx];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
