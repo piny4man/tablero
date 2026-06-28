@@ -14,7 +14,7 @@
 //! [`OutputHandler`]: smithay_client_toolkit::output::OutputHandler
 
 use std::collections::HashMap;
-use std::collections::hash_map::ValuesMut;
+use std::collections::hash_map::{Values, ValuesMut};
 
 use tablero_core::config::Config;
 
@@ -91,6 +91,11 @@ impl<S> Outputs<S> {
     /// The surface for output `id`, if tracked, mutably.
     pub fn get_mut(&mut self, id: OutputId) -> Option<&mut S> {
         self.entries.get_mut(&id)
+    }
+
+    /// Every tracked surface — for finding the one a Wayland event targets.
+    pub fn values(&self) -> Values<'_, OutputId, S> {
+        self.entries.values()
     }
 
     /// Every tracked surface, mutably — for fanning a message out to all bars.
