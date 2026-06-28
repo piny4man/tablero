@@ -85,11 +85,11 @@ key, an unknown widget name, or a malformed color stops startup with a clear
 message naming the file.
 
 A ready-to-copy, fully-commented template lives at
-[`crates/tablero/config.example.toml`](crates/tablero/config.example.toml):
+[`config.example.toml`](config.example.toml):
 
 ```sh
 mkdir -p ~/.config/tablero
-cp crates/tablero/config.example.toml ~/.config/tablero/config.toml
+cp config.example.toml ~/.config/tablero/config.toml
 ```
 
 ### Reference

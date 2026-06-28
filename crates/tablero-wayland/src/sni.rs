@@ -133,7 +133,11 @@ pub fn tray_item_from_props(
 /// unreadable, undecodable) yields `None` — the item simply shows its initial.
 ///
 /// The PNG read is async so it never blocks the single-worker producer runtime.
-async fn resolve_icon(icon_name: &str, pixmaps: &[RawPixmap], theme_path: &str) -> Option<TrayIcon> {
+async fn resolve_icon(
+    icon_name: &str,
+    pixmaps: &[RawPixmap],
+    theme_path: &str,
+) -> Option<TrayIcon> {
     if let Some(icon) = select_pixmap(pixmaps) {
         return Some(icon);
     }
@@ -250,8 +254,9 @@ impl Watcher {
             .lock()
             .map(|mut items| items.insert(address.clone()))
             .unwrap_or(false);
-        if inserted {
-            let _ = Self::status_notifier_item_registered(&emitter, &address).await;
+        if inserted && let Err(e) = Self::status_notifier_item_registered(&emitter, &address).await
+        {
+            warn!("failed to emit StatusNotifierItemRegistered for {address}: {e}");
         }
     }
 

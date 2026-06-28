@@ -312,9 +312,10 @@ impl Config {
     pub fn from_toml_str(toml: &str) -> Result<Config, ConfigError> {
         let config: Config =
             toml::from_str(toml).map_err(|source| ConfigError::Parse { path: None, source })?;
-        config
-            .validate()
-            .map_err(|message| ConfigError::Invalid { path: None, message })?;
+        config.validate().map_err(|message| ConfigError::Invalid {
+            path: None,
+            message,
+        })?;
         Ok(config)
     }
 
@@ -370,7 +371,12 @@ impl Config {
             }
             let who = monitor.name.as_str();
             if let Some(height) = monitor.height {
-                validate_range(&format!("monitor {who:?} height"), height, MIN_HEIGHT, MAX_HEIGHT)?;
+                validate_range(
+                    &format!("monitor {who:?} height"),
+                    height,
+                    MIN_HEIGHT,
+                    MAX_HEIGHT,
+                )?;
             }
             if let Some(spacing) = monitor.spacing {
                 validate_range(&format!("monitor {who:?} spacing"), spacing, 0, MAX_GAP)?;
@@ -445,7 +451,9 @@ fn validate_range(field: &str, value: u32, min: u32, max: u32) -> Result<(), Str
     if (min..=max).contains(&value) {
         Ok(())
     } else {
-        Err(format!("{field} must be between {min} and {max}, got {value}"))
+        Err(format!(
+            "{field} must be between {min} and {max}, got {value}"
+        ))
     }
 }
 
@@ -1025,7 +1033,10 @@ mod tests {
         );
         // The message points at the specific monitor and field.
         let msg = err.to_string();
-        assert!(msg.contains("DP-1") && msg.contains("height"), "message: {msg}");
+        assert!(
+            msg.contains("DP-1") && msg.contains("height"),
+            "message: {msg}"
+        );
     }
 
     #[test]
