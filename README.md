@@ -43,6 +43,13 @@ RUST_LOG=info cargo run -p tablero
     NetworkManager is unavailable.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
+- Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
+  (so the bar keeps a consistent apparent size across displays), while the
+  shared-memory buffer is allocated at the output's physical pixel density and
+  `set_buffer_scale` maps it back. Text and layout are scaled exactly once — no
+  double-scaling. Integer-scale outputs are pixel-crisp; fractional-scale
+  Hyprland setups render at the next integer scale and the compositor downscales,
+  which stays sharp in practice.
 - Pulls live data from **async producers** (Hyprland IPC, UPower, procfs,
   NetworkManager over DBus) running on an off-thread Tokio runtime; they reach
   the synchronous render loop only by sending messages through a `calloop`
@@ -77,7 +84,8 @@ cp crates/tablero/config.example.toml ~/.config/tablero/config.toml
 Every value below is the built-in default.
 
 ```toml
-# Bar height in pixels. The width always spans the output.
+# Bar height in logical pixels (scaled to the output's pixel density on HiDPI
+# displays). The width always spans the output.
 height = 32
 
 # Horizontal gap between adjacent widget columns, in pixels.
@@ -140,5 +148,16 @@ surface placement and input need a live compositor. To verify on Hyprland:
    order), restart, and confirm the change takes effect; introduce a typo and
    confirm the process **refuses to start with a clear error** rather than
    silently ignoring it.
-9. Press the compositor's close path for the layer (or terminate the session)
-   and confirm the process exits cleanly via the `closed` handler.
+9. Verify **HiDPI scaling** on a scaled output. Set a scale on the monitor (e.g.
+   `hyprctl keyword monitor <name>,preferred,auto,2` for integer 2×, or `,1.5`
+   for fractional), then run the bar on it:
+   - The bar keeps the **same apparent height and text size** as on an unscaled
+     output — geometry is logical, so it does not shrink or balloon.
+   - Text and widget edges stay **crisp**, not blurry: the buffer is rendered at
+     the output's physical resolution (`RUST_LOG=info` logs `output scale changed
+     to Nx` when the compositor reports the scale).
+   - **Clicking a workspace** still switches to it — pointer hit-testing tracks
+     the scaled layout. On a fractional scale (e.g. 1.5×) the bar renders at 2×
+     and the compositor downscales; confirm it still looks sharp and clicks land.
+10. Press the compositor's close path for the layer (or terminate the session)
+    and confirm the process exits cleanly via the `closed` handler.
