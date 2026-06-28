@@ -11,7 +11,15 @@
 
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget};
+use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+
+/// Default network glyphs (Font Awesome, via Nerd Font), chosen by connection
+/// state: a wifi arc, a wired sitemap, a cross when disconnected, and a question
+/// mark when the state is indeterminate.
+const WIRELESS_GLYPH: &str = "\u{f1eb}"; // nf-fa-wifi
+const WIRED_GLYPH: &str = "\u{f0e8}"; // nf-fa-sitemap
+const DISCONNECTED_GLYPH: &str = "\u{f00d}"; // nf-fa-times
+const UNKNOWN_GLYPH: &str = "\u{f128}"; // nf-fa-question
 
 /// The kind of network connection in use, normalized from a raw daemon reading.
 ///
@@ -102,6 +110,18 @@ impl Network {
     }
 }
 
+/// The default glyph for a connection state: a wifi arc on a wireless link, a
+/// sitemap on a wired one, a cross when disconnected, and a question mark when
+/// the state is indeterminate.
+fn default_glyph(state: NetworkState) -> &'static str {
+    match state {
+        NetworkState::Wireless => WIRELESS_GLYPH,
+        NetworkState::Wired => WIRED_GLYPH,
+        NetworkState::Disconnected => DISCONNECTED_GLYPH,
+        NetworkState::Unknown => UNKNOWN_GLYPH,
+    }
+}
+
 /// A bar widget showing the network connection state and, on Wi-Fi, the SSID.
 ///
 /// Holds the last snapshot it was given so [`update`](Widget::update) can report
@@ -109,25 +129,49 @@ impl Network {
 /// snapshot is an [`Option`]: `None` is "no network / unavailable", which renders
 /// as empty space — identical to the pre-first-reading state, so unavailable
 /// connectivity is shown the same whether it was never there or just went away.
+/// Its resolved [`WidgetStyle`] decides the glyph, the optional pill, and the
+/// colors it draws with.
 pub struct NetworkWidget {
     bounds: Bounds,
     state: Option<Network>,
+    style: WidgetStyle,
 }
 
 impl NetworkWidget {
     /// Create a network widget occupying `bounds`, empty until its first
-    /// [`Msg::Network`](super::Msg::Network).
+    /// [`Msg::Network`](super::Msg::Network) and carrying the default (flat,
+    /// glyph-on) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             state: None,
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](NetworkWidget::new) at build time.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The currently displayed label (empty before the first reading, or while
     /// the network is unavailable).
     pub fn label(&self) -> String {
         self.state.as_ref().map(Network::label).unwrap_or_default()
+    }
+
+    /// The full pill text: the state-derived glyph joined to the label, or empty
+    /// while the network is unavailable (so the widget reserves no slot).
+    fn display_text(&self) -> String {
+        match &self.state {
+            Some(network) => glyph_label(
+                self.style.glyph(default_glyph(network.state())),
+                &network.label(),
+            ),
+            None => String::new(),
+        }
     }
 }
 
@@ -146,12 +190,19 @@ impl Widget for NetworkWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // An unavailable network draws nothing: the dashboard has already cleared
-        // the background, so the widget's slot is left blank.
-        if let Some(network) = &self.state {
-            let fg = ctx.foreground();
-            ctx.draw_text(&network.label(), self.bounds, fg);
-        }
+        // An unavailable network leaves `display_text` empty, so the pill paints
+        // nothing: the dashboard has already cleared the background.
+        draw_text_pill(
+            ctx,
+            &self.style,
+            self.bounds,
+            &self.display_text(),
+            self.style.base_colors(),
+        );
+    }
+
+    fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
+        measure_text_pill(ctx, &self.style, &self.display_text())
     }
 
     fn bounds(&self) -> Bounds {
@@ -298,5 +349,34 @@ mod tests {
         let mut widget = NetworkWidget::new(Bounds::new(0, 0, 1, 1));
         widget.set_bounds(Bounds::new(10, 0, 200, 32));
         assert_eq!(widget.bounds(), Bounds::new(10, 0, 200, 32));
+    }
+
+    #[test]
+    fn display_text_uses_a_state_driven_glyph() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
+        // Nothing to show before the first reading: no glyph, no slot.
+        assert_eq!(widget.display_text(), "");
+        // Each connection state picks its own glyph ahead of the label.
+        widget.update(&network(NetworkState::Wireless, Some("home-net")));
+        assert_eq!(
+            widget.display_text(),
+            format!("{WIRELESS_GLYPH} wifi home-net")
+        );
+        widget.update(&network(NetworkState::Wired, None));
+        assert_eq!(widget.display_text(), format!("{WIRED_GLYPH} wired"));
+        widget.update(&network(NetworkState::Disconnected, None));
+        assert_eq!(
+            widget.display_text(),
+            format!("{DISCONNECTED_GLYPH} disconnected")
+        );
+    }
+
+    #[test]
+    fn an_absent_network_measures_zero_a_present_one_reserves_a_slot() {
+        let mut ctx = RenderContext::new(320, 32);
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.measure(&mut ctx, 32), 0);
+        widget.update(&network(NetworkState::Wired, None));
+        assert!(widget.measure(&mut ctx, 32) > 0);
     }
 }

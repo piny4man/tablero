@@ -275,7 +275,7 @@ impl Surface {
         };
 
         self.ctx.resize(width, height);
-        self.dashboard.layout(width, height);
+        self.dashboard.layout(&mut self.ctx, width, height);
         self.dashboard.draw(&mut self.ctx);
         write_argb8888(self.ctx.pixels(), canvas);
 

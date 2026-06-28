@@ -11,7 +11,18 @@
 
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget};
+use super::{
+    Msg, StateColors, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+};
+
+/// Default battery glyphs (Font Awesome, via Nerd Font): a discharge ramp picked
+/// by charge quintile, plus a bolt shown while charging or topped off on AC.
+const BATTERY_EMPTY: &str = "\u{f244}"; // nf-fa-battery_empty
+const BATTERY_QUARTER: &str = "\u{f243}"; // nf-fa-battery_quarter
+const BATTERY_HALF: &str = "\u{f242}"; // nf-fa-battery_half
+const BATTERY_THREE_QUARTERS: &str = "\u{f241}"; // nf-fa-battery_three_quarters
+const BATTERY_FULL: &str = "\u{f240}"; // nf-fa-battery_full
+const BATTERY_CHARGING: &str = "\u{f0e7}"; // nf-fa-bolt
 
 /// The charge direction of a battery, normalized from a raw power-daemon state.
 ///
@@ -91,32 +102,83 @@ impl Battery {
     }
 }
 
+/// The default glyph for a battery snapshot: a bolt while charging or full on AC,
+/// otherwise the discharge ramp picked by charge quintile.
+fn default_glyph(battery: Battery) -> &'static str {
+    match battery.state() {
+        BatteryState::Charging | BatteryState::Full => BATTERY_CHARGING,
+        _ => match battery.percent() {
+            0..=19 => BATTERY_EMPTY,
+            20..=39 => BATTERY_QUARTER,
+            40..=59 => BATTERY_HALF,
+            60..=79 => BATTERY_THREE_QUARTERS,
+            _ => BATTERY_FULL,
+        },
+    }
+}
+
 /// A bar widget showing battery percentage and charge state.
 ///
 /// Holds the last snapshot it was given so [`update`](Widget::update) can report
 /// a visible change only when the normalized snapshot actually differs. The
 /// snapshot is an [`Option`]: `None` is "no battery / unavailable", which renders
 /// as empty space — identical to the pre-first-reading state, so an absent
-/// battery is shown the same whether it was never there or just went away.
+/// battery is shown the same whether it was never there or just went away. Its
+/// resolved [`WidgetStyle`] decides the glyph, the optional pill, and the colors
+/// it draws with — swapping to the warn colors when a discharging battery falls
+/// below the style's threshold.
 pub struct BatteryWidget {
     bounds: Bounds,
     state: Option<Battery>,
+    style: WidgetStyle,
 }
 
 impl BatteryWidget {
     /// Create a battery widget occupying `bounds`, empty until its first
-    /// [`Msg::Battery`](super::Msg::Battery).
+    /// [`Msg::Battery`](super::Msg::Battery) and carrying the default (flat,
+    /// glyph-on) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             state: None,
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](BatteryWidget::new) at build time.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The currently displayed label (empty before the first present reading, or
     /// while no battery is present).
     pub fn label(&self) -> String {
         self.state.map(Battery::label).unwrap_or_default()
+    }
+
+    /// The full pill text: the state-derived glyph joined to the label, or empty
+    /// when no battery is present (so the widget reserves no slot).
+    fn display_text(&self) -> String {
+        match self.state {
+            Some(battery) => {
+                glyph_label(self.style.glyph(default_glyph(battery)), &battery.label())
+            }
+            None => String::new(),
+        }
+    }
+
+    /// The pill colors for the current reading: the style's warn colors when a
+    /// discharging battery is below its threshold, otherwise the base colors.
+    fn state_colors(&self, battery: Battery) -> StateColors {
+        if battery.state() == BatteryState::Discharging
+            && u32::from(battery.percent()) < self.style.warn_threshold
+        {
+            self.style.warn
+        } else {
+            self.style.base_colors()
+        }
     }
 }
 
@@ -138,9 +200,18 @@ impl Widget for BatteryWidget {
         // An absent battery draws nothing: the dashboard has already cleared the
         // background, so the widget's slot is left blank.
         if let Some(battery) = self.state {
-            let fg = ctx.foreground();
-            ctx.draw_text(&battery.label(), self.bounds, fg);
+            draw_text_pill(
+                ctx,
+                &self.style,
+                self.bounds,
+                &self.display_text(),
+                self.state_colors(battery),
+            );
         }
+    }
+
+    fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
+        measure_text_pill(ctx, &self.style, &self.display_text())
     }
 
     fn bounds(&self) -> Bounds {
@@ -262,5 +333,82 @@ mod tests {
         let mut widget = BatteryWidget::new(Bounds::new(0, 0, 1, 1));
         widget.set_bounds(Bounds::new(10, 0, 200, 32));
         assert_eq!(widget.bounds(), Bounds::new(10, 0, 200, 32));
+    }
+
+    #[test]
+    fn default_glyph_ramps_by_quintile_while_discharging() {
+        let glyph = |percent| default_glyph(Battery::new(BatteryState::Discharging, percent));
+        // Each fifth of the charge range steps the ramp up one notch, empty→full.
+        assert_eq!(glyph(0.0), BATTERY_EMPTY);
+        assert_eq!(glyph(19.0), BATTERY_EMPTY);
+        assert_eq!(glyph(20.0), BATTERY_QUARTER);
+        assert_eq!(glyph(39.0), BATTERY_QUARTER);
+        assert_eq!(glyph(40.0), BATTERY_HALF);
+        assert_eq!(glyph(59.0), BATTERY_HALF);
+        assert_eq!(glyph(60.0), BATTERY_THREE_QUARTERS);
+        assert_eq!(glyph(79.0), BATTERY_THREE_QUARTERS);
+        assert_eq!(glyph(80.0), BATTERY_FULL);
+        assert_eq!(glyph(100.0), BATTERY_FULL);
+    }
+
+    #[test]
+    fn charging_or_full_shows_the_bolt_glyph() {
+        // On AC the ramp is irrelevant — a bolt marks power going in or topped off.
+        assert_eq!(
+            default_glyph(Battery::new(BatteryState::Charging, 5.0)),
+            BATTERY_CHARGING
+        );
+        assert_eq!(
+            default_glyph(Battery::new(BatteryState::Full, 100.0)),
+            BATTERY_CHARGING
+        );
+    }
+
+    #[test]
+    fn display_text_prefixes_the_state_glyph() {
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        // Nothing to show before the first reading: no glyph, no slot.
+        assert_eq!(widget.display_text(), "");
+        widget.update(&battery(BatteryState::Discharging, 85.0));
+        assert_eq!(
+            widget.display_text(),
+            format!("{BATTERY_FULL} 85% discharging")
+        );
+    }
+
+    #[test]
+    fn a_low_discharging_battery_uses_the_warn_colors() {
+        // Default style, default 20% threshold: below it while discharging swaps
+        // to the warn colors; at or above it keeps the base colors.
+        let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        let style = WidgetStyle::default();
+        assert_eq!(
+            widget.state_colors(Battery::new(BatteryState::Discharging, 15.0)),
+            style.warn
+        );
+        assert_eq!(
+            widget.state_colors(Battery::new(BatteryState::Discharging, 50.0)),
+            style.base_colors()
+        );
+    }
+
+    #[test]
+    fn a_low_battery_on_ac_keeps_the_base_colors() {
+        // The warn swap is for *discharging* only: a low battery that is charging
+        // is recovering, not in trouble, so it stays in the base colors.
+        let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(
+            widget.state_colors(Battery::new(BatteryState::Charging, 5.0)),
+            WidgetStyle::default().base_colors()
+        );
+    }
+
+    #[test]
+    fn an_absent_battery_measures_zero_a_present_one_reserves_a_slot() {
+        let mut ctx = RenderContext::new(320, 32);
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.measure(&mut ctx, 32), 0);
+        widget.update(&battery(BatteryState::Discharging, 85.0));
+        assert!(widget.measure(&mut ctx, 32) > 0);
     }
 }

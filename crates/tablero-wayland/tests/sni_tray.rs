@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
-use tablero_core::render::Bounds;
+use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::widget::{Command, Dashboard, Msg, TrayItem, TrayState, TrayWidget};
 use tablero_wayland::producer::{ProducerBridge, from_fn};
 use tablero_wayland::sni::tray_item_from_props;
@@ -176,11 +176,14 @@ fn clicking_a_tray_item_activates_it_by_address() {
     // activation command carrying that item's watcher address — the payload the
     // SNI executor turns into an Activate call.
     let mut dashboard = Dashboard::new(vec![Box::new(TrayWidget::new(Bounds::new(0, 0, 320, 32)))]);
-    dashboard.layout(320, 32);
+    // Populate the tray *before* layout: each item reserves one square cell, so
+    // the widget's slot is only sized once it holds items (as the host loop does).
     dashboard.update(&Msg::Tray(state_from(&[
         (":1.1", "discord", "Discord", "Active"),
         (":1.2", "telegram", "Telegram", "Active"),
     ])));
+    let mut ctx = RenderContext::new(320, 32);
+    dashboard.layout(&mut ctx, 320, 32);
 
     // Square cells of side 32 packed from the origin: address-sorted, :1.1 owns
     // [0,32) and :1.2 owns [32,64).

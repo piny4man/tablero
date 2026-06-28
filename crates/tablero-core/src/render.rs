@@ -1,10 +1,12 @@
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
-use tiny_skia::{FilterQuality, Paint, Pixmap, PixmapPaint, PixmapRef, Rect, Transform};
+use tiny_skia::{
+    FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, PixmapRef, Rect, Transform,
+};
 
-/// Opaque dark background color (R, G, B).
-pub const BG: (u8, u8, u8) = (0x18, 0x18, 0x18);
-/// Light foreground text color (R, G, B).
-pub const FG: (u8, u8, u8) = (0xEA, 0xEA, 0xEA);
+/// Opaque dark background color (R, G, B, A).
+pub const BG: (u8, u8, u8, u8) = (0x18, 0x18, 0x18, 0xFF);
+/// Opaque light foreground text color (R, G, B, A).
+pub const FG: (u8, u8, u8, u8) = (0xEA, 0xEA, 0xEA, 0xFF);
 
 /// Default font size (px) used when no configuration overrides it.
 const FONT_SIZE: f32 = 16.0;
@@ -16,16 +18,22 @@ const FONT_SIZE: f32 = 16.0;
 /// active foreground/accent through the context rather than baking in constants.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderSettings {
-    /// Background fill behind every widget.
-    pub background: (u8, u8, u8),
+    /// Background fill behind every widget. A non-opaque alpha lets the desktop
+    /// show through, which is what makes a "floating pills" bar possible.
+    pub background: (u8, u8, u8, u8),
     /// Default text color.
-    pub foreground: (u8, u8, u8),
+    pub foreground: (u8, u8, u8, u8),
     /// Emphasis color (e.g. the active workspace).
-    pub accent: (u8, u8, u8),
+    pub accent: (u8, u8, u8, u8),
     /// Text size in pixels.
     pub font_size: f32,
     /// Font family name, or `None` for the system default.
     pub font_family: Option<String>,
+    /// Integer output scale (HiDPI). The font is *pre-scaled* into `font_size`;
+    /// this factor scales the *geometry* widgets author in logical pixels
+    /// (pill radius, padding, inter-pill gap, bar margin) at render/layout time.
+    /// Always at least 1.
+    pub scale: u32,
 }
 
 impl Default for RenderSettings {
@@ -36,6 +44,7 @@ impl Default for RenderSettings {
             accent: FG,
             font_size: FONT_SIZE,
             font_family: None,
+            scale: 1,
         }
     }
 }
@@ -106,12 +115,12 @@ impl RenderContext {
     }
 
     /// The active foreground (default text) color.
-    pub fn foreground(&self) -> (u8, u8, u8) {
+    pub fn foreground(&self) -> (u8, u8, u8, u8) {
         self.settings.foreground
     }
 
     /// The active accent (emphasis) color.
-    pub fn accent(&self) -> (u8, u8, u8) {
+    pub fn accent(&self) -> (u8, u8, u8, u8) {
         self.settings.accent
     }
 
@@ -139,6 +148,15 @@ impl RenderContext {
         self.pixmap.height()
     }
 
+    /// The active integer output scale (always at least 1).
+    ///
+    /// Widgets multiply logical geometry (radius, padding, gap, margin) by this
+    /// to land physical pixels. The font is already scaled into `font_size`, so
+    /// it must *not* be multiplied again — see [`RenderSettings::scale`].
+    pub fn scale_factor(&self) -> u32 {
+        self.settings.scale.max(1)
+    }
+
     /// Resize the target to `width * height`, reallocating only when the size
     /// actually changed. A zero dimension is ignored (the protocol uses zero to
     /// mean "keep your current value").
@@ -151,11 +169,57 @@ impl RenderContext {
         }
     }
 
-    /// Fill the whole target with the configured opaque background.
+    /// Fill the whole target with the configured background color, honoring its
+    /// alpha (a transparent background lets the desktop show through).
     pub fn fill_background(&mut self) {
-        let (r, g, b) = self.settings.background;
+        let (r, g, b, a) = self.settings.background;
+        self.pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
+    }
+
+    /// Fill a rounded rectangle covering `bounds` with `color`, corner radius
+    /// `radius` pixels.
+    ///
+    /// This is the "pill" primitive: a widget paints one behind its content to
+    /// get the floating-pill look. `color` is *straight* (non-premultiplied)
+    /// alpha — pass the raw `#rrggbbaa` channels and let tiny-skia premultiply,
+    /// so a translucent pill blends correctly over a transparent bar with no
+    /// dark halo on its anti-aliased edges. The radius is clamped to half the
+    /// shorter side (an over-large radius yields a stadium/circle, not
+    /// artifacts). Nothing is drawn for a zero-area slot or a fully transparent
+    /// color, so a widget with no background color draws no pill at all.
+    pub fn fill_rounded_rect(&mut self, bounds: Bounds, color: (u8, u8, u8, u8), radius: f32) {
+        let (r, g, b, a) = color;
+        if bounds.width == 0 || bounds.height == 0 || a == 0 {
+            return;
+        }
+
+        let (x, y) = (bounds.x as f32, bounds.y as f32);
+        let (w, h) = (bounds.width as f32, bounds.height as f32);
+        let radius = radius.clamp(0.0, (w / 2.0).min(h / 2.0));
+
+        let path = if radius <= 0.0 {
+            PathBuilder::from_rect(Rect::from_xywh(x, y, w, h).expect("validated non-zero rect"))
+        } else {
+            // Walk the outline clockwise, rounding each corner with a quadratic
+            // curve whose control point is the would-be sharp corner.
+            let mut pb = PathBuilder::new();
+            pb.move_to(x + radius, y);
+            pb.line_to(x + w - radius, y);
+            pb.quad_to(x + w, y, x + w, y + radius);
+            pb.line_to(x + w, y + h - radius);
+            pb.quad_to(x + w, y + h, x + w - radius, y + h);
+            pb.line_to(x + radius, y + h);
+            pb.quad_to(x, y + h, x, y + h - radius);
+            pb.line_to(x, y + radius);
+            pb.quad_to(x, y, x + radius, y);
+            pb.close();
+            pb.finish().expect("rounded-rect path is well-formed")
+        };
+
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(r, g, b, a);
         self.pixmap
-            .fill(tiny_skia::Color::from_rgba8(r, g, b, 0xFF));
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
     /// Shape and draw `text` in `color` within `bounds`.
@@ -164,7 +228,7 @@ impl RenderContext {
     /// line box is the full bound height), and never wraps. Glyphs are clipped
     /// to nothing outside the bounds only insofar as the shaping box limits
     /// them; callers size bounds to fit their content.
-    pub fn draw_text(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8)) {
+    pub fn draw_text(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8, u8)) {
         if bounds.width == 0 || bounds.height == 0 {
             return;
         }
@@ -188,7 +252,7 @@ impl RenderContext {
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(font_system, false);
 
-        let text_color = Color::rgb(color.0, color.1, color.2);
+        let text_color = Color::rgba(color.0, color.1, color.2, color.3);
         let (ox, oy) = (bounds.x as f32, bounds.y as f32);
         let mut dst = pixmap.as_mut();
         buffer.draw(font_system, swash_cache, text_color, |x, y, w, h, color| {
@@ -201,6 +265,45 @@ impl RenderContext {
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             dst.fill_rect(rect, &paint, Transform::default(), None);
         });
+    }
+
+    /// The width in pixels `text` would occupy when shaped with the active font,
+    /// unconstrained (single line, no wrapping), rounded up.
+    ///
+    /// This is how the content-aware layout sizes a widget to exactly its
+    /// content. The shaping matches [`draw_text`](RenderContext::draw_text) (same
+    /// font, same `Shaping::Advanced` glyph fallback), so the measured width
+    /// agrees with the drawn width up to the sub-pixel the `ceil` absorbs. Empty
+    /// text measures zero, so an empty widget reserves no slot.
+    pub fn measure_text(&mut self, text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+
+        let RenderContext {
+            font_system,
+            settings,
+            ..
+        } = self;
+
+        let metrics = Metrics::new(settings.font_size, settings.font_size);
+        let mut buffer = Buffer::new(font_system, metrics);
+        // Unconstrained box: the shaped line keeps its full advance width.
+        buffer.set_size(None, None);
+        buffer.set_wrap(Wrap::None);
+
+        let mut attrs = Attrs::new();
+        if let Some(family) = &settings.font_family {
+            attrs = attrs.family(Family::Name(family));
+        }
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max)
+            .ceil() as u32
     }
 
     /// Blit a premultiplied RGBA8888 image into `bounds`, scaled to fit while
@@ -285,6 +388,73 @@ mod tests {
             "corner not dark: {last:?}"
         );
         assert_eq!(last[3], 0xFF, "corner not opaque");
+    }
+
+    #[test]
+    fn fill_background_alpha_is_transparent() {
+        // A background color with zero alpha clears to fully transparent pixels,
+        // so a transparent bar lets the desktop show through. tiny-skia stores
+        // premultiplied bytes, so zero alpha zeroes every channel.
+        let settings = RenderSettings {
+            background: (0x80, 0x40, 0x20, 0x00),
+            ..RenderSettings::default()
+        };
+        let mut ctx = RenderContext::with_settings(8, 4, settings);
+        ctx.fill_background();
+        assert_eq!(&ctx.pixels()[0..4], &[0, 0, 0, 0], "background not transparent");
+    }
+
+    #[test]
+    fn fill_rounded_rect_paints_interior_and_skips_transparent() {
+        let mut ctx = RenderContext::new(40, 40);
+        ctx.fill_background();
+        // An opaque green pill across the middle of the surface.
+        ctx.fill_rounded_rect(Bounds::new(4, 4, 32, 32), (0x00, 0xC0, 0x00, 0xFF), 8.0);
+        let center = (20 * 40 + 20) * 4;
+        {
+            let px = ctx.pixels();
+            // The center is deep inside the pill: fully covered, so green.
+            assert!(
+                px[center] < 0x30 && px[center + 1] > 0x80 && px[center + 2] < 0x30,
+                "pill center not green: {:?}",
+                &px[center..center + 4]
+            );
+        }
+
+        // A fully transparent fill is a no-op: a corner outside the pill keeps
+        // the background it had before the call.
+        let before = ctx.pixels()[0..4].to_vec();
+        ctx.fill_rounded_rect(Bounds::new(0, 0, 40, 40), (0xFF, 0x00, 0x00, 0x00), 8.0);
+        assert_eq!(
+            &ctx.pixels()[0..4],
+            &before[..],
+            "transparent fill changed pixels"
+        );
+    }
+
+    #[test]
+    fn measure_text_grows_with_content_and_is_zero_for_empty() {
+        let mut ctx = RenderContext::new(200, 32);
+        assert_eq!(ctx.measure_text(""), 0, "empty text has zero width");
+        let one = ctx.measure_text("8");
+        let many = ctx.measure_text("88:88:88");
+        assert!(one > 0, "a single glyph has nonzero width");
+        assert!(many > one, "more text is wider: {many} !> {one}");
+    }
+
+    #[test]
+    fn scale_factor_defaults_to_one_and_follows_settings() {
+        let ctx = RenderContext::new(10, 10);
+        assert_eq!(ctx.scale_factor(), 1);
+        let scaled = RenderContext::with_settings(
+            10,
+            10,
+            RenderSettings {
+                scale: 2,
+                ..RenderSettings::default()
+            },
+        );
+        assert_eq!(scaled.scale_factor(), 2);
     }
 
     #[test]

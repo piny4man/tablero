@@ -7,16 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::render::{Bounds, RenderContext};
+use crate::render::{BG, Bounds, FG, RenderContext};
 
-use super::{Command, Msg, Widget};
-
-/// Width, in pixels, of each workspace item's clickable/rendered cell.
-///
-/// Items are packed left-to-right from the widget's origin, each in a cell this
-/// wide. Only these cells are interactive; the rest of the widget's slot is
-/// empty space that ignores clicks.
-const ITEM_WIDTH: u32 = 36;
+use super::{Command, Msg, Widget, WidgetStyle, draw_centered};
 
 /// The projection of a snapshot that a single widget renders: the ids to show,
 /// in order, and which one (if any) is active in that widget's scope.
@@ -204,29 +197,40 @@ pub struct WorkspaceWidget {
     /// global fallback that shows every monitor's workspaces.
     monitor: Option<String>,
     state: Option<Workspaces>,
+    style: WidgetStyle,
 }
 
 impl WorkspaceWidget {
     /// Create an unscoped workspace widget occupying `bounds`, empty until its
     /// first [`Msg::Workspaces`](super::Msg::Workspaces). It shows the global
-    /// workspace set across every monitor.
+    /// workspace set across every monitor, with the default (flat) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             monitor: None,
             state: None,
+            style: WidgetStyle::default(),
         }
     }
 
     /// Create a workspace widget scoped to one `monitor` (connector name): it
     /// shows only that monitor's workspaces and highlights that monitor's
-    /// active workspace.
+    /// active workspace. Carries the default (flat) style until one is set.
     pub fn for_monitor(bounds: Bounds, monitor: impl Into<String>) -> Self {
         Self {
             bounds,
             monitor: Some(monitor.into()),
             state: None,
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](WorkspaceWidget::new) or
+    /// [`for_monitor`](WorkspaceWidget::for_monitor) at build time.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The current view this widget renders (empty before the first snapshot).
@@ -244,28 +248,42 @@ impl WorkspaceWidget {
 
     /// The per-item cells: each `(id, bounds)` pair is one workspace's slot.
     ///
-    /// Items are laid out left-to-right from the widget origin in [`ITEM_WIDTH`]
-    /// cells, clipped to the widget's slot. Both [`draw`](Widget::draw) and
+    /// Items are laid out left-to-right from the widget origin in square cells as
+    /// wide as the widget is tall (so each scales with the bar height and the
+    /// output's pixel density, since layout runs in physical pixels), clipped to
+    /// the widget's slot. Both [`draw`](Widget::draw) and
     /// [`on_click`](Widget::on_click) read this, so what is painted and what is
-    /// clickable are the same regions by construction.
+    /// clickable are the same regions by construction — and the height-derived
+    /// extent keeps [`on_click`](Widget::on_click) free of any render context.
     fn item_cells(&self) -> Vec<(i32, Bounds)> {
-        if self.bounds.width == 0 || self.bounds.height == 0 {
+        let side = self.bounds.height;
+        if self.bounds.width == 0 || side == 0 {
             return Vec::new();
         }
 
         let right = self.bounds.x + self.bounds.width;
         let mut cells = Vec::new();
         for (i, id) in self.view().ids.into_iter().enumerate() {
-            let x = self.bounds.x + ITEM_WIDTH * i as u32;
+            let x = self.bounds.x + side * i as u32;
             if x >= right {
                 // Ran out of room in the widget's slot; stop placing items.
                 break;
             }
-            let width = ITEM_WIDTH.min(right - x);
+            let width = side.min(right - x);
             cells.push((id, Bounds::new(x, self.bounds.y, width, self.bounds.height)));
         }
         cells
     }
+}
+
+/// Light or dark text, whichever reads more clearly over the pill `fill` —
+/// chosen by the fill's perceived luminance (Rec. 601). So an active workspace's
+/// id stays legible whatever accent the theme paints behind it, without the
+/// style having to carry a separate "text over the active pill" color.
+fn contrast_color(fill: (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+    let (r, g, b, _) = fill;
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    if luma >= 140.0 { BG } else { FG }
 }
 
 impl Widget for WorkspaceWidget {
@@ -283,19 +301,34 @@ impl Widget for WorkspaceWidget {
         }
     }
 
+    fn measure(&self, _ctx: &mut RenderContext, height: u32) -> u32 {
+        // One square cell per workspace, each as wide as the row is tall, matching
+        // the cells [`item_cells`](WorkspaceWidget::item_cells) will draw (which
+        // size off the laid-out `bounds.height` this same value becomes).
+        self.view().ids.len() as u32 * height
+    }
+
     fn draw(&self, ctx: &mut RenderContext) {
         let active = self.view().active;
-        let foreground = ctx.foreground();
-        let accent = ctx.accent();
+        let radius = (self.style.radius * ctx.scale_factor()) as f32;
         for (id, cell) in self.item_cells() {
-            // The active workspace is bracketed and painted in the accent color to
-            // set it apart from the rest.
-            let (text, color) = if Some(id) == active {
-                (format!("[{id}]"), accent)
-            } else {
-                (id.to_string(), foreground)
+            let is_active = Some(id) == active;
+            let (text, color) = match self.style.background {
+                // Pills enabled (a background is configured): the active item
+                // fills the accent pill, the rest the base background, and the id
+                // reads in whichever of light/dark contrasts with that fill.
+                Some(base) => {
+                    let fill = if is_active { self.style.accent } else { base };
+                    ctx.fill_rounded_rect(cell, fill, radius);
+                    (id.to_string(), contrast_color(fill))
+                }
+                // Flat default (no background): the active id is bracketed and
+                // accent-colored, the rest plain foreground — no pill, identical
+                // to the bare bar before any styling.
+                None if is_active => (format!("[{id}]"), self.style.accent),
+                None => (id.to_string(), self.style.foreground),
             };
-            ctx.draw_text(&text, cell, color);
+            draw_centered(ctx, &text, cell, color);
         }
     }
 
@@ -389,8 +422,8 @@ mod tests {
     fn click_on_an_item_switches_to_that_workspace() {
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
         widget.update(&ws([1, 2, 3], 1));
-        // Items are 36px-wide cells packed from the origin: 1 -> [0,36),
-        // 2 -> [36,72), 3 -> [72,108).
+        // Square cells as wide as the 32px-tall widget, packed from the origin:
+        // 1 -> [0,32), 2 -> [32,64), 3 -> [64,96).
         assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(1)));
         assert_eq!(widget.on_click(50, 16), Some(Command::SwitchWorkspace(2)));
         assert_eq!(widget.on_click(80, 31), Some(Command::SwitchWorkspace(3)));
@@ -400,7 +433,7 @@ mod tests {
     fn click_on_empty_space_past_the_items_is_ignored() {
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
         widget.update(&ws([1, 2, 3], 1));
-        // Past the third item's cell (ends at 108) there is only empty slot.
+        // Past the third item's cell (ends at 96) there is only empty slot.
         assert_eq!(widget.on_click(200, 16), None);
     }
 
@@ -414,7 +447,7 @@ mod tests {
     fn click_respects_the_widget_offset() {
         let mut widget = WorkspaceWidget::new(Bounds::new(100, 0, 220, 32));
         widget.update(&ws([1, 2], 1));
-        // Cells start at the widget origin: 1 -> [100,136), 2 -> [136,172).
+        // Cells start at the widget origin: 1 -> [100,132), 2 -> [132,164).
         assert_eq!(widget.on_click(90, 0), None);
         assert_eq!(widget.on_click(110, 0), Some(Command::SwitchWorkspace(1)));
         assert_eq!(widget.on_click(150, 0), Some(Command::SwitchWorkspace(2)));
@@ -426,10 +459,58 @@ mod tests {
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 40, 32));
         widget.update(&ws([1, 2, 3], 1));
         assert_eq!(widget.on_click(10, 0), Some(Command::SwitchWorkspace(1)));
-        // Second item would start at x=36, within the 40px slot, clipped to 4px.
+        // Second item starts at x=32, within the 40px slot, clipped to 8px.
         assert_eq!(widget.on_click(38, 0), Some(Command::SwitchWorkspace(2)));
-        // Third item would start at x=72, past the slot: never placed.
+        // Third item would start at x=64, past the slot: never placed.
         assert_eq!(widget.on_click(39, 0), Some(Command::SwitchWorkspace(2)));
+    }
+
+    #[test]
+    fn contrast_color_picks_dark_over_light_and_light_over_dark() {
+        // A bright fill takes dark text; a dark fill takes light text, so an id
+        // stays legible over whatever accent the theme paints.
+        assert_eq!(contrast_color((0xEA, 0xEA, 0xEA, 0xFF)), BG);
+        assert_eq!(contrast_color((0x20, 0x20, 0x20, 0xFF)), FG);
+    }
+
+    #[test]
+    fn a_styled_workspace_fills_the_active_pill_with_the_accent() {
+        // A configured background switches the widget to pills: the active cell
+        // is filled with the accent (here pure red), not left flat.
+        let style = WidgetStyle {
+            background: Some((0x30, 0x30, 0x30, 0xFF)),
+            accent: (0xFF, 0x00, 0x00, 0xFF),
+            ..WidgetStyle::default()
+        };
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 64, 32)).with_style(style);
+        widget.update(&ws([1, 2], 1)); // 1 is active
+
+        let mut ctx = RenderContext::new(64, 32);
+        ctx.fill_background();
+        widget.draw(&mut ctx);
+        // The active cell is [0,32); a point on its left-middle edge (clear of the
+        // centered id glyph) is solidly the red accent fill.
+        let px = ctx.pixels();
+        let p = (16 * 64 + 4) * 4;
+        assert!(
+            px[p] > 0xC0 && px[p + 1] < 0x40 && px[p + 2] < 0x40,
+            "active pill not accent-filled"
+        );
+    }
+
+    #[test]
+    fn the_flat_default_paints_no_pill_behind_the_active_workspace() {
+        // The default style has no background, so the active workspace draws as
+        // bracketed text over the bare bar — the cell corner stays background.
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 64, 32));
+        widget.update(&ws([1, 2], 1));
+
+        let mut ctx = RenderContext::new(64, 32);
+        ctx.fill_background();
+        widget.draw(&mut ctx);
+        // The active cell's top-left corner holds no pill fill: it is bare bar.
+        let px = ctx.pixels();
+        assert_eq!(&px[0..4], &[BG.0, BG.1, BG.2, BG.3]);
     }
 
     // --- Monitor-aware snapshots ----------------------------------------------
@@ -482,7 +563,7 @@ mod tests {
             w.update(&Msg::Workspaces(multi()));
             w
         };
-        // Cells pack from the origin over this monitor's ids: 3 -> [0,36), 4 -> [36,72).
+        // Cells pack from the origin over this monitor's ids: 3 -> [0,32), 4 -> [32,64).
         assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(3)));
         assert_eq!(widget.on_click(50, 0), Some(Command::SwitchWorkspace(4)));
     }

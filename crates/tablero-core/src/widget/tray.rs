@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use crate::render::{Bounds, RenderContext};
 
-use super::{Command, Msg, Widget};
+use super::{Command, Msg, Widget, WidgetStyle, draw_centered};
 
 /// A tray item's status, normalized from the SNI `Status` property.
 ///
@@ -259,16 +259,27 @@ impl TrayState {
 pub struct TrayWidget {
     bounds: Bounds,
     state: Option<TrayState>,
+    style: WidgetStyle,
 }
 
 impl TrayWidget {
     /// Create a tray widget occupying `bounds`, empty until its first
-    /// [`Msg::Tray`](super::Msg::Tray).
+    /// [`Msg::Tray`](super::Msg::Tray), with the default (flat) style.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
             state: None,
+            style: WidgetStyle::default(),
         }
+    }
+
+    /// Set the resolved visual style, consuming and returning `self` so it
+    /// chains off [`new`](TrayWidget::new) at build time. The
+    /// [`attention`](super::WidgetStyle::attention) colors back the pill drawn
+    /// behind an item that requests attention.
+    pub fn with_style(mut self, style: WidgetStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The number of items currently shown (zero before the first message).
@@ -336,14 +347,39 @@ impl Widget for TrayWidget {
         }
     }
 
+    fn measure(&self, _ctx: &mut RenderContext, height: u32) -> u32 {
+        // One square cell per item, each as wide as the row is tall, matching the
+        // cells [`item_cells`](TrayWidget::item_cells) will draw.
+        self.len() as u32 * height
+    }
+
     fn draw(&self, ctx: &mut RenderContext) {
-        let fg = ctx.foreground();
+        let radius = (self.style.radius * ctx.scale_factor()) as f32;
         for (item, cell) in self.item_cells() {
+            let needs_attention = item.status() == TrayStatus::NeedsAttention;
+            // A pill sits behind the cell when the item needs attention (the
+            // alert color) or when a base background is configured; the attention
+            // color wins so a flagged item always stands out.
+            let pill = if needs_attention {
+                self.style.attention.background
+            } else {
+                self.style.background
+            };
+            if let Some(bg) = pill {
+                ctx.fill_rounded_rect(cell, bg, radius);
+            }
             // A usable icon is blitted into its cell; an item without one falls
-            // back to its initial so it stays visible and clickable.
+            // back to its centered initial so it stays visible and clickable.
             match item.icon() {
                 Some(icon) => ctx.draw_icon(icon.rgba(), icon.width(), icon.height(), cell),
-                None => ctx.draw_text(&item.fallback_label(), cell, fg),
+                None => {
+                    let color = if needs_attention {
+                        self.style.attention.foreground
+                    } else {
+                        self.style.foreground
+                    };
+                    draw_centered(ctx, &item.fallback_label(), cell, color);
+                }
             }
         }
     }
@@ -580,6 +616,42 @@ mod tests {
         let px = ctx.pixels();
         let center = (16 * 64 + 16) * 4;
         assert!(px[center + 2] > 0x80, "icon cell not blue");
+    }
+
+    #[test]
+    fn an_attention_item_draws_an_alert_pill_behind_its_cell() {
+        // An item requesting attention gets the default alert pill (a muted red)
+        // painted behind it, so it stands out even with no icon.
+        let attn = TrayItem::new(":1.1", "urgent", TrayStatus::NeedsAttention, None);
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32));
+        widget.update(&Msg::Tray(TrayState::new([attn])));
+
+        let mut ctx = RenderContext::new(32, 32);
+        ctx.fill_background();
+        widget.draw(&mut ctx);
+        // A point on the cell's left-middle edge (clear of the centered initial)
+        // reads distinctly red — redder than it is blue — unlike the dark bar.
+        let px = ctx.pixels();
+        let p = (16 * 32 + 3) * 4;
+        assert!(
+            px[p] > 0x80 && px[p] > px[p + 2],
+            "attention cell not alert-filled"
+        );
+    }
+
+    #[test]
+    fn a_passive_item_with_the_default_style_draws_no_pill() {
+        // The default style has no base background, so an ordinary item leaves
+        // the bar showing through behind its centered initial.
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32));
+        widget.update(&Msg::Tray(TrayState::new([item(":1.1", "app")])));
+
+        let mut ctx = RenderContext::new(32, 32);
+        ctx.fill_background();
+        widget.draw(&mut ctx);
+        // The cell's top-left corner holds no pill fill: it is bare bar.
+        let px = ctx.pixels();
+        assert_eq!(&px[0..4], &[0x18, 0x18, 0x18, 0xFF]);
     }
 
     #[test]
