@@ -38,7 +38,8 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BatteryWidget, ClockWidget, Dashboard, NetworkWidget, SystemWidget, Widget, WorkspaceWidget,
+    BatteryWidget, ClockWidget, Dashboard, NetworkWidget, SystemWidget, TrayWidget, Widget,
+    WorkspaceWidget,
 };
 
 /// Default bar height in pixels.
@@ -157,6 +158,8 @@ pub enum WidgetKind {
     System,
     /// The network connectivity indicator.
     Network,
+    /// The StatusNotifierItem system tray.
+    Tray,
 }
 
 /// The default left-to-right widget order, matching the pre-config bar.
@@ -264,6 +267,7 @@ impl WidgetKind {
             WidgetKind::Battery => Box::new(BatteryWidget::new(bounds)),
             WidgetKind::System => Box::new(SystemWidget::new(bounds)),
             WidgetKind::Network => Box::new(NetworkWidget::new(bounds)),
+            WidgetKind::Tray => Box::new(TrayWidget::new(bounds)),
         }
     }
 }
@@ -492,6 +496,16 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid config"), "message: {msg}");
+    }
+
+    #[test]
+    fn tray_is_an_opt_in_widget_name() {
+        // The tray is not in the default set, but naming it is valid and builds.
+        assert!(!default_widgets().contains(&WidgetKind::Tray));
+        let config = Config::from_toml_str(r#"widgets = ["tray", "clock"]"#).unwrap();
+        assert_eq!(config.widgets, vec![WidgetKind::Tray, WidgetKind::Clock]);
+        // It constructs a widget without panicking.
+        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32));
     }
 
     #[test]
