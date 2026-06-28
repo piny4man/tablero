@@ -131,13 +131,19 @@ pub fn tray_item_from_props(
 /// otherwise the icon name is resolved against the item's `IconThemePath` and the
 /// standard system icon directories. Any failure along the themed path (no file,
 /// unreadable, undecodable) yields `None` — the item simply shows its initial.
-fn resolve_icon(icon_name: &str, pixmaps: &[RawPixmap], theme_path: &str) -> Option<TrayIcon> {
+///
+/// The PNG read is async so it never blocks the single-worker producer runtime.
+async fn resolve_icon(
+    icon_name: &str,
+    pixmaps: &[RawPixmap],
+    theme_path: &str,
+) -> Option<TrayIcon> {
     if let Some(icon) = select_pixmap(pixmaps) {
         return Some(icon);
     }
     let dirs = icon_search_dirs(theme_path);
     let file = find_icon_file(icon_name, &dirs)?;
-    let bytes = std::fs::read(file).ok()?;
+    let bytes = tokio::fs::read(file).await.ok()?;
     TrayIcon::from_png_bytes(&bytes).ok()
 }
 
@@ -189,7 +195,7 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
     let pixmaps = item.icon_pixmap().await.unwrap_or_default();
 
-    let icon = resolve_icon(&icon_name, &pixmaps, &theme_path);
+    let icon = resolve_icon(&icon_name, &pixmaps, &theme_path).await;
     Some(tray_item_from_props(key, &id, &title, &status, icon))
 }
 
@@ -248,8 +254,9 @@ impl Watcher {
             .lock()
             .map(|mut items| items.insert(address.clone()))
             .unwrap_or(false);
-        if inserted {
-            let _ = Self::status_notifier_item_registered(&emitter, &address).await;
+        if inserted && let Err(e) = Self::status_notifier_item_registered(&emitter, &address).await
+        {
+            warn!("failed to emit StatusNotifierItemRegistered for {address}: {e}");
         }
     }
 

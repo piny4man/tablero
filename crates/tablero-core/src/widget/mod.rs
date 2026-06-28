@@ -242,10 +242,10 @@ mod tests {
 
         // First message paints from the empty initial state: dirty.
         assert!(dash.update(&at(12, 0, 0)));
-        // Same wall-clock second again: no visible change, not dirty.
-        assert!(!dash.update(&at(12, 0, 0)));
-        // A new second flips the displayed text: dirty again.
-        assert!(dash.update(&at(12, 0, 1)));
+        // A later second in the same minute: no visible change, not dirty.
+        assert!(!dash.update(&at(12, 0, 30)));
+        // A new minute flips the displayed text: dirty again.
+        assert!(dash.update(&at(12, 1, 0)));
     }
 
     #[test]

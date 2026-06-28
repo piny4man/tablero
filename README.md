@@ -41,7 +41,7 @@ RUST_LOG=info cargo run -p tablero
   architecture, each repainting only when its visible state actually changes:
   - **Workspaces** — the Hyprland workspace set, active one bracketed and drawn
     in the accent color. **Click a workspace to switch to it.**
-  - **Clock** — a live local clock (`HH:MM:SS`).
+  - **Clock** — a live local clock (`HH:MM`).
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
   - **System** — CPU and memory load sampled from procfs.
@@ -85,11 +85,11 @@ key, an unknown widget name, or a malformed color stops startup with a clear
 message naming the file.
 
 A ready-to-copy, fully-commented template lives at
-[`crates/tablero/config.example.toml`](crates/tablero/config.example.toml):
+[`config.example.toml`](config.example.toml):
 
 ```sh
 mkdir -p ~/.config/tablero
-cp crates/tablero/config.example.toml ~/.config/tablero/config.toml
+cp config.example.toml ~/.config/tablero/config.toml
 ```
 
 ### Reference

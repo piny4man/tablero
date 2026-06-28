@@ -52,7 +52,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use tablero_core::blit::write_argb8888;
-use tablero_core::clock::millis_until_next_second;
+use tablero_core::clock::millis_until_next_minute;
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::scale::Scale;
@@ -463,11 +463,13 @@ pub fn run_with_producers(
     // Wayland events (output advertisements, configure, close, ...) wake the loop.
     WaylandSource::new(conn, event_queue).insert(handle.clone())?;
 
-    // A timer aligned to the wall-clock second wakes the loop for each tick.
-    let timer = Timer::from_duration(Duration::from_millis(millis_until_next_second()));
+    // A timer aligned to the wall-clock minute wakes the loop for each tick. The
+    // clock renders HH:MM, so once-per-minute keeps it correct while the loop
+    // stays idle the rest of the minute.
+    let timer = Timer::from_duration(Duration::from_millis(millis_until_next_minute()));
     handle.insert_source(timer, |_deadline, _, app| {
         app.handle_all(&Msg::tick_now());
-        TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_second()))
+        TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_minute()))
     })?;
 
     // Bring up the async producer bridge only when there is async work to do.

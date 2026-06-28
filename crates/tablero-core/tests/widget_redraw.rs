@@ -21,20 +21,20 @@ fn message_updates_state_and_drives_exact_redraw_decision() {
 
     // From the empty initial state, the first tick is a visible change → redraw.
     assert!(
-        dash.update(&tick(23, 59, 58)),
+        dash.update(&tick(23, 58, 10)),
         "first tick must request a redraw"
     );
 
-    // The same wall-clock second produces identical text → no redraw.
+    // A later second within the same minute produces identical text → no redraw.
     assert!(
-        !dash.update(&tick(23, 59, 58)),
-        "an unchanged second must not request a redraw"
+        !dash.update(&tick(23, 58, 45)),
+        "an unchanged minute must not request a redraw"
     );
 
-    // Crossing a second boundary changes the text → redraw again.
+    // Crossing a minute boundary changes the text → redraw again.
     assert!(
-        dash.update(&tick(23, 59, 59)),
-        "a new second must request a redraw"
+        dash.update(&tick(23, 59, 0)),
+        "a new minute must request a redraw"
     );
 }
 

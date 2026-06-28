@@ -5,3 +5,23 @@ members = [
     "crates/tablero-wayland",
 ]
 resolver = "2"
+
+# Size-optimized release build. The bar is a long-running daemon whose render
+# path is light, so we trade a little compile time (and unwinding panics) for the
+# smallest possible binary. Dev/test builds are unaffected — they keep the
+# default unwinding panics and backtraces.
+[profile.release]
+opt-level = "z"     # optimize for size over speed
+lto = true          # fat link-time optimization across the whole graph
+codegen-units = 1   # maximum cross-unit optimization (slower compile)
+panic = "abort"     # drop unwind tables; a panic aborts the process
+strip = true        # strip symbols and debuginfo from the binary
+
+# Shared lints, inherited by every member via `[lints] workspace = true`. Kept
+# pragmatic: deny clippy's default group and direct `unsafe`, but leave the
+# pedantic/nursery groups opt-in so the build isn't flooded with style nits.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "deny"

@@ -1,4 +1,4 @@
-//! The clock widget: an `HH:MM:SS` readout driven by [`Msg::Tick`].
+//! The clock widget: an `HH:MM` readout driven by [`Msg::Tick`].
 
 use crate::clock::format_time;
 use crate::render::{Bounds, RenderContext};
@@ -8,9 +8,9 @@ use super::{Msg, Widget};
 /// A live clock rendered through the widget architecture.
 ///
 /// Holds the currently displayed text so [`update`](Widget::update) can report a
-/// visible change only when the formatted second actually differs — sub-second
-/// ticks that format identically are reported as unchanged, so the host loop
-/// stays idle between visible flips.
+/// visible change only when the formatted minute actually differs — ticks within
+/// the same minute format identically and are reported as unchanged, so the host
+/// loop stays idle between visible flips.
 pub struct ClockWidget {
     bounds: Bounds,
     text: String,
@@ -74,23 +74,24 @@ mod tests {
         let mut clock = ClockWidget::new(Bounds::new(0, 0, 320, 32));
         assert_eq!(clock.text(), "");
         assert!(clock.update(&tick(8, 9, 7)));
-        assert_eq!(clock.text(), "08:09:07");
+        assert_eq!(clock.text(), "08:09");
     }
 
     #[test]
-    fn repeated_same_second_is_not_a_visible_change() {
+    fn ticks_within_the_same_minute_are_not_a_visible_change() {
         let mut clock = ClockWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(clock.update(&tick(8, 9, 7)));
-        assert!(!clock.update(&tick(8, 9, 7)));
-        assert_eq!(clock.text(), "08:09:07");
+        // A later second in the same minute formats identically: no redraw.
+        assert!(!clock.update(&tick(8, 9, 42)));
+        assert_eq!(clock.text(), "08:09");
     }
 
     #[test]
-    fn advancing_a_second_is_a_visible_change() {
+    fn advancing_a_minute_is_a_visible_change() {
         let mut clock = ClockWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(clock.update(&tick(8, 9, 7)));
-        assert!(clock.update(&tick(8, 9, 8)));
-        assert_eq!(clock.text(), "08:09:08");
+        assert!(clock.update(&tick(8, 10, 0)));
+        assert_eq!(clock.text(), "08:10");
     }
 
     #[test]
