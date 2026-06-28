@@ -1,4 +1,4 @@
-use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 /// Opaque dark background color (R, G, B).
@@ -6,8 +6,39 @@ pub const BG: (u8, u8, u8) = (0x18, 0x18, 0x18);
 /// Light foreground text color (R, G, B).
 pub const FG: (u8, u8, u8) = (0xEA, 0xEA, 0xEA);
 
-/// Font size (px) used for all text rendering.
+/// Default font size (px) used when no configuration overrides it.
 const FONT_SIZE: f32 = 16.0;
+
+/// The visual settings a [`RenderContext`] paints with: theme colors and font.
+///
+/// One value resolved once (from configuration, or [`RenderSettings::default`]
+/// for the built-in theme) and handed to the context, so widgets read the
+/// active foreground/accent through the context rather than baking in constants.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderSettings {
+    /// Background fill behind every widget.
+    pub background: (u8, u8, u8),
+    /// Default text color.
+    pub foreground: (u8, u8, u8),
+    /// Emphasis color (e.g. the active workspace).
+    pub accent: (u8, u8, u8),
+    /// Text size in pixels.
+    pub font_size: f32,
+    /// Font family name, or `None` for the system default.
+    pub font_family: Option<String>,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            background: BG,
+            foreground: FG,
+            accent: FG,
+            font_size: FONT_SIZE,
+            font_family: None,
+        }
+    }
+}
 
 /// An axis-aligned rectangle in surface pixel coordinates.
 ///
@@ -52,17 +83,41 @@ pub struct RenderContext {
     font_system: FontSystem,
     swash_cache: SwashCache,
     pixmap: Pixmap,
+    settings: RenderSettings,
 }
 
 impl RenderContext {
-    /// Create a context targeting a `width * height` pixel surface.
+    /// Create a context targeting a `width * height` pixel surface, using the
+    /// built-in theme ([`RenderSettings::default`]).
     pub fn new(width: u32, height: u32) -> Self {
+        Self::with_settings(width, height, RenderSettings::default())
+    }
+
+    /// Create a context targeting a `width * height` pixel surface, painting with
+    /// the supplied [`RenderSettings`].
+    pub fn with_settings(width: u32, height: u32, settings: RenderSettings) -> Self {
         let pixmap = Pixmap::new(width.max(1), height.max(1)).expect("non-zero pixmap dimensions");
         Self {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
             pixmap,
+            settings,
         }
+    }
+
+    /// The active foreground (default text) color.
+    pub fn foreground(&self) -> (u8, u8, u8) {
+        self.settings.foreground
+    }
+
+    /// The active accent (emphasis) color.
+    pub fn accent(&self) -> (u8, u8, u8) {
+        self.settings.accent
+    }
+
+    /// The settings this context paints with.
+    pub fn settings(&self) -> &RenderSettings {
+        &self.settings
     }
 
     /// Current target width in pixels.
@@ -87,10 +142,11 @@ impl RenderContext {
         }
     }
 
-    /// Fill the whole target with the opaque dark background.
+    /// Fill the whole target with the configured opaque background.
     pub fn fill_background(&mut self) {
+        let (r, g, b) = self.settings.background;
         self.pixmap
-            .fill(tiny_skia::Color::from_rgba8(BG.0, BG.1, BG.2, 0xFF));
+            .fill(tiny_skia::Color::from_rgba8(r, g, b, 0xFF));
     }
 
     /// Shape and draw `text` in `color` within `bounds`.
@@ -108,14 +164,18 @@ impl RenderContext {
             font_system,
             swash_cache,
             pixmap,
+            settings,
         } = self;
 
-        let metrics = Metrics::new(FONT_SIZE, bounds.height as f32);
+        let metrics = Metrics::new(settings.font_size, bounds.height as f32);
         let mut buffer = Buffer::new(font_system, metrics);
         buffer.set_size(Some(bounds.width as f32), Some(bounds.height as f32));
         buffer.set_wrap(Wrap::None);
 
-        let attrs = Attrs::new();
+        let mut attrs = Attrs::new();
+        if let Some(family) = &settings.font_family {
+            attrs = attrs.family(Family::Name(family));
+        }
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(font_system, false);
 

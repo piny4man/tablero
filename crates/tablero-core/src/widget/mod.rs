@@ -115,12 +115,29 @@ pub trait Widget {
 /// widget. Layout is intentionally minimal for now (see [`layout`](Dashboard::layout)).
 pub struct Dashboard {
     widgets: Vec<Box<dyn Widget>>,
+    /// Horizontal gap between adjacent widget columns, in pixels.
+    spacing: u32,
+    /// Inner padding inset on each widget column, in pixels.
+    padding: u32,
 }
 
 impl Dashboard {
-    /// Build a dashboard from its widgets, front-to-back in draw order.
+    /// Build a dashboard from its widgets, front-to-back in draw order, with no
+    /// spacing or padding between/within columns.
     pub fn new(widgets: Vec<Box<dyn Widget>>) -> Self {
-        Self { widgets }
+        Self {
+            widgets,
+            spacing: 0,
+            padding: 0,
+        }
+    }
+
+    /// Set the column `spacing` (gap between widgets) and `padding` (inset within
+    /// each widget's slot) used by [`layout`](Dashboard::layout), in pixels.
+    pub fn with_layout(mut self, spacing: u32, padding: u32) -> Self {
+        self.spacing = spacing;
+        self.padding = padding;
+        self
     }
 
     /// Broadcast `msg` to every widget.
@@ -140,25 +157,40 @@ impl Dashboard {
     ///
     /// Widgets are placed left-to-right in equal-width columns, in construction
     /// order, so multiple widgets never overlap. A single widget therefore still
-    /// gets the full surface. This is the seam a content-aware layout engine
-    /// will replace; the widget contract ([`Widget::set_bounds`]) already
-    /// supports arbitrary slots.
+    /// gets the full surface. The configured [`spacing`](Dashboard::with_layout)
+    /// reserves a horizontal gap between adjacent columns, and `padding` insets
+    /// each column on all four sides; both default to zero. This is the seam a
+    /// content-aware layout engine will replace; the widget contract
+    /// ([`Widget::set_bounds`]) already supports arbitrary slots.
     pub fn layout(&mut self, width: u32, height: u32) {
         let count = self.widgets.len() as u32;
         if count == 0 {
             return;
         }
-        let column = width / count;
+        // The inter-column gaps come out of the usable width first; the remainder
+        // is split into equal columns.
+        let gaps = self.spacing.saturating_mul(count - 1);
+        let usable = width.saturating_sub(gaps);
+        let column = usable / count;
+        let pad = self.padding;
         for (i, widget) in self.widgets.iter_mut().enumerate() {
-            let x = column * i as u32;
-            // The last column absorbs any rounding remainder so the row spans
-            // the full width.
-            let w = if i as u32 == count - 1 {
-                width - x
+            let slot_x = (column + self.spacing).saturating_mul(i as u32);
+            // The last column absorbs any rounding remainder so the row spans the
+            // full width; earlier columns are exactly one column wide.
+            let slot_w = if i as u32 == count - 1 {
+                width.saturating_sub(slot_x)
             } else {
                 column
             };
-            widget.set_bounds(Bounds::new(x, 0, w, height));
+            // Inset the slot by the padding on every side, clamping so a slot
+            // narrower than the padding collapses to zero rather than underflowing.
+            let inner = Bounds::new(
+                slot_x + pad,
+                pad,
+                slot_w.saturating_sub(pad.saturating_mul(2)),
+                height.saturating_sub(pad.saturating_mul(2)),
+            );
+            widget.set_bounds(inner);
         }
     }
 
@@ -231,6 +263,29 @@ mod tests {
         // so the two columns tile the full width without overlap or gaps.
         assert_eq!(dash.widgets[0].bounds(), Bounds::new(0, 0, 50, 32));
         assert_eq!(dash.widgets[1].bounds(), Bounds::new(50, 0, 51, 32));
+    }
+
+    #[test]
+    fn layout_reserves_spacing_between_columns() {
+        let mut dash = Dashboard::new(vec![
+            Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1))),
+            Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1))),
+        ])
+        .with_layout(10, 0);
+        dash.layout(110, 32);
+        // One 10px gap is reserved first; the remaining 100 splits into two 50px
+        // columns. The gap sits between them, so column 1 starts at 60.
+        assert_eq!(dash.widgets[0].bounds(), Bounds::new(0, 0, 50, 32));
+        assert_eq!(dash.widgets[1].bounds(), Bounds::new(60, 0, 50, 32));
+    }
+
+    #[test]
+    fn layout_insets_each_column_by_padding() {
+        let mut dash = Dashboard::new(vec![Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1)))])
+            .with_layout(0, 4);
+        dash.layout(100, 32);
+        // The single column is the full surface, inset by 4px on every side.
+        assert_eq!(dash.widgets[0].bounds(), Bounds::new(4, 4, 92, 24));
     }
 
     #[test]

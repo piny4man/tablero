@@ -35,6 +35,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 
+use crate::render::{Bounds, RenderSettings};
+use crate::widget::{BatteryWidget, ClockWidget, Dashboard, SystemWidget, Widget, WorkspaceWidget};
+
 /// Default bar height in pixels.
 const DEFAULT_HEIGHT: u32 = 32;
 /// Default text size in pixels.
@@ -240,6 +243,48 @@ impl Config {
             }
         }
         resolved
+    }
+}
+
+impl WidgetKind {
+    /// Construct the widget this kind names, occupying `bounds`.
+    ///
+    /// The bounds are a placeholder seed; real per-column slots are assigned by
+    /// [`Dashboard::layout`] each frame.
+    pub fn build(self, bounds: Bounds) -> Box<dyn Widget> {
+        match self {
+            WidgetKind::Workspaces => Box::new(WorkspaceWidget::new(bounds)),
+            WidgetKind::Clock => Box::new(ClockWidget::new(bounds)),
+            WidgetKind::Battery => Box::new(BatteryWidget::new(bounds)),
+            WidgetKind::System => Box::new(SystemWidget::new(bounds)),
+        }
+    }
+}
+
+impl Config {
+    /// The render settings (theme colors and font) this configuration resolves to.
+    pub fn render_settings(&self) -> RenderSettings {
+        RenderSettings {
+            background: self.theme.background.to_rgb(),
+            foreground: self.theme.foreground.to_rgb(),
+            accent: self.theme.accent.to_rgb(),
+            font_size: self.font.size,
+            font_family: self.font.family.clone(),
+        }
+    }
+
+    /// Build the dashboard this configuration describes.
+    ///
+    /// The resolved widgets are constructed in order, each seeded at `bounds`,
+    /// and the dashboard carries the configured spacing and padding so its
+    /// [`layout`](Dashboard::layout) tiles them as configured.
+    pub fn build_dashboard(&self, bounds: Bounds) -> Dashboard {
+        let widgets = self
+            .resolved_widgets()
+            .into_iter()
+            .map(|kind| kind.build(bounds))
+            .collect();
+        Dashboard::new(widgets).with_layout(self.spacing, self.padding)
     }
 }
 

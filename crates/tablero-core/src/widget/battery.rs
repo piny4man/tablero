@@ -9,7 +9,7 @@
 //! its first reading, so a laptop without a battery never paints a stale or
 //! placeholder value.
 
-use crate::render::{Bounds, FG, RenderContext};
+use crate::render::{Bounds, RenderContext};
 
 use super::{Msg, Widget};
 
@@ -138,7 +138,8 @@ impl Widget for BatteryWidget {
         // An absent battery draws nothing: the dashboard has already cleared the
         // background, so the widget's slot is left blank.
         if let Some(battery) = self.state {
-            ctx.draw_text(&battery.label(), self.bounds, FG);
+            let fg = ctx.foreground();
+            ctx.draw_text(&battery.label(), self.bounds, fg);
         }
     }
 
