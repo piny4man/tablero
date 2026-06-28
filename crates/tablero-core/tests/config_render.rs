@@ -15,7 +15,7 @@ use tablero_core::widget::{Command, Dashboard, Msg, Workspaces};
 /// clickable cell at its column origin.
 fn laid_out(toml: &str) -> Dashboard {
     let config = Config::from_toml_str(toml).expect("valid config");
-    let mut dash = config.build_dashboard(Bounds::new(0, 0, 200, 32));
+    let mut dash = config.build_dashboard(Bounds::new(0, 0, 200, 32), None);
     dash.layout(200, 32);
     dash.update(&Msg::Workspaces(Workspaces::new([1], 1)));
     dash

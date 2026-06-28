@@ -278,7 +278,7 @@ pub fn run_with_producers(
     // initial bounds are just placeholders. The theme and font reach the
     // renderer through the context's settings.
     let full = Bounds::new(0, 0, INITIAL_WIDTH, height);
-    let dashboard = config.build_dashboard(full);
+    let dashboard = config.build_dashboard(full, None);
     let ctx = RenderContext::with_settings(INITIAL_WIDTH, height, config.render_settings());
 
     let mut bar = Bar {

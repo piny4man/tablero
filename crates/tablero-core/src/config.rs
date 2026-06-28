@@ -382,10 +382,15 @@ impl WidgetKind {
     /// Construct the widget this kind names, occupying `bounds`.
     ///
     /// The bounds are a placeholder seed; real per-column slots are assigned by
-    /// [`Dashboard::layout`] each frame.
-    pub fn build(self, bounds: Bounds) -> Box<dyn Widget> {
+    /// [`Dashboard::layout`] each frame. `monitor` is the connector name of the
+    /// output this dashboard serves, threaded to the workspace widget so it
+    /// shows only that monitor's workspaces; `None` builds the global fallback.
+    pub fn build(self, bounds: Bounds, monitor: Option<&str>) -> Box<dyn Widget> {
         match self {
-            WidgetKind::Workspaces => Box::new(WorkspaceWidget::new(bounds)),
+            WidgetKind::Workspaces => match monitor {
+                Some(name) => Box::new(WorkspaceWidget::for_monitor(bounds, name)),
+                None => Box::new(WorkspaceWidget::new(bounds)),
+            },
             WidgetKind::Clock => Box::new(ClockWidget::new(bounds)),
             WidgetKind::Battery => Box::new(BatteryWidget::new(bounds)),
             WidgetKind::System => Box::new(SystemWidget::new(bounds)),
@@ -436,16 +441,18 @@ impl Config {
         scale.to_physical(self.height)
     }
 
-    /// Build the dashboard this configuration describes.
+    /// Build the dashboard this configuration describes for one output.
     ///
     /// The resolved widgets are constructed in order, each seeded at `bounds`,
     /// and the dashboard carries the configured spacing and padding so its
-    /// [`layout`](Dashboard::layout) tiles them as configured.
-    pub fn build_dashboard(&self, bounds: Bounds) -> Dashboard {
+    /// [`layout`](Dashboard::layout) tiles them as configured. `monitor` is the
+    /// output's connector name, threaded to the workspace widget so it shows
+    /// only that monitor's workspaces; pass `None` for the global fallback.
+    pub fn build_dashboard(&self, bounds: Bounds, monitor: Option<&str>) -> Dashboard {
         let widgets = self
             .resolved_widgets()
             .into_iter()
-            .map(|kind| kind.build(bounds))
+            .map(|kind| kind.build(bounds, monitor))
             .collect();
         Dashboard::new(widgets).with_layout(self.spacing, self.padding)
     }
@@ -628,7 +635,7 @@ mod tests {
         let config = Config::from_toml_str(r#"widgets = ["tray", "clock"]"#).unwrap();
         assert_eq!(config.widgets, vec![WidgetKind::Tray, WidgetKind::Clock]);
         // It constructs a widget without panicking.
-        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32));
+        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32), None);
     }
 
     #[test]
