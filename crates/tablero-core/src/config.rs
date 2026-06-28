@@ -8,14 +8,14 @@
 //! schema does not recognize (an unknown key, an unknown widget name, a
 //! malformed color) is a hard [`ConfigError`] rather than a silent fallback.
 //!
-//! Defaults match the constants the bar shipped with before configuration
-//! existed, so an absent config file renders exactly as the hardcoded bar did:
+//! Every field has a documented default, so an absent config file renders the
+//! full default bar:
 //!
 //! ```toml
 //! height  = 32
 //! spacing = 0
 //! padding = 0
-//! widgets = ["workspaces", "clock", "battery", "system"]
+//! widgets = ["workspaces", "clock", "battery", "system", "network"]
 //!
 //! [theme]
 //! background = "#181818"
@@ -36,7 +36,9 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 
 use crate::render::{Bounds, RenderSettings};
-use crate::widget::{BatteryWidget, ClockWidget, Dashboard, SystemWidget, Widget, WorkspaceWidget};
+use crate::widget::{
+    BatteryWidget, ClockWidget, Dashboard, NetworkWidget, SystemWidget, Widget, WorkspaceWidget,
+};
 
 /// Default bar height in pixels.
 const DEFAULT_HEIGHT: u32 = 32;
@@ -152,6 +154,8 @@ pub enum WidgetKind {
     Battery,
     /// The CPU/memory indicator.
     System,
+    /// The network connectivity indicator.
+    Network,
 }
 
 /// The default left-to-right widget order, matching the pre-config bar.
@@ -161,6 +165,7 @@ fn default_widgets() -> Vec<WidgetKind> {
         WidgetKind::Clock,
         WidgetKind::Battery,
         WidgetKind::System,
+        WidgetKind::Network,
     ]
 }
 
@@ -257,6 +262,7 @@ impl WidgetKind {
             WidgetKind::Clock => Box::new(ClockWidget::new(bounds)),
             WidgetKind::Battery => Box::new(BatteryWidget::new(bounds)),
             WidgetKind::System => Box::new(SystemWidget::new(bounds)),
+            WidgetKind::Network => Box::new(NetworkWidget::new(bounds)),
         }
     }
 }
@@ -338,7 +344,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_matches_the_pre_config_bar() {
+    fn default_is_the_documented_baseline() {
         let config = Config::default();
         assert_eq!(config.height, 32);
         assert_eq!(config.spacing, 0);
@@ -355,6 +361,7 @@ mod tests {
                 WidgetKind::Clock,
                 WidgetKind::Battery,
                 WidgetKind::System,
+                WidgetKind::Network,
             ]
         );
     }
