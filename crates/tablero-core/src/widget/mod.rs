@@ -17,10 +17,12 @@ use crate::render::{Bounds, RenderContext};
 
 pub mod battery;
 pub mod clock;
+pub mod system;
 pub mod workspaces;
 
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use clock::ClockWidget;
+pub use system::{SystemStats, SystemWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
 /// Every state update a widget can react to.
@@ -39,6 +41,8 @@ pub enum Msg {
     /// The battery reading changed; `None` means no battery is present (or the
     /// power daemon is unavailable), so the widget shows nothing.
     Battery(Option<Battery>),
+    /// A fresh system-pressure sample: current CPU and memory load.
+    System(SystemStats),
 }
 
 impl Msg {
