@@ -28,10 +28,14 @@ use tablero_core::widget::{Command, Msg, Workspaces};
 use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
-/// One element of the `j/workspaces` array; only the id is needed.
+/// One element of the `j/workspaces` array; the id and the monitor that owns it.
 #[derive(Deserialize)]
 struct RawWorkspace {
     id: i32,
+    /// The connector name of the monitor this workspace lives on. Optional so a
+    /// trimmed reply without it still parses (falling back to the global view).
+    #[serde(default)]
+    monitor: Option<String>,
 }
 
 /// The `j/activeworkspace` object; only the id is needed.
@@ -40,10 +44,29 @@ struct RawActiveWorkspace {
     id: i32,
 }
 
-/// Parse the JSON array returned by `j/workspaces` into its workspace ids.
-pub fn parse_workspaces(json: &str) -> serde_json::Result<Vec<i32>> {
+/// One element of the `j/monitors` array: a connector name and the workspace it
+/// currently shows.
+#[derive(Deserialize)]
+struct RawMonitor {
+    name: String,
+    #[serde(rename = "activeWorkspace")]
+    active_workspace: RawActiveWorkspace,
+}
+
+/// Parse the JSON array returned by `j/workspaces`, pairing each id with the
+/// monitor that owns it (Hyprland always reports it; absent → `None`).
+pub fn parse_workspace_entries(json: &str) -> serde_json::Result<Vec<(i32, Option<String>)>> {
     let raw: Vec<RawWorkspace> = serde_json::from_str(json)?;
-    Ok(raw.into_iter().map(|w| w.id).collect())
+    Ok(raw.into_iter().map(|w| (w.id, w.monitor)).collect())
+}
+
+/// Parse the JSON array returned by `j/workspaces` into its workspace ids,
+/// discarding the per-monitor membership.
+pub fn parse_workspaces(json: &str) -> serde_json::Result<Vec<i32>> {
+    Ok(parse_workspace_entries(json)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect())
 }
 
 /// Parse the JSON object returned by `j/activeworkspace` into the active id.
@@ -52,7 +75,18 @@ pub fn parse_active(json: &str) -> serde_json::Result<i32> {
     Ok(raw.id)
 }
 
-/// Build a normalized [`Workspaces`] snapshot from the two raw IPC responses.
+/// Parse the JSON array returned by `j/monitors` into each monitor's active
+/// workspace, as `(connector name, active workspace id)` pairs.
+pub fn parse_monitors(json: &str) -> serde_json::Result<Vec<(String, i32)>> {
+    let raw: Vec<RawMonitor> = serde_json::from_str(json)?;
+    Ok(raw
+        .into_iter()
+        .map(|m| (m.name, m.active_workspace.id))
+        .collect())
+}
+
+/// Build a normalized [`Workspaces`] snapshot from the two raw IPC responses,
+/// with no per-monitor membership (every widget sees the global set).
 ///
 /// Pure over its inputs: the integration tests drive the full
 /// parse → message → widget path through this without a live compositor.
@@ -63,6 +97,27 @@ pub fn snapshot_from_json(
     let ids = parse_workspaces(workspaces_json)?;
     let active = parse_active(active_json)?;
     Ok(Workspaces::new(ids, active))
+}
+
+/// Build a monitor-aware [`Workspaces`] snapshot from the three raw IPC
+/// responses.
+///
+/// `j/workspaces` supplies each workspace's owning monitor, `j/monitors` each
+/// monitor's active workspace, and `j/activeworkspace` the globally focused one
+/// (used by an unscoped widget). Pure over its inputs, so the per-monitor path
+/// is unit-testable without a live compositor.
+pub fn snapshot_with_monitors(
+    workspaces_json: &str,
+    active_json: &str,
+    monitors_json: &str,
+) -> serde_json::Result<Workspaces> {
+    let workspaces: Vec<(i32, String)> = parse_workspace_entries(workspaces_json)?
+        .into_iter()
+        .filter_map(|(id, monitor)| monitor.map(|m| (id, m)))
+        .collect();
+    let focused = parse_active(active_json)?;
+    let actives = parse_monitors(monitors_json)?;
+    Ok(Workspaces::with_monitors(workspaces, actives, focused))
 }
 
 /// Translate a typed [`Command`] into the Hyprland `.socket.sock` request that
@@ -158,11 +213,17 @@ async fn query(dir: &Path, request: &str) -> io::Result<String> {
     Ok(response)
 }
 
-/// Query both workspace endpoints and fold them into a normalized snapshot.
+/// Query the workspace, active-workspace and monitor endpoints and fold them
+/// into a normalized, monitor-aware snapshot.
 async fn fetch_snapshot(dir: &Path) -> Result<Workspaces, Box<dyn Error + Send + Sync>> {
     let workspaces_json = query(dir, "j/workspaces").await?;
     let active_json = query(dir, "j/activeworkspace").await?;
-    Ok(snapshot_from_json(&workspaces_json, &active_json)?)
+    let monitors_json = query(dir, "j/monitors").await?;
+    Ok(snapshot_with_monitors(
+        &workspaces_json,
+        &active_json,
+        &monitors_json,
+    )?)
 }
 
 /// A [`Producer`] that streams Hyprland workspace changes into the render loop.
@@ -265,6 +326,55 @@ mod tests {
         assert_eq!(snapshot.ids(), &[1, 2, 3]);
         assert_eq!(snapshot.active(), 2);
         assert_eq!(snapshot.label(), "1 [2] 3");
+    }
+
+    // A two-monitor setup: DP-1 owns 1,2 (active 2); HDMI-A-1 owns 5,6 (active 5).
+    const MULTI_WORKSPACES_JSON: &str = r#"[
+        {"id": 2, "name": "2", "monitor": "DP-1", "windows": 1},
+        {"id": 6, "name": "6", "monitor": "HDMI-A-1", "windows": 0},
+        {"id": 1, "name": "1", "monitor": "DP-1", "windows": 4},
+        {"id": 5, "name": "5", "monitor": "HDMI-A-1", "windows": 2}
+    ]"#;
+    const MONITORS_JSON: &str = r#"[
+        {"id": 0, "name": "DP-1", "activeWorkspace": {"id": 2, "name": "2"}},
+        {"id": 1, "name": "HDMI-A-1", "activeWorkspace": {"id": 5, "name": "5"}}
+    ]"#;
+
+    #[test]
+    fn parse_workspace_entries_pairs_each_id_with_its_monitor() {
+        let entries = parse_workspace_entries(MULTI_WORKSPACES_JSON).expect("valid json");
+        assert_eq!(
+            entries,
+            vec![
+                (2, Some("DP-1".to_string())),
+                (6, Some("HDMI-A-1".to_string())),
+                (1, Some("DP-1".to_string())),
+                (5, Some("HDMI-A-1".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_monitors_extracts_each_monitors_active_workspace() {
+        let monitors = parse_monitors(MONITORS_JSON).expect("valid json");
+        assert_eq!(
+            monitors,
+            vec![("DP-1".to_string(), 2), ("HDMI-A-1".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn snapshot_with_monitors_scopes_each_monitors_workspaces() {
+        let snapshot = snapshot_with_monitors(MULTI_WORKSPACES_JSON, ACTIVE_JSON, MONITORS_JSON)
+            .expect("valid json");
+        // Each monitor sees only its own workspaces, with its own active.
+        assert_eq!(snapshot.ids_for("DP-1"), vec![1, 2]);
+        assert_eq!(snapshot.active_for("DP-1"), Some(2));
+        assert_eq!(snapshot.ids_for("HDMI-A-1"), vec![5, 6]);
+        assert_eq!(snapshot.active_for("HDMI-A-1"), Some(5));
+        // The global view spans both, with the focused active from j/activeworkspace.
+        assert_eq!(snapshot.ids(), &[1, 2, 5, 6]);
+        assert_eq!(snapshot.active(), 2);
     }
 
     #[test]

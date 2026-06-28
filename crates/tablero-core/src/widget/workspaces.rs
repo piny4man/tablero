@@ -5,6 +5,8 @@
 //! repainting only when the visible workspace set or the active workspace
 //! actually changes.
 
+use std::collections::BTreeMap;
+
 use crate::render::{Bounds, RenderContext};
 
 use super::{Command, Msg, Widget};
@@ -16,52 +18,27 @@ use super::{Command, Msg, Widget};
 /// empty space that ignores clicks.
 const ITEM_WIDTH: u32 = 36;
 
-/// A normalized snapshot of the Hyprland workspace set.
+/// The projection of a snapshot that a single widget renders: the ids to show,
+/// in order, and which one (if any) is active in that widget's scope.
 ///
-/// Normalization happens once, at the producer boundary, so widgets and the
-/// redraw policy compare clean, canonical values: ids are sorted ascending and
-/// deduplicated, and the `active` id is always part of the set (Hyprland can
-/// report an active workspace a hair before it appears in the workspace list).
-/// Equality is therefore a faithful "does this look different on screen?" test.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Workspaces {
+/// A widget scoped to a monitor and one with no scope (the global fallback)
+/// both reduce to a `View`; the redraw policy compares `View`s, so a widget
+/// repaints only when *its* slice of the world changes — a switch on another
+/// monitor leaves a monitor-scoped widget's `View` untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct View {
     ids: Vec<i32>,
-    active: i32,
+    active: Option<i32>,
 }
 
-impl Workspaces {
-    /// Build a snapshot from a raw id set and the active id, normalizing both.
-    ///
-    /// The `active` id is folded into the set, then the whole set is sorted and
-    /// deduplicated. Pass the ids in any order, with or without `active`.
-    pub fn new(ids: impl IntoIterator<Item = i32>, active: i32) -> Self {
-        let mut ids: Vec<i32> = ids.into_iter().collect();
-        ids.push(active);
-        ids.sort_unstable();
-        ids.dedup();
-        Self { ids, active }
-    }
-
-    /// The normalized, sorted workspace ids.
-    pub fn ids(&self) -> &[i32] {
-        &self.ids
-    }
-
-    /// The active workspace id.
-    pub fn active(&self) -> i32 {
-        self.active
-    }
-
-    /// The display label: ids joined by spaces, with the active one bracketed.
-    ///
-    /// For example `1 [2] 3` — the brackets are how the bar distinguishes the
-    /// active workspace from the rest. Keeping this a pure function makes the
-    /// rendered text deterministic and unit-testable without painting pixels.
-    pub fn label(&self) -> String {
+impl View {
+    /// The display label: ids joined by spaces, with the active one bracketed
+    /// (e.g. `1 [2] 3`).
+    fn label(&self) -> String {
         self.ids
             .iter()
             .map(|&id| {
-                if id == self.active {
+                if Some(id) == self.active {
                     format!("[{id}]")
                 } else {
                     id.to_string()
@@ -72,32 +49,197 @@ impl Workspaces {
     }
 }
 
-/// A bar widget showing the workspace set with the active workspace marked.
+/// A normalized, monitor-aware snapshot of the Hyprland workspace set.
+///
+/// Normalization happens once, at the producer boundary, so widgets and the
+/// redraw policy compare clean, canonical values: within any scope ids are
+/// sorted ascending and deduplicated, and an active id is always part of its
+/// scope's set (Hyprland can report an active workspace a hair before it
+/// appears in the workspace list).
+///
+/// Each workspace carries the monitor (connector name) that owns it, and each
+/// monitor reports its own active workspace — Hyprland binds workspaces to
+/// monitors, so a per-output bar shows only its monitor's workspaces and
+/// highlights that monitor's active one. A widget with no monitor scope sees
+/// the union of every monitor and the globally focused active workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workspaces {
+    /// Each workspace id paired with its owning monitor, if known.
+    entries: Vec<(i32, Option<String>)>,
+    /// The sorted, deduplicated union of every workspace id (the global view).
+    ids: Vec<i32>,
+    /// Each monitor's active workspace, by connector name.
+    active_by_monitor: BTreeMap<String, i32>,
+    /// The globally focused active workspace (the global view's highlight).
+    active: i32,
+}
+
+impl Workspaces {
+    /// Build a snapshot from a flat id set and the focused active id, with no
+    /// per-monitor information.
+    ///
+    /// Used where monitor data is unavailable; every widget sees the same set.
+    /// The `active` id is folded in, then the set is sorted and deduplicated —
+    /// pass the ids in any order, with or without `active`.
+    pub fn new(ids: impl IntoIterator<Item = i32>, active: i32) -> Self {
+        let mut entries: Vec<(i32, Option<String>)> =
+            ids.into_iter().map(|id| (id, None)).collect();
+        entries.push((active, None));
+        Self::build(entries, BTreeMap::new(), active)
+    }
+
+    /// Build a monitor-aware snapshot.
+    ///
+    /// `workspaces` pairs each workspace id with its owning monitor; `actives`
+    /// gives each monitor's active workspace; `focused` is the globally focused
+    /// active workspace (used by an unscoped widget). Every monitor's active id
+    /// is folded into its own set, and `focused` into the global set.
+    pub fn with_monitors<S: Into<String>>(
+        workspaces: impl IntoIterator<Item = (i32, S)>,
+        actives: impl IntoIterator<Item = (S, i32)>,
+        focused: i32,
+    ) -> Self {
+        let active_by_monitor: BTreeMap<String, i32> = actives
+            .into_iter()
+            .map(|(monitor, id)| (monitor.into(), id))
+            .collect();
+
+        let mut entries: Vec<(i32, Option<String>)> = workspaces
+            .into_iter()
+            .map(|(id, monitor)| (id, Some(monitor.into())))
+            .collect();
+        // Fold each monitor's active workspace into its own set, in case the
+        // active id leads the listed set.
+        for (monitor, &id) in &active_by_monitor {
+            entries.push((id, Some(monitor.clone())));
+        }
+        entries.push((focused, None));
+
+        Self::build(entries, active_by_monitor, focused)
+    }
+
+    /// Normalize raw entries into a snapshot: dedup `(id, monitor)` pairs and
+    /// precompute the sorted global id union.
+    fn build(
+        mut entries: Vec<(i32, Option<String>)>,
+        active_by_monitor: BTreeMap<String, i32>,
+        active: i32,
+    ) -> Self {
+        entries.sort();
+        entries.dedup();
+
+        let mut ids: Vec<i32> = entries.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+
+        Self {
+            entries,
+            ids,
+            active_by_monitor,
+            active,
+        }
+    }
+
+    /// The normalized, sorted union of every workspace id (the global view).
+    pub fn ids(&self) -> &[i32] {
+        &self.ids
+    }
+
+    /// The globally focused active workspace id.
+    pub fn active(&self) -> i32 {
+        self.active
+    }
+
+    /// The sorted, deduplicated ids owned by `monitor`.
+    pub fn ids_for(&self, monitor: &str) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .entries
+            .iter()
+            .filter(|(_, m)| m.as_deref() == Some(monitor))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// The active workspace on `monitor`, if that monitor reported one.
+    pub fn active_for(&self, monitor: &str) -> Option<i32> {
+        self.active_by_monitor.get(monitor).copied()
+    }
+
+    /// The view a widget with the given monitor scope renders.
+    ///
+    /// A `Some` scope filters to that monitor's ids and active workspace; `None`
+    /// is the global fallback — every id, focused active.
+    fn view(&self, monitor: Option<&str>) -> View {
+        match monitor {
+            Some(m) => View {
+                ids: self.ids_for(m),
+                active: self.active_for(m),
+            },
+            None => View {
+                ids: self.ids.clone(),
+                active: Some(self.active),
+            },
+        }
+    }
+
+    /// The display label of the global view, with the active workspace
+    /// bracketed (e.g. `1 [2] 3`).
+    pub fn label(&self) -> String {
+        self.view(None).label()
+    }
+}
+
+/// A bar widget showing a monitor's workspace set with its active workspace
+/// marked.
 ///
 /// Holds the last snapshot it was given so [`update`](Widget::update) can report
-/// a visible change only when the normalized snapshot actually differs — a
-/// repeated identical snapshot keeps the loop idle.
+/// a visible change only when its [`View`] actually differs — a repeated
+/// identical view, or a change confined to another monitor, keeps the loop idle.
 pub struct WorkspaceWidget {
     bounds: Bounds,
+    /// The monitor (connector name) this widget is scoped to, or `None` for the
+    /// global fallback that shows every monitor's workspaces.
+    monitor: Option<String>,
     state: Option<Workspaces>,
 }
 
 impl WorkspaceWidget {
-    /// Create a workspace widget occupying `bounds`, empty until its first
-    /// [`Msg::Workspaces`](super::Msg::Workspaces).
+    /// Create an unscoped workspace widget occupying `bounds`, empty until its
+    /// first [`Msg::Workspaces`](super::Msg::Workspaces). It shows the global
+    /// workspace set across every monitor.
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
+            monitor: None,
             state: None,
         }
     }
 
-    /// The currently displayed label (empty before the first snapshot).
-    pub fn label(&self) -> String {
+    /// Create a workspace widget scoped to one `monitor` (connector name): it
+    /// shows only that monitor's workspaces and highlights that monitor's
+    /// active workspace.
+    pub fn for_monitor(bounds: Bounds, monitor: impl Into<String>) -> Self {
+        Self {
+            bounds,
+            monitor: Some(monitor.into()),
+            state: None,
+        }
+    }
+
+    /// The current view this widget renders (empty before the first snapshot).
+    fn view(&self) -> View {
         self.state
             .as_ref()
-            .map(Workspaces::label)
+            .map(|state| state.view(self.monitor.as_deref()))
             .unwrap_or_default()
+    }
+
+    /// The currently displayed label (empty before the first snapshot).
+    pub fn label(&self) -> String {
+        self.view().label()
     }
 
     /// The per-item cells: each `(id, bounds)` pair is one workspace's slot.
@@ -107,16 +249,13 @@ impl WorkspaceWidget {
     /// [`on_click`](Widget::on_click) read this, so what is painted and what is
     /// clickable are the same regions by construction.
     fn item_cells(&self) -> Vec<(i32, Bounds)> {
-        let Some(state) = &self.state else {
-            return Vec::new();
-        };
         if self.bounds.width == 0 || self.bounds.height == 0 {
             return Vec::new();
         }
 
         let right = self.bounds.x + self.bounds.width;
         let mut cells = Vec::new();
-        for (i, &id) in state.ids().iter().enumerate() {
+        for (i, id) in self.view().ids.into_iter().enumerate() {
             let x = self.bounds.x + ITEM_WIDTH * i as u32;
             if x >= right {
                 // Ran out of room in the widget's slot; stop placing items.
@@ -133,7 +272,8 @@ impl Widget for WorkspaceWidget {
     fn update(&mut self, msg: &Msg) -> bool {
         match msg {
             Msg::Workspaces(next) => {
-                if self.state.as_ref() == Some(next) {
+                let next_view = next.view(self.monitor.as_deref());
+                if self.state.as_ref().map(|s| s.view(self.monitor.as_deref())) == Some(next_view) {
                     return false;
                 }
                 self.state = Some(next.clone());
@@ -144,7 +284,7 @@ impl Widget for WorkspaceWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        let active = self.state.as_ref().map(Workspaces::active);
+        let active = self.view().active;
         let foreground = ctx.foreground();
         let accent = ctx.accent();
         for (id, cell) in self.item_cells() {
@@ -290,5 +430,96 @@ mod tests {
         assert_eq!(widget.on_click(38, 0), Some(Command::SwitchWorkspace(2)));
         // Third item would start at x=72, past the slot: never placed.
         assert_eq!(widget.on_click(39, 0), Some(Command::SwitchWorkspace(2)));
+    }
+
+    // --- Monitor-aware snapshots ----------------------------------------------
+
+    fn multi() -> Workspaces {
+        // DP-1 owns 1,2 (active 2); HDMI-A-1 owns 3,4 (active 3); focused is 2.
+        Workspaces::with_monitors(
+            [(1, "DP-1"), (2, "DP-1"), (3, "HDMI-A-1"), (4, "HDMI-A-1")],
+            [("DP-1", 2), ("HDMI-A-1", 3)],
+            2,
+        )
+    }
+
+    #[test]
+    fn ids_for_returns_only_that_monitors_workspaces() {
+        let w = multi();
+        assert_eq!(w.ids_for("DP-1"), vec![1, 2]);
+        assert_eq!(w.ids_for("HDMI-A-1"), vec![3, 4]);
+        // An unknown monitor has no workspaces.
+        assert!(w.ids_for("eDP-1").is_empty());
+    }
+
+    #[test]
+    fn active_for_returns_that_monitors_active_workspace() {
+        let w = multi();
+        assert_eq!(w.active_for("DP-1"), Some(2));
+        assert_eq!(w.active_for("HDMI-A-1"), Some(3));
+        assert_eq!(w.active_for("eDP-1"), None);
+    }
+
+    #[test]
+    fn the_global_view_still_spans_every_monitor() {
+        let w = multi();
+        assert_eq!(w.ids(), &[1, 2, 3, 4]);
+        assert_eq!(w.active(), 2);
+    }
+
+    #[test]
+    fn a_monitor_scoped_widget_shows_only_its_monitor() {
+        let mut widget = WorkspaceWidget::for_monitor(Bounds::new(0, 0, 320, 32), "HDMI-A-1");
+        assert!(widget.update(&Msg::Workspaces(multi())));
+        // HDMI-A-1 owns 3,4 with 3 active — DP-1's 1,2 never appear here.
+        assert_eq!(widget.label(), "[3] 4");
+    }
+
+    #[test]
+    fn a_monitor_scoped_widget_clicks_its_own_ids() {
+        let widget = {
+            let mut w = WorkspaceWidget::for_monitor(Bounds::new(0, 0, 320, 32), "HDMI-A-1");
+            w.update(&Msg::Workspaces(multi()));
+            w
+        };
+        // Cells pack from the origin over this monitor's ids: 3 -> [0,36), 4 -> [36,72).
+        assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(3)));
+        assert_eq!(widget.on_click(50, 0), Some(Command::SwitchWorkspace(4)));
+    }
+
+    #[test]
+    fn another_monitors_change_is_not_a_visible_change_here() {
+        let mut widget = WorkspaceWidget::for_monitor(Bounds::new(0, 0, 320, 32), "DP-1");
+        assert!(widget.update(&Msg::Workspaces(multi())));
+        // HDMI-A-1 switches its active 3 -> 4; DP-1's view (1,2 active 2) is unchanged.
+        let other_moved = Workspaces::with_monitors(
+            [(1, "DP-1"), (2, "DP-1"), (3, "HDMI-A-1"), (4, "HDMI-A-1")],
+            [("DP-1", 2), ("HDMI-A-1", 4)],
+            4,
+        );
+        assert!(!widget.update(&Msg::Workspaces(other_moved)));
+        assert_eq!(widget.label(), "1 [2]");
+    }
+
+    #[test]
+    fn this_monitors_change_is_a_visible_change() {
+        let mut widget = WorkspaceWidget::for_monitor(Bounds::new(0, 0, 320, 32), "DP-1");
+        assert!(widget.update(&Msg::Workspaces(multi())));
+        // DP-1 switches its active 2 -> 1.
+        let moved = Workspaces::with_monitors(
+            [(1, "DP-1"), (2, "DP-1"), (3, "HDMI-A-1"), (4, "HDMI-A-1")],
+            [("DP-1", 1), ("HDMI-A-1", 3)],
+            1,
+        );
+        assert!(widget.update(&Msg::Workspaces(moved)));
+        assert_eq!(widget.label(), "[1] 2");
+    }
+
+    #[test]
+    fn an_unfiltered_widget_shows_the_global_set_from_monitor_data() {
+        // A widget with no monitor scope (the fallback) still renders everything.
+        let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(widget.update(&Msg::Workspaces(multi())));
+        assert_eq!(widget.label(), "1 [2] 3 4");
     }
 }
