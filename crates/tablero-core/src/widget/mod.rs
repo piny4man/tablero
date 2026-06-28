@@ -15,9 +15,11 @@ use chrono::{DateTime, Local};
 
 use crate::render::{Bounds, RenderContext};
 
+pub mod battery;
 pub mod clock;
 pub mod workspaces;
 
+pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use clock::ClockWidget;
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -34,6 +36,9 @@ pub enum Msg {
     Tick(DateTime<Local>),
     /// The Hyprland workspace set or active workspace changed.
     Workspaces(Workspaces),
+    /// The battery reading changed; `None` means no battery is present (or the
+    /// power daemon is unavailable), so the widget shows nothing.
+    Battery(Option<Battery>),
 }
 
 impl Msg {
