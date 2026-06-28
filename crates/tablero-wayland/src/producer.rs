@@ -146,12 +146,17 @@ impl ProducerBridge {
     /// Build the producer runtime and the channel into the render loop.
     ///
     /// Returns the bridge and the [`Channel`] receiver to register with the
-    /// calloop event loop. The runtime uses a small fixed worker pool —
-    /// producers are I/O-bound and light — and touches no Wayland state, so it
-    /// is safe to create before or independently of the Wayland connection.
+    /// calloop event loop. A single worker thread drives every producer future
+    /// concurrently — they are I/O-bound and light, so one thread is plenty —
+    /// and it touches no Wayland state, so the bridge is safe to create before
+    /// or independently of the Wayland connection.
     pub fn new() -> io::Result<(Self, Channel<Msg>)> {
+        // A multi-thread runtime with one worker. Producers are spawned and
+        // detached — nothing calls `block_on` to drive them — so the runtime
+        // needs its own thread; `new_current_thread()` would never run them.
+        // One worker suffices for a handful of async, I/O-bound producers.
         let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(1)
             .thread_name("tablero-producer")
             .enable_all()
             .build()?;
