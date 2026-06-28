@@ -36,6 +36,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 
 use crate::render::{Bounds, RenderSettings};
+use crate::scale::Scale;
 use crate::widget::{
     BatteryWidget, ClockWidget, Dashboard, NetworkWidget, SystemWidget, Widget, WorkspaceWidget,
 };
@@ -269,6 +270,10 @@ impl WidgetKind {
 
 impl Config {
     /// The render settings (theme colors and font) this configuration resolves to.
+    ///
+    /// Sizes are logical pixels — the values as written in the config. For a
+    /// scaled output, resolve physical settings with
+    /// [`scaled_render_settings`](Config::scaled_render_settings).
     pub fn render_settings(&self) -> RenderSettings {
         RenderSettings {
             background: self.theme.background.to_rgb(),
@@ -277,6 +282,31 @@ impl Config {
             font_size: self.font.size,
             font_family: self.font.family.clone(),
         }
+    }
+
+    /// The render settings for an output at `scale`, with the font size resolved
+    /// to physical pixels.
+    ///
+    /// Only the font size scales; colors and family are scale-independent. At
+    /// [`Scale::ONE`] this equals [`render_settings`](Config::render_settings),
+    /// so the unscaled path is unchanged. The font is scaled here, once, and the
+    /// layout is scaled separately at the surface boundary — the two never
+    /// compound, which is what keeps text from being double-scaled.
+    pub fn scaled_render_settings(&self, scale: Scale) -> RenderSettings {
+        RenderSettings {
+            font_size: scale.scale_font(self.font.size),
+            ..self.render_settings()
+        }
+    }
+
+    /// The bar's physical height in device pixels for an output at `scale`.
+    ///
+    /// The configured [`height`](Config::height) is logical, so the surface keeps
+    /// a consistent apparent size across scales: 32 logical px is 32 device px at
+    /// scale 1 and 64 at scale 2, matching the higher pixel density. This is the
+    /// buffer/render-target height; the layer-shell size request stays logical.
+    pub fn physical_height(&self, scale: Scale) -> u32 {
+        scale.to_physical(self.height)
     }
 
     /// Build the dashboard this configuration describes.
@@ -514,6 +544,49 @@ mod tests {
         fs::write(&path, "height = 48\n").unwrap();
         let config = Config::load_from_path(&path).unwrap();
         assert_eq!(config.height, 48);
+    }
+
+    #[test]
+    fn physical_height_scales_the_logical_height() {
+        let config = Config::from_toml_str("height = 30").unwrap();
+        // At scale 1 the physical height equals the configured logical height...
+        assert_eq!(config.physical_height(Scale::ONE), 30);
+        // ...and at higher scales it grows by the integer factor.
+        assert_eq!(config.physical_height(Scale::new(2)), 60);
+        assert_eq!(config.physical_height(Scale::new(3)), 90);
+    }
+
+    #[test]
+    fn scaled_render_settings_scale_only_the_font() {
+        let config = Config::from_toml_str(
+            r##"
+            [theme]
+            foreground = "#102030"
+
+            [font]
+            family = "JetBrains Mono"
+            size = 16.0
+            "##,
+        )
+        .unwrap();
+
+        let scaled = config.scaled_render_settings(Scale::new(2));
+        // The font size doubles to physical pixels...
+        assert_eq!(scaled.font_size, 32.0);
+        // ...while everything scale-independent is carried verbatim.
+        assert_eq!(scaled.foreground, (0x10, 0x20, 0x30));
+        assert_eq!(scaled.font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn scaled_render_settings_at_scale_one_equal_the_logical_settings() {
+        // The unscaled path must be untouched: scale 1 resolves identically to
+        // the plain logical settings.
+        let config = Config::from_toml_str("[font]\nsize = 18.0").unwrap();
+        assert_eq!(
+            config.scaled_render_settings(Scale::ONE),
+            config.render_settings()
+        );
     }
 
     #[test]

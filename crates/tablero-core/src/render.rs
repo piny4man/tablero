@@ -120,6 +120,15 @@ impl RenderContext {
         &self.settings
     }
 
+    /// Replace the settings this context paints with.
+    ///
+    /// Used when the output scale changes and the resolved physical font size
+    /// must follow it. Cheap: the font machinery (`FontSystem`, `SwashCache`) is
+    /// retained, only the visual settings are swapped.
+    pub fn set_settings(&mut self, settings: RenderSettings) {
+        self.settings = settings;
+    }
+
     /// Current target width in pixels.
     pub fn width(&self) -> u32 {
         self.pixmap.width()
