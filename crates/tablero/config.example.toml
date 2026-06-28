@@ -16,8 +16,10 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "clock",
-# "battery", "system", "network". Repeats are de-duplicated, keeping first
-# position.
+# "battery", "system", "network", "tray". "tray" shows StatusNotifierItem
+# system-tray icons from background apps and is opt-in — add it to enable it,
+# e.g. ["workspaces", "clock", "battery", "system", "network", "tray"]. Repeats
+# are de-duplicated, keeping first position.
 widgets = ["workspaces", "clock", "battery", "system", "network"]
 
 [theme]
