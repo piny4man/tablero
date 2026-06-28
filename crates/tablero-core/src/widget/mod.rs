@@ -17,11 +17,13 @@ use crate::render::{Bounds, RenderContext};
 
 pub mod battery;
 pub mod clock;
+pub mod network;
 pub mod system;
 pub mod workspaces;
 
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use clock::ClockWidget;
+pub use network::{Network, NetworkState, NetworkWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -43,6 +45,9 @@ pub enum Msg {
     Battery(Option<Battery>),
     /// A fresh system-pressure sample: current CPU and memory load.
     System(SystemStats),
+    /// The network connectivity changed; `None` means no network is available
+    /// (or the network daemon is unreachable), so the widget shows nothing.
+    Network(Option<Network>),
 }
 
 impl Msg {

@@ -7,6 +7,7 @@
 
 pub mod command;
 pub mod hyprland;
+pub mod networkmanager;
 pub mod producer;
 pub mod sysmon;
 pub mod upower;
@@ -47,6 +48,7 @@ use tablero_core::widget::{Dashboard, Msg};
 
 use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
+use crate::networkmanager::NetworkProducer;
 use crate::producer::{Producer, ProducerBridge};
 use crate::sysmon::SystemProducer;
 use crate::upower::UPowerProducer;
@@ -161,11 +163,11 @@ impl Bar {
 ///
 /// The bar's height, theme, font, spacing, and widget order all come from
 /// `config` (see [`tablero_core::config::Config`]). Wires the default producer
-/// set — the Hyprland workspace source, the UPower battery source, and the
-/// procfs system-stats source — so the bar shows live workspaces, battery, and
-/// CPU/memory load alongside the clock. The clock itself is still driven by the
-/// synchronous tick timer; see [`run_with_producers`] to supply a custom
-/// producer set.
+/// set — the Hyprland workspace source, the UPower battery source, the procfs
+/// system-stats source, and the NetworkManager connectivity source — so the bar
+/// shows live workspaces, battery, CPU/memory load, and network state alongside
+/// the clock. The clock itself is still driven by the synchronous tick timer;
+/// see [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     run_with_producers(
         config,
@@ -173,6 +175,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(HyprlandProducer::new()),
             Box::new(UPowerProducer::new()),
             Box::new(SystemProducer::new()),
+            Box::new(NetworkProducer::new()),
         ],
     )
 }

@@ -38,11 +38,15 @@ RUST_LOG=info cargo run -p tablero
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
   - **System** — CPU and memory load sampled from procfs.
+  - **Network** — connection state via NetworkManager (disconnected, wired,
+    wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
+    NetworkManager is unavailable.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
-- Pulls live data from **async producers** (Hyprland IPC, UPower, procfs) running
-  on an off-thread Tokio runtime; they reach the synchronous render loop only by
-  sending messages through a `calloop` channel.
+- Pulls live data from **async producers** (Hyprland IPC, UPower, procfs,
+  NetworkManager over DBus) running on an off-thread Tokio runtime; they reach
+  the synchronous render loop only by sending messages through a `calloop`
+  channel.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
@@ -83,8 +87,9 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "clock",
-# "battery", "system". Repeats are de-duplicated, keeping first position.
-widgets = ["workspaces", "clock", "battery", "system"]
+# "battery", "system", "network". Repeats are de-duplicated, keeping first
+# position.
+widgets = ["workspaces", "clock", "battery", "system", "network"]
 
 [theme]
 # Colors are "#rrggbb" hex strings (the leading "#" is optional).
@@ -104,7 +109,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "clock", "battery", "system"]`| Render order, left to right; duplicates keep their first slot.   |
+| `widgets`      | list of strings | `["workspaces", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot.   |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -118,8 +123,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
 
 1. From inside a Hyprland session, run `RUST_LOG=info cargo run -p tablero`.
 2. Confirm a bar appears **pinned to the top** of the screen, spanning its full
-   width, showing a dark background with the workspaces, clock, battery, and
-   system widgets laid out left to right.
+   width, showing a dark background with the workspaces, clock, battery,
+   system, and network widgets laid out left to right.
 3. Confirm the clock **advances once per second** and that the text changes
    exactly on the second boundary (the timer is second-aligned).
 4. Confirm the **workspace indicator tracks Hyprland** — switching workspaces by

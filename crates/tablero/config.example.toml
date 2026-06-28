@@ -16,8 +16,9 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "clock",
-# "battery", "system". Repeats are de-duplicated, keeping first position.
-widgets = ["workspaces", "clock", "battery", "system"]
+# "battery", "system", "network". Repeats are de-duplicated, keeping first
+# position.
+widgets = ["workspaces", "clock", "battery", "system", "network"]
 
 [theme]
 # Colors are "#rrggbb" hex strings (the leading "#" is optional).
