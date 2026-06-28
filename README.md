@@ -41,6 +41,12 @@ RUST_LOG=info cargo run -p tablero
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
     NetworkManager is unavailable.
+  - **Tray** — StatusNotifierItem (SNI) system-tray icons from background apps,
+    over DBus. **Opt-in**: not in the default set; add `"tray"` to `widgets` to
+    enable it. **Click an icon to activate** its application. Under a compositor
+    with no native `StatusNotifierWatcher` (e.g. Hyprland) the bar hosts one
+    itself. Icons come from an embedded pixmap or a themed PNG; an item with
+    neither falls back to its initial letter.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -95,8 +101,9 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "clock",
-# "battery", "system", "network". Repeats are de-duplicated, keeping first
-# position.
+# "battery", "system", "network", "tray". "tray" is opt-in (not in the default
+# set above) — add it to enable the system tray. Repeats are de-duplicated,
+# keeping first position.
 widgets = ["workspaces", "clock", "battery", "system", "network"]
 
 [theme]
@@ -117,7 +124,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot.   |
+| `widgets`      | list of strings | `["workspaces", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -159,5 +166,38 @@ surface placement and input need a live compositor. To verify on Hyprland:
    - **Clicking a workspace** still switches to it — pointer hit-testing tracks
      the scaled layout. On a fractional scale (e.g. 1.5×) the bar renders at 2×
      and the compositor downscales; confirm it still looks sharp and clicks land.
-10. Press the compositor's close path for the layer (or terminate the session)
+10. Verify the **system tray** with at least two real tray-producing apps. Add
+    `"tray"` to `widgets` (it is opt-in), restart, then launch two SNI clients —
+    e.g. **Discord** or **Element** (Electron, ARGB pixmaps), **Telegram
+    Desktop** (themed icon name), **nm-applet** or **blueman-applet** (classic
+    Qt/GTK trays), or `KStatusNotifierItem` apps. Confirm:
+    - Each app's icon **appears** in the bar shortly after launch and
+      **disappears** when the app quits — the host re-enumerates on every
+      watcher registration/unregistration.
+    - **Clicking an icon activates** the app (raises/toggles its window) — the
+      click maps to the item's DBus `Activate` call.
+    - An app that ships only an `IconName` (no pixmap) still renders, resolved
+      against the icon theme; an app with neither shows its **initial letter**
+      rather than vanishing or crashing.
+    - Quitting an app **mid-session** does not crash the bar or leave a stale
+      icon.
+
+    **Protocol quirks** worth knowing when reading the code or debugging:
+    - **No watcher under bare compositors.** Hyprland (and similar) run no
+      `org.kde.StatusNotifierWatcher`, so tablero serves one itself and only
+      defers to an existing watcher when the well-known name is already owned.
+    - **Registration address is ambiguous.** Apps register either a bare bus
+      name (icon lives at the default `/StatusNotifierItem`), or a bus name
+      immediately followed by an object path (Ayatana/`libdbusmenu` apps use a
+      per-item path like `/org/ayatana/NotificationItem/foo`). The host splits
+      at the first `/`; a bare path with no bus name is unaddressable and
+      skipped.
+    - **Pixmap bytes are ARGB32, network byte order**, *not* the RGBA the
+      renderer wants — each pixel is reordered and alpha-premultiplied on
+      decode. Items often ship several sizes; the largest by area is chosen.
+    - **Icon-theme lookup is pragmatic, not full XDG.** `IconThemePath` (when
+      set) leads, then common `hicolor` app/status sizes and `/usr/share/pixmaps`
+      — `index.theme` inheritance is not walked, which covers typical bar apps
+      without the full resolver.
+11. Press the compositor's close path for the layer (or terminate the session)
     and confirm the process exits cleanly via the `closed` handler.

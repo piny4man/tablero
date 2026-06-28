@@ -1,5 +1,5 @@
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
-use tiny_skia::{Paint, Pixmap, Rect, Transform};
+use tiny_skia::{FilterQuality, Paint, Pixmap, PixmapPaint, PixmapRef, Rect, Transform};
 
 /// Opaque dark background color (R, G, B).
 pub const BG: (u8, u8, u8) = (0x18, 0x18, 0x18);
@@ -203,6 +203,43 @@ impl RenderContext {
         });
     }
 
+    /// Blit a premultiplied RGBA8888 image into `bounds`, scaled to fit while
+    /// preserving its aspect ratio and centered within the slot.
+    ///
+    /// `rgba` is `img_w * img_h` premultiplied `[R, G, B, A]` pixels — the same
+    /// layout [`pixels`](RenderContext::pixels) reads back, so an icon decoded to
+    /// this form draws directly. The image is downscaled (or upscaled) with
+    /// bilinear filtering to the largest size that fits `bounds` on both axes, then
+    /// centered; nothing is drawn for an empty slot, an empty image, or a byte
+    /// slice whose length does not match `img_w * img_h * 4`. This is the one
+    /// raster-image primitive the tray widget needs beyond text.
+    pub fn draw_icon(&mut self, rgba: &[u8], img_w: u32, img_h: u32, bounds: Bounds) {
+        if bounds.width == 0 || bounds.height == 0 || img_w == 0 || img_h == 0 {
+            return;
+        }
+        let Some(src) = PixmapRef::from_bytes(rgba, img_w, img_h) else {
+            // Mismatched length or zero dimension: skip rather than risk a panic.
+            return;
+        };
+
+        // Largest uniform scale that fits the image inside the slot on both axes.
+        let scale = (bounds.width as f32 / img_w as f32).min(bounds.height as f32 / img_h as f32);
+        let draw_w = img_w as f32 * scale;
+        let draw_h = img_h as f32 * scale;
+        // Center the scaled image within the slot.
+        let tx = bounds.x as f32 + (bounds.width as f32 - draw_w) / 2.0;
+        let ty = bounds.y as f32 + (bounds.height as f32 - draw_h) / 2.0;
+        let transform = Transform::from_scale(scale, scale).post_translate(tx, ty);
+
+        let paint = PixmapPaint {
+            quality: FilterQuality::Bilinear,
+            ..PixmapPaint::default()
+        };
+        self.pixmap
+            .as_mut()
+            .draw_pixmap(0, 0, src, &paint, transform, None);
+    }
+
     /// Premultiplied RGBA8888 bytes of the current frame (`[R, G, B, A]` per
     /// pixel). Convert to the Wayland shared-memory layout with
     /// [`crate::blit::write_argb8888`] before committing.
@@ -281,6 +318,42 @@ mod tests {
         ctx.resize(0, 16);
         assert_eq!((ctx.width(), ctx.height()), (128, 16));
         assert_eq!(ctx.pixels().len(), 128 * 16 * 4);
+    }
+
+    #[test]
+    fn draw_icon_blits_a_centered_image_into_its_slot() {
+        // A 2x2 fully-opaque red icon, premultiplied (opaque red is unchanged).
+        let red = [255u8, 0, 0, 255];
+        let icon: Vec<u8> = red.iter().cycle().take(2 * 2 * 4).copied().collect();
+        let mut ctx = RenderContext::new(64, 32);
+        ctx.fill_background();
+        ctx.draw_icon(&icon, 2, 2, Bounds::new(0, 0, 32, 32));
+        let px = ctx.pixels();
+        // The icon scales to the 32x32 slot, so its center pixel must be red.
+        let center = (16 * 64 + 16) * 4;
+        assert!(
+            px[center] > 0xC0 && px[center + 1] < 0x30 && px[center + 2] < 0x30,
+            "icon center not red: {:?}",
+            &px[center..center + 4]
+        );
+        // The far-right slot is untouched: still dark background.
+        let corner = (16 * 64 + 60) * 4;
+        assert!(
+            px[corner] < 0x30 && px[corner + 1] < 0x30 && px[corner + 2] < 0x30,
+            "outside-icon area not background"
+        );
+    }
+
+    #[test]
+    fn draw_icon_ignores_malformed_byte_lengths() {
+        // A byte slice too short for the claimed dimensions must be skipped, not
+        // panic — malformed tray pixmap data must never crash a draw.
+        let mut ctx = RenderContext::new(32, 32);
+        ctx.fill_background();
+        ctx.draw_icon(&[0xFF, 0x00, 0x00], 4, 4, Bounds::new(0, 0, 32, 32));
+        // The whole surface is still the untouched background.
+        let px = ctx.pixels();
+        assert!(px[0] < 0x30 && px[1] < 0x30 && px[2] < 0x30);
     }
 
     #[test]

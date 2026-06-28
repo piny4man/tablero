@@ -19,12 +19,14 @@ pub mod battery;
 pub mod clock;
 pub mod network;
 pub mod system;
+pub mod tray;
 pub mod workspaces;
 
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use clock::ClockWidget;
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use system::{SystemStats, SystemWidget};
+pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
 /// Every state update a widget can react to.
@@ -48,6 +50,9 @@ pub enum Msg {
     /// The network connectivity changed; `None` means no network is available
     /// (or the network daemon is unreachable), so the widget shows nothing.
     Network(Option<Network>),
+    /// The set of registered StatusNotifierItem tray items changed; carries the
+    /// normalized snapshot of what the tray should now show.
+    Tray(TrayState),
 }
 
 impl Msg {
@@ -73,6 +78,9 @@ impl Msg {
 pub enum Command {
     /// Switch the compositor to the workspace with this id.
     SwitchWorkspace(i32),
+    /// Activate the tray item registered under this address (an SNI
+    /// `Activate` request — primary click).
+    ActivateTrayItem(String),
 }
 
 /// A drawable, message-driven component of the bar.
