@@ -7,6 +7,7 @@
 
 pub mod command;
 pub mod hyprland;
+pub mod networkmanager;
 pub mod producer;
 pub mod sysmon;
 pub mod upower;
