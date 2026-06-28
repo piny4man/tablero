@@ -14,6 +14,7 @@
 pub mod command;
 pub mod hyprland;
 pub mod networkmanager;
+pub mod outputs;
 pub mod producer;
 pub mod sni;
 pub mod sysmon;
