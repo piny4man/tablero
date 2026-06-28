@@ -30,6 +30,13 @@ RUST_LOG=info cargo run -p tablero
 - Opens a **top-anchored** layer-shell surface spanning the output width, with an
   **exclusive zone** equal to its height so tiled windows do not overlap it. The
   height (default 32px) is configurable.
+- Shows **one bar per monitor**: it tracks Wayland output lifecycle and opens a
+  surface on each output as it appears, tearing it down when the output is
+  unplugged — hotplug never crashes the bar or leaks stale state. Each output's
+  bar can be configured independently (widget set and visual overrides), and its
+  **workspace widget is scoped to that monitor** — it shows only that monitor's
+  workspaces and highlights *its* active one, matching Hyprland's per-monitor
+  workspace model.
 - Renders, left to right, a set of **widgets** driven by a typed message
   architecture, each repainting only when its visible state actually changes:
   - **Workspaces** — the Hyprland workspace set, active one bracketed and drawn
@@ -131,6 +138,48 @@ size = 16.0
 | `font.family`  | string (opt.)   | unset → system font                           | Font family name.                                                |
 | `font.size`    | float (px)      | `16.0`                                         | Text size.                                                       |
 
+### Per-monitor overrides
+
+tablero shows one bar per output. By default every output runs on the global
+settings above; add a `[[monitor]]` block to override a specific output, matched
+by its Hyprland connector name (`hyprctl monitors` lists them — `DP-1`,
+`HDMI-A-1`, `eDP-1`, …):
+
+```toml
+[[monitor]]
+name = "DP-1"          # required: the connector to match
+height = 40            # override just this output's height
+widgets = ["workspaces", "clock"]   # and its widget set
+
+[monitor.theme]
+accent = "#88c0d0"     # only the accent changes; background/foreground inherit
+
+[monitor.font]
+size = 18.0            # larger text on this monitor only
+
+[[monitor]]
+name = "eDP-1"         # the laptop panel: shorter bar, everything else global
+height = 28
+```
+
+Every field **except `name` is optional** and overrides are shallow per field: a
+field you omit keeps the output's global value (and within `[monitor.theme]` /
+`[monitor.font]`, an omitted channel inherits the global theme/font rather than
+resetting to the built-in default). An output whose connector matches no
+`[[monitor]]` block — or that advertises no name — runs on the global defaults
+unchanged.
+
+| Key                  | Type            | Notes                                                                 |
+| -------------------- | --------------- | --------------------------------------------------------------------- |
+| `monitor` (`[[monitor]]`) | array of tables | One block per output you want to customize; omit entirely for a uniform bar. |
+| `monitor.name`       | string          | **Required.** Hyprland connector name to match (`hyprctl monitors`).  |
+| `monitor.height`     | integer (px)    | Overrides `height` on this output.                                    |
+| `monitor.spacing`    | integer (px)    | Overrides `spacing` on this output.                                   |
+| `monitor.padding`    | integer (px)    | Overrides `padding` on this output.                                   |
+| `monitor.widgets`    | list of strings | Overrides the widget set/order on this output.                        |
+| `monitor.theme.*`    | hex color       | Per-channel theme override; omitted channels inherit the global theme. |
+| `monitor.font.*`     | family / size   | Per-field font override; omitted fields inherit the global font.      |
+
 ## Manual verification under Hyprland
 
 The render, blit, widget, and config paths are unit- and integration-tested, but
@@ -166,7 +215,27 @@ surface placement and input need a live compositor. To verify on Hyprland:
    - **Clicking a workspace** still switches to it — pointer hit-testing tracks
      the scaled layout. On a fractional scale (e.g. 1.5×) the bar renders at 2×
      and the compositor downscales; confirm it still looks sharp and clicks land.
-10. Verify the **system tray** with at least two real tray-producing apps. Add
+10. Verify **multi-monitor** placement with at least two outputs (`hyprctl
+    monitors` lists them). With the bar running:
+    - Confirm **each monitor has its own bar**, pinned to the top of *that*
+      output and spanning *its* width — not one bar stretched across both, and no
+      output left bare.
+    - Confirm each bar's **workspace widget shows only its own monitor's
+      workspaces** and brackets/accents the workspace active *on that monitor* —
+      switching workspaces on one screen updates that screen's bar without
+      disturbing the other's (this mirrors Hyprland's per-monitor workspaces).
+    - Confirm **clicking a workspace** on a given monitor's bar switches that
+      monitor — input is routed to the surface it lands on.
+    - Add a `[[monitor]]` block for one connector (e.g. a different `height`,
+      `widgets`, or `[monitor.theme] accent`), restart, and confirm **only that
+      monitor's bar changes** while the other keeps the global look.
+    - **Hotplug**: unplug a monitor (or `hyprctl keyword monitor <name>,disable`)
+      and confirm its bar disappears while the remaining bar(s) keep running;
+      re-enable it and confirm a fresh bar reappears. `RUST_LOG=info` logs
+      `output … added` / `output … removed` and the app must not crash or leave a
+      stale surface (`hyprctl layers` should list exactly one `tablero` namespace
+      per live output).
+11. Verify the **system tray** with at least two real tray-producing apps. Add
     `"tray"` to `widgets` (it is opt-in), restart, then launch two SNI clients —
     e.g. **Discord** or **Element** (Electron, ARGB pixmaps), **Telegram
     Desktop** (themed icon name), **nm-applet** or **blueman-applet** (classic
@@ -199,5 +268,6 @@ surface placement and input need a live compositor. To verify on Hyprland:
       set) leads, then common `hicolor` app/status sizes and `/usr/share/pixmaps`
       — `index.theme` inheritance is not walked, which covers typical bar apps
       without the full resolver.
-11. Press the compositor's close path for the layer (or terminate the session)
-    and confirm the process exits cleanly via the `closed` handler.
+12. Press the compositor's close path for the layer (or terminate the session)
+    and confirm the process exits cleanly: each surface is removed via the
+    `closed` handler, and the process shuts down once the last bar is gone.

@@ -1,9 +1,12 @@
 //! Wayland layer-shell front-end for tablero.
 //!
-//! Opens a top-anchored `wlr-layer-shell` surface under a compositor such as
-//! Hyprland, renders a live clock through a shared-memory buffer, and drives
-//! redraws from a [`calloop`] timer so the loop only wakes for clock ticks,
-//! compositor events (configure, scale), or shutdown — never a busy redraw loop.
+//! Opens one top-anchored `wlr-layer-shell` surface **per output** under a
+//! compositor such as Hyprland — tracking output hotplug to add and remove bars
+//! as monitors come and go — renders a live clock through a shared-memory buffer,
+//! and drives redraws from a [`calloop`] timer so the loop only wakes for clock
+//! ticks, compositor events (output lifecycle, configure, scale), or shutdown —
+//! never a busy redraw loop. Each output's bar is configured independently (see
+//! [`outputs`]); producer messages and ticks fan out to every surface.
 //!
 //! Surface geometry is kept in logical pixels (the layer-shell size request and
 //! exclusive zone), while the shared-memory buffer is allocated at the output's

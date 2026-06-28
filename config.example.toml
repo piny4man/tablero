@@ -33,3 +33,24 @@ accent     = "#eaeaea" # emphasis color (e.g. the active workspace)
 # pick a specific family:
 # family = "JetBrains Mono"
 size = 16.0
+
+# Per-monitor overrides. tablero shows one bar per connected output; by default
+# every output uses the global settings above. Add a [[monitor]] block to tweak a
+# specific output, matched by its Hyprland connector name (`hyprctl monitors`
+# lists them, e.g. "DP-1", "HDMI-A-1", "eDP-1"). Every field except `name` is
+# optional — omit one and that output keeps the global value, so you only state
+# what differs. An output with no matching [[monitor]] block uses the global
+# defaults unchanged.
+#
+# [[monitor]]
+# name = "DP-1"            # required: the connector to match
+# height = 40             # taller bar on this monitor only
+# widgets = ["workspaces", "clock"]   # a leaner widget set here
+# [monitor.theme]
+# accent = "#88c0d0"      # only the accent changes; background/foreground inherit
+# [monitor.font]
+# size = 18.0             # larger text on this monitor only
+#
+# [[monitor]]
+# name = "eDP-1"          # the laptop panel: just a shorter bar, nothing else
+# height = 28
