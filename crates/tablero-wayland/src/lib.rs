@@ -3,7 +3,13 @@
 //! Opens a top-anchored `wlr-layer-shell` surface under a compositor such as
 //! Hyprland, renders a live clock through a shared-memory buffer, and drives
 //! redraws from a [`calloop`] timer so the loop only wakes for clock ticks,
-//! compositor events (configure), or shutdown — never a busy redraw loop.
+//! compositor events (configure, scale), or shutdown — never a busy redraw loop.
+//!
+//! Surface geometry is kept in logical pixels (the layer-shell size request and
+//! exclusive zone), while the shared-memory buffer is allocated at the output's
+//! physical pixel density: on a scaled output the buffer is `scale`× larger and
+//! `set_buffer_scale` maps it back, so the bar stays crisp on HiDPI displays.
+//! The logical→physical conversion lives entirely in [`tablero_core::scale`].
 
 pub mod command;
 pub mod hyprland;
@@ -44,6 +50,7 @@ use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_second;
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
+use tablero_core::scale::Scale;
 use tablero_core::widget::{Dashboard, Msg};
 
 use crate::command::{CommandSender, command_channel};
@@ -72,8 +79,16 @@ struct Bar {
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    /// Surface dimensions in *logical* pixels (as the compositor reports them in
+    /// `configure`). The shared-memory buffer is `scale`× larger; see [`Bar::draw`].
     width: u32,
     height: u32,
+    /// The output's integer buffer scale. Drives the physical buffer size and the
+    /// physical font size; `1` until the compositor reports otherwise.
+    scale: Scale,
+    /// The resolved configuration, retained so the physical font size can be
+    /// re-resolved whenever the output scale changes.
+    config: Config,
     /// Widgets composing the bar, plus the dirty-flag redraw policy over them.
     dashboard: Dashboard,
     /// Reused software-render target (font machinery + pixmap).
@@ -99,6 +114,22 @@ impl Bar {
         }
     }
 
+    /// Adopt a new output buffer scale.
+    ///
+    /// Re-resolves the physical font size from the configuration so text stays
+    /// crisp at the new density, then repaints (once configured) so the buffer is
+    /// reallocated at the new physical size. A no-op when the scale is unchanged.
+    fn set_scale(&mut self, scale: Scale) {
+        if self.scale == scale {
+            return;
+        }
+        self.scale = scale;
+        self.ctx
+            .set_settings(self.config.scaled_render_settings(scale));
+        info!("output scale changed to {}x", scale.get());
+        self.draw();
+    }
+
     /// Route a left-button press at surface coordinates `(x, y)` to the
     /// dashboard, dispatching any resulting [`Command`](tablero_core::widget::Command)
     /// into the producer runtime. Clicks that hit no interactive region — empty
@@ -108,8 +139,12 @@ impl Bar {
         if x < 0.0 || y < 0.0 {
             return;
         }
-        // Floor to whole pixels for the widgets' half-open hit-test.
-        let Some(command) = self.dashboard.on_click(x as u32, y as u32) else {
+        // Pointer coordinates are surface-local *logical* pixels, but the widgets
+        // are laid out in physical pixels, so the click is scaled by the same
+        // factor before the half-open hit-test — the one conversion that keeps
+        // input and layout in the same space.
+        let s = self.scale.get() as f64;
+        let Some(command) = self.dashboard.on_click((x * s) as u32, (y * s) as u32) else {
             return;
         };
         if let Some(commands) = &self.commands
@@ -127,8 +162,10 @@ impl Bar {
             return;
         }
 
-        let width = self.width;
-        let height = self.height;
+        // Logical surface dimensions scale up to the physical buffer the
+        // compositor maps back down via `set_buffer_scale`. Everything below this
+        // point — buffer, render target, layout, font — works in physical pixels.
+        let (width, height) = self.scale.to_physical_size(self.width, self.height);
         let stride = width as i32 * 4;
 
         let (buffer, canvas) = match self.pool.create_buffer(
@@ -150,6 +187,9 @@ impl Bar {
         write_argb8888(self.ctx.pixels(), canvas);
 
         let surface = self.layer.wl_surface();
+        // Tell the compositor the buffer holds `scale`× physical pixels per
+        // logical pixel, so it maps the larger buffer back to the logical size.
+        surface.set_buffer_scale(self.scale.get() as i32);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         if let Err(e) = buffer.attach_to(surface) {
             error!("failed to attach buffer: {e}");
@@ -240,6 +280,11 @@ pub fn run_with_producers(
         layer,
         width: INITIAL_WIDTH,
         height,
+        // The compositor reports the real scale via `scale_factor_changed`,
+        // typically before the first configure; until then assume an unscaled
+        // output.
+        scale: Scale::ONE,
+        config,
         dashboard,
         ctx,
         pointer: None,
@@ -307,8 +352,11 @@ impl CompositorHandler for Bar {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        new_factor: i32,
     ) {
+        // The compositor reports the surface's preferred integer buffer scale.
+        // Adopt it so the bar renders at the output's pixel density.
+        self.set_scale(Scale::new(new_factor));
     }
 
     fn transform_changed(
