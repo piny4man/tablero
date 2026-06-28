@@ -51,6 +51,17 @@ const DEFAULT_BACKGROUND: Color = Color::rgb(0x18, 0x18, 0x18);
 /// Default light foreground (also the default accent).
 const DEFAULT_FOREGROUND: Color = Color::rgb(0xEA, 0xEA, 0xEA);
 
+/// Smallest accepted bar height, in pixels (a zero-height bar is a broken surface).
+const MIN_HEIGHT: u32 = 1;
+/// Largest accepted bar height, in pixels — anything larger is surely a mistake.
+const MAX_HEIGHT: u32 = 4096;
+/// Smallest accepted font size, in pixels.
+const MIN_FONT_SIZE: f32 = 1.0;
+/// Largest accepted font size, in pixels.
+const MAX_FONT_SIZE: f32 = 512.0;
+/// Largest accepted widget spacing/padding, in pixels.
+const MAX_GAP: u32 = 4096;
+
 /// An RGB color, parsed from a `"#rrggbb"` (or bare `"rrggbb"`) hex string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
@@ -299,7 +310,12 @@ impl Config {
     /// Missing fields fall back to their documented defaults; unknown keys,
     /// unknown widget names, and malformed colors are reported as errors.
     pub fn from_toml_str(toml: &str) -> Result<Config, ConfigError> {
-        toml::from_str(toml).map_err(|source| ConfigError::Parse { path: None, source })
+        let config: Config =
+            toml::from_str(toml).map_err(|source| ConfigError::Parse { path: None, source })?;
+        config
+            .validate()
+            .map_err(|message| ConfigError::Invalid { path: None, message })?;
+        Ok(config)
     }
 
     /// Load a configuration from a TOML file.
@@ -311,16 +327,62 @@ impl Config {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         let path = path.as_ref();
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                path: Some(path.to_path_buf()),
-                source,
-            }),
+            Ok(text) => {
+                let config: Config =
+                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                        path: Some(path.to_path_buf()),
+                        source,
+                    })?;
+                config.validate().map_err(|message| ConfigError::Invalid {
+                    path: Some(path.to_path_buf()),
+                    message,
+                })?;
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
             Err(source) => Err(ConfigError::Read {
                 path: path.to_path_buf(),
                 source,
             }),
         }
+    }
+
+    /// Validate the resolved values, rejecting ones that deserialize fine but
+    /// would render a blank or broken bar: an out-of-range height or font size,
+    /// an absurd spacing/padding, or a `[[monitor]]` override with no name (it
+    /// can never match an output). Returns a message naming the first offending
+    /// field.
+    ///
+    /// Called from both parse entry points so a present-but-invalid config is
+    /// fatal at startup rather than silently producing an unusable bar.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_range("height", self.height, MIN_HEIGHT, MAX_HEIGHT)?;
+        validate_font_size("font.size", self.font.size)?;
+        validate_range("spacing", self.spacing, 0, MAX_GAP)?;
+        validate_range("padding", self.padding, 0, MAX_GAP)?;
+
+        for monitor in &self.monitors {
+            if monitor.name.trim().is_empty() {
+                return Err(
+                    "a [[monitor]] override has an empty `name`; it can never match an output"
+                        .to_string(),
+                );
+            }
+            let who = monitor.name.as_str();
+            if let Some(height) = monitor.height {
+                validate_range(&format!("monitor {who:?} height"), height, MIN_HEIGHT, MAX_HEIGHT)?;
+            }
+            if let Some(spacing) = monitor.spacing {
+                validate_range(&format!("monitor {who:?} spacing"), spacing, 0, MAX_GAP)?;
+            }
+            if let Some(padding) = monitor.padding {
+                validate_range(&format!("monitor {who:?} padding"), padding, 0, MAX_GAP)?;
+            }
+            if let Some(size) = monitor.font.size {
+                validate_font_size(&format!("monitor {who:?} font.size"), size)?;
+            }
+        }
+        Ok(())
     }
 
     /// The widget kinds to build, in display order, with duplicates removed
@@ -375,6 +437,26 @@ impl Config {
         monitor.font.apply(&mut resolved.font);
 
         resolved
+    }
+}
+
+/// Reject a `u32` field outside `min..=max`, with a message naming the field.
+fn validate_range(field: &str, value: u32, min: u32, max: u32) -> Result<(), String> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be between {min} and {max}, got {value}"))
+    }
+}
+
+/// Reject a font size that is not a finite number within the accepted range.
+fn validate_font_size(field: &str, size: f32) -> Result<(), String> {
+    if size.is_finite() && (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be a finite number between {MIN_FONT_SIZE} and {MAX_FONT_SIZE}, got {size}"
+        ))
     }
 }
 
@@ -475,6 +557,13 @@ pub enum ConfigError {
         /// The underlying TOML error (carries line/column and a message).
         source: toml::de::Error,
     },
+    /// The document parsed but holds a value that would render a broken bar.
+    Invalid {
+        /// The file the document came from, if it was read from disk.
+        path: Option<PathBuf>,
+        /// What was wrong, naming the offending field.
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -490,6 +579,14 @@ impl fmt::Display for ConfigError {
             ConfigError::Parse { path: None, source } => {
                 write!(f, "invalid config: {source}")
             }
+            ConfigError::Invalid {
+                path: Some(path),
+                message,
+            } => write!(f, "invalid config {}: {message}", path.display()),
+            ConfigError::Invalid {
+                path: None,
+                message,
+            } => write!(f, "invalid config: {message}"),
         }
     }
 }
@@ -499,6 +596,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Read { source, .. } => Some(source),
             ConfigError::Parse { source, .. } => Some(source),
+            ConfigError::Invalid { .. } => None,
         }
     }
 }
@@ -855,5 +953,97 @@ mod tests {
         let msg = err.to_string();
         // The error names the offending file, not a silent fallback to defaults.
         assert!(msg.contains("broken.toml"), "message: {msg}");
+    }
+
+    #[test]
+    fn zero_height_is_rejected() {
+        let err = Config::from_toml_str("height = 0").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+        assert!(err.to_string().contains("height"), "message: {err}");
+    }
+
+    #[test]
+    fn absurdly_tall_bar_is_rejected() {
+        let err = Config::from_toml_str("height = 100000").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn zero_font_size_is_rejected() {
+        let err = Config::from_toml_str("[font]\nsize = 0.0").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+        assert!(err.to_string().contains("font.size"), "message: {err}");
+    }
+
+    #[test]
+    fn non_finite_font_size_is_rejected() {
+        // TOML spells these `nan` / `inf`; both must be refused, not rendered.
+        for doc in ["[font]\nsize = nan", "[font]\nsize = inf"] {
+            let err = Config::from_toml_str(doc).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "{doc:?} -> {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_font_size_is_rejected() {
+        let err = Config::from_toml_str("[font]\nsize = -4.0").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn nameless_monitor_override_is_rejected() {
+        // A [[monitor]] with no name can never match an output — surely a mistake.
+        let err = Config::from_toml_str("[[monitor]]\nheight = 30").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+        assert!(err.to_string().contains("name"), "message: {err}");
+    }
+
+    #[test]
+    fn out_of_range_monitor_override_is_rejected() {
+        let err = Config::from_toml_str("[[monitor]]\nname = \"DP-1\"\nheight = 0").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "wrong variant: {err:?}"
+        );
+        // The message points at the specific monitor and field.
+        let msg = err.to_string();
+        assert!(msg.contains("DP-1") && msg.contains("height"), "message: {msg}");
+    }
+
+    #[test]
+    fn boundary_values_are_accepted() {
+        // The inclusive bounds themselves are valid.
+        let config = Config::from_toml_str("height = 4096\n[font]\nsize = 1.0").unwrap();
+        assert_eq!(config.height, 4096);
+        assert_eq!(config.font.size, 1.0);
+    }
+
+    #[test]
+    fn an_invalid_file_names_the_file_and_the_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        fs::write(&path, "height = 0\n").unwrap();
+        let err = Config::load_from_path(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad.toml"), "message: {msg}");
+        assert!(msg.contains("height"), "message: {msg}");
     }
 }
