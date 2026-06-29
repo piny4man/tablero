@@ -1,17 +1,32 @@
-//! Hyprland workspace source.
+//! Hyprland IPC source for workspaces and the focused window's title.
 //!
-//! Reads the workspace set from Hyprland's IPC sockets and emits typed
-//! [`Msg::Workspaces`] snapshots through the [producer bridge](crate::producer),
-//! so workspace state reaches the render loop the same way every other message
-//! does — the rendering code never talks to Hyprland directly.
+//! Reads the workspace set and the active window on the focused monitor from
+//! Hyprland's IPC sockets, and emits typed [`Msg::Workspaces`] /
+//! [`Msg::ActiveWindow`] snapshots through the [producer bridge](crate::producer),
+//! so both reach the render loop the same way every other message does — the
+//! rendering code never talks to Hyprland directly.
 //!
 //! Hyprland exposes two Unix sockets under `$XDG_RUNTIME_DIR/hypr/$SIGNATURE`:
 //! `.socket.sock` answers one-shot JSON requests (`j/workspaces`,
-//! `j/activeworkspace`), and `.socket2.sock` streams `EVENT>>DATA` lines. The
-//! producer queries an initial snapshot, then re-queries whenever a
-//! workspace-relevant event arrives. Normalization and de-duplication live in
-//! [`Workspaces`], so emitting a snapshot that turns out unchanged is harmless —
-//! the widget simply reports no visible change.
+//! `j/activeworkspace`, `j/monitors`, `j/activewindow`), and `.socket2.sock`
+//! streams `EVENT>>DATA` lines. The producer queries an initial snapshot of
+//! both, then on each event stream line dispatches to the right endpoint:
+//!
+//! - **Workspace events** ([`is_workspace_event`]) drive a `j/workspaces` +
+//!   `j/activeworkspace` + `j/monitors` refresh.
+//!
+//! - **Active-window events** ([`is_focus_or_lifecycle_event`]) —
+//!   `activewindow>>`, `activewindowv2>>`, `focusedmon>>`, `openwindow>>`,
+//!   `closewindow>>` — drive the per-monitor active-window tracking. The
+//!   `activewindow`/`activewindowv2` payloads carry `class,title` inline and
+//!   are parsed without an IPC round-trip; `focusedmon`, `openwindow`, and
+//!   `closewindow` re-query `j/activewindow` because the payload alone does
+//!   not describe the new state.
+//!
+//! Active-window messages are emitted *only* for the currently focused
+//! monitor: each output's `TitleWidget` is bound to a connector name and
+//! drops messages for any other monitor, so a focus change on monitor A
+//! updates only monitor A's bar.
 
 use std::env;
 use std::error::Error;
@@ -23,7 +38,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use tablero_core::widget::{Command, Msg, Workspaces};
+use tablero_core::widget::{ActiveWindow, Command, Msg, Workspaces};
 
 use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
@@ -83,6 +98,48 @@ pub fn parse_monitors(json: &str) -> serde_json::Result<Vec<(String, i32)>> {
         .into_iter()
         .map(|m| (m.name, m.active_workspace.id))
         .collect())
+}
+
+/// One element of `j/activewindow`: the focused window's class and title.
+///
+/// Optional fields so a `j/activewindow` reply that omits either (older
+/// Hyprland, or a focused window without one of the atoms reported) still
+/// parses into a usable snapshot — the [`ActiveWindow`] defaults the missing
+/// field to the empty string.
+#[derive(Deserialize)]
+struct RawActiveWindow {
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    title: String,
+}
+
+/// Parse the JSON object returned by `j/activewindow` into a normalized
+/// [`ActiveWindow`] snapshot.
+///
+/// A bare `{}` (no focused window / empty desktop) parses to an empty
+/// snapshot, which the [`TitleWidget`](crate::TitleWidget) treats as "no
+/// window" and reserves no slot.
+pub fn parse_active_window(json: &str) -> serde_json::Result<ActiveWindow> {
+    let raw: RawActiveWindow = serde_json::from_str(json)?;
+    Ok(ActiveWindow::new(raw.class, raw.title))
+}
+
+/// Parse an `activewindow>>…` or `activewindowv2>>…` stream line into the
+/// focused window's class and title.
+///
+/// Both event names carry the same `class,title` payload, so a single
+/// parser covers v1 and v2. Returns `None` for any other event name or a
+/// payload that does not match the `,`-separated two-field shape — callers
+/// should only invoke this on lines already confirmed to be an
+/// `activewindow`-family event.
+pub fn parse_activewindow_stream(line: &str) -> Option<(String, String)> {
+    let (name, rest) = line.split_once(">>")?;
+    if name != "activewindow" && name != "activewindowv2" {
+        return None;
+    }
+    let (class, title) = rest.split_once(',')?;
+    Some((class.to_string(), title.to_string()))
 }
 
 /// Build a normalized [`Workspaces`] snapshot from the two raw IPC responses,
@@ -181,6 +238,42 @@ fn is_workspace_event(line: &str) -> bool {
     name.contains("workspace") || name == "focusedmon" || name == "activespecial"
 }
 
+/// True if an event name from `.socket2.sock` is one we handle for
+/// active-window tracking.
+///
+/// Covers the dedicated focus events (`activewindow>>`, `activewindowv2>>`),
+/// the window-lifecycle events (`openwindow>>`, `closewindow>>`), and the
+/// monitor-focus event (`focusedmon>>`, since the active window can change
+/// with the focused monitor without an `activewindow>>` immediately
+/// following).
+///
+/// The lifecycle events are needed because Hyprland does not always re-emit
+/// `activewindow>>` when the focused window closes — listening to the
+/// lifecycle events directly ensures the title widget catches the transition.
+pub fn is_focus_or_lifecycle_event(name: &str) -> bool {
+    matches!(
+        name,
+        "activewindow" | "activewindowv2" | "openwindow" | "closewindow" | "focusedmon"
+    )
+}
+
+/// Parse a `focusedmon>>monitor,workspace_id` event line into the focused
+/// monitor's connector name.
+///
+/// `focusedmon>>DP-1,2` → `Some("DP-1".to_string())`. Returns `None` for
+/// events that are not `focusedmon>>` or for payloads that do not have the
+/// `,`-separated `monitor,workspace` shape — callers should gate on the
+/// event name first, but the parser also refuses unrelated events as a
+/// defense in depth.
+pub fn parse_focusedmon(line: &str) -> Option<String> {
+    let (name, rest) = line.split_once(">>")?;
+    if name != "focusedmon" {
+        return None;
+    }
+    let (monitor, _ws_id) = rest.split_once(',')?;
+    Some(monitor.to_string())
+}
+
 /// Locate Hyprland's socket directory from the environment.
 ///
 /// Prefers `$XDG_RUNTIME_DIR/hypr/$SIGNATURE` (current Hyprland) and falls back
@@ -226,16 +319,61 @@ async fn fetch_snapshot(dir: &Path) -> Result<Workspaces, Box<dyn Error + Send +
     )?)
 }
 
-/// A [`Producer`] that streams Hyprland workspace changes into the render loop.
+/// Query `j/activewindow` and return a normalized [`ActiveWindow`] snapshot.
+///
+/// Hyprland returns `{}` when no window is focused (empty desktop, or a
+/// compositor state where the global focus has no addressable window); the
+/// parser folds that into an empty snapshot, which the
+/// [`TitleWidget`](crate::TitleWidget) treats as "no window" and reserves no
+/// slot for.
+async fn fetch_activewindow(dir: &Path) -> Result<ActiveWindow, Box<dyn Error + Send + Sync>> {
+    let json = query(dir, "j/activewindow").await?;
+    Ok(parse_active_window(&json)?)
+}
+
+/// Resolve the focused monitor name *and* the active window in one startup
+/// pass.
+///
+/// Hyprland exposes the globally active window only via `j/activewindow`
+/// and the globally active workspace only via `j/activeworkspace`. The
+/// focused monitor is the one whose `j/monitors` entry has the same
+/// `activeWorkspace.id` as the global active workspace — that's the
+/// monitor the active window lives on. Combining the three gives us a
+/// `(focused_monitor, active_window)` pair to seed the per-monitor
+/// tracking without waiting for the first `focusedmon>>` event.
+async fn fetch_initial_focused_activewindow(
+    dir: &Path,
+) -> Result<(String, ActiveWindow), Box<dyn Error + Send + Sync>> {
+    let active_ws_json = query(dir, "j/activeworkspace").await?;
+    let active_ws_id = parse_active(&active_ws_json)?;
+    let monitors_json = query(dir, "j/monitors").await?;
+    let monitors = parse_monitors(&monitors_json)?;
+    let focused = monitors
+        .iter()
+        .find(|(_, ws)| *ws == active_ws_id)
+        .map(|(name, _)| name.clone())
+        .ok_or("no monitor matches the globally active workspace")?;
+    let active_json = query(dir, "j/activewindow").await?;
+    let window = parse_active_window(&active_json)?;
+    Ok((focused, window))
+}
+
+/// A [`Producer`] that streams Hyprland workspace and focus changes into the
+/// render loop.
 ///
 /// Construct with [`new`](HyprlandProducer::new) and hand it to the producer
-/// bridge; it queries an initial snapshot, then re-queries and emits on every
-/// workspace-relevant compositor event until its sockets close or the render
-/// loop shuts down.
+/// bridge; it queries an initial snapshot of both workspaces and the
+/// per-monitor active window, then on each event stream line dispatches to
+/// the right endpoint and emits a typed [`Msg`] addressed to the affected
+/// monitor — until its sockets close or the render loop shuts down.
 pub struct HyprlandProducer;
 
 impl HyprlandProducer {
-    /// Create a Hyprland workspace producer.
+    /// Create a Hyprland IPC producer.
+    ///
+    /// The same single producer drives both the workspace stream and the
+    /// active-window stream, sharing one connection to `.socket2.sock` and
+    /// dispatching each incoming event to the right one-shot query.
     pub fn new() -> Self {
         Self
     }
@@ -249,7 +387,7 @@ impl Default for HyprlandProducer {
 
 impl Producer for HyprlandProducer {
     fn name(&self) -> String {
-        "hyprland-workspaces".to_string()
+        "hyprland".to_string()
     }
 
     fn run(self: Box<Self>, tx: MsgSender) -> ProducerFuture {
@@ -257,7 +395,18 @@ impl Producer for HyprlandProducer {
     }
 }
 
-/// Drive the workspace stream: initial snapshot, then re-query on each event.
+/// Drive both streams: seed workspaces and the per-monitor active window,
+/// then on each event stream line dispatch to the right endpoint.
+///
+/// The active-window tracking is *per-monitor*: each output's bar binds to
+/// one Hyprland connector name and updates only on focus events for that
+/// monitor. The producer tracks the most recently focused monitor via
+/// `focusedmon>>` events; focus changes within that monitor (`activewindow>>`
+/// and `activewindowv2>>`) parse the `class,title` payload inline and emit
+/// without an extra IPC round-trip. Window lifecycle (`openwindow>>`,
+/// `closewindow>>`) and the focus-change re-query (`focusedmon>>`) still
+/// round-trip `j/activewindow` because the payload alone is not enough to
+/// know the post-state.
 ///
 /// Returns `Ok(())` once the render loop has gone away (a [`send`] reports the
 /// channel closed) or the event socket reaches EOF. Transient query failures are
@@ -267,29 +416,110 @@ impl Producer for HyprlandProducer {
 async fn run(tx: MsgSender) -> ProducerResult {
     let dir = resolve_socket_dir()?;
 
-    // Seed the bar with the current workspaces before the first event arrives.
-    match fetch_snapshot(&dir).await {
-        Ok(snapshot) => {
-            if tx.send(Msg::Workspaces(snapshot)).is_err() {
-                return Ok(());
-            }
+    // Seed workspaces + active window before the first event arrives.
+    if let Ok(snapshot) = fetch_snapshot(&dir).await {
+        if tx.send(Msg::Workspaces(snapshot)).is_err() {
+            return Ok(());
         }
-        Err(e) => warn!("hyprland: initial workspace query failed: {e}"),
+    } else {
+        warn!("hyprland: initial workspace query failed");
+    }
+
+    let mut last_focused_monitor: Option<String> = None;
+    if let Ok((monitor, window)) = fetch_initial_focused_activewindow(&dir).await {
+        last_focused_monitor = Some(monitor.clone());
+        let window = (!window.is_empty()).then_some(window);
+        if tx.send(Msg::ActiveWindow { monitor, window }).is_err() {
+            return Ok(());
+        }
+    } else {
+        warn!("hyprland: initial activewindow query failed");
     }
 
     let events = UnixStream::connect(dir.join(".socket2.sock")).await?;
     let mut lines = BufReader::new(events).lines();
     while let Some(line) = lines.next_line().await? {
-        if !is_workspace_event(&line) {
-            continue;
-        }
-        match fetch_snapshot(&dir).await {
-            Ok(snapshot) => {
+        let name = line.split(">>").next().unwrap_or("");
+
+        if is_workspace_event(&line) {
+            if let Ok(snapshot) = fetch_snapshot(&dir).await {
                 if tx.send(Msg::Workspaces(snapshot)).is_err() {
                     return Ok(());
                 }
+            } else {
+                warn!("hyprland: workspace refresh failed");
             }
-            Err(e) => warn!("hyprland: workspace refresh failed: {e}"),
+        }
+
+        if !is_focus_or_lifecycle_event(name) {
+            // Unrelated event (workspace events handled above; this drops
+            // the rest: submap toggles, config reloads, etc.).
+            continue;
+        }
+
+        match name {
+            "focusedmon" => {
+                // New focused monitor — re-query the active window so the
+                // title widget on the newly-focused monitor reflects the
+                // currently-active surface there. Non-focused monitors'
+                // bars stay untouched.
+                if let Some(mon) = parse_focusedmon(&line) {
+                    last_focused_monitor = Some(mon.clone());
+                    if let Ok(window) = fetch_activewindow(&dir).await {
+                        let window = (!window.is_empty()).then_some(window);
+                        if tx
+                            .send(Msg::ActiveWindow {
+                                monitor: mon,
+                                window,
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    } else {
+                        warn!("hyprland: focusedmon activewindow refresh failed");
+                    }
+                }
+            }
+            "activewindow" | "activewindowv2" => {
+                // Inline parse — no IPC round-trip. The active window is
+                // always on the most recently focused monitor (which
+                // `focusedmon>>` keeps in `last_focused_monitor`); events
+                // arriving before any `focusedmon>>` are dropped, which
+                // matches the cold-start "wait for first focus" behavior.
+                let Some(monitor) = last_focused_monitor.clone() else {
+                    continue;
+                };
+                let Some((class, title)) = parse_activewindow_stream(&line) else {
+                    continue;
+                };
+                if tx
+                    .send(Msg::ActiveWindow {
+                        monitor,
+                        window: Some(ActiveWindow::new(class, title)),
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            "openwindow" | "closewindow" => {
+                // Lifecycle event: Hyprland does not always re-emit
+                // `activewindow>>` after a focused window closes, so we
+                // re-query on these too. Same routing as `focusedmon`.
+                let Some(monitor) = last_focused_monitor.clone() else {
+                    continue;
+                };
+                if let Ok(window) = fetch_activewindow(&dir).await {
+                    let window = (!window.is_empty()).then_some(window);
+                    if tx.send(Msg::ActiveWindow { monitor, window }).is_err() {
+                        return Ok(());
+                    }
+                } else {
+                    warn!("hyprland: openwindow/closewindow refresh failed");
+                }
+            }
+            _ => {}
         }
     }
 
@@ -406,6 +636,94 @@ mod tests {
         assert!(!is_workspace_event("activewindow>>class,title"));
         assert!(!is_workspace_event("openwindow>>0x55,2,class,title"));
         assert!(!is_workspace_event("submap>>resize"));
+    }
+
+    // A realistically-shaped `j/activewindow` reply: includes extras the
+    // parser must ignore, plus a class-only variant and the modern form
+    // with both class and title.
+    const ACTIVEWINDOW_JSON: &str =
+        r#"{"address": "0x55", "class": "firefox", "title": "GitHub", "workspace": {"id": 2}}"#;
+    const ACTIVEWINDOW_CLASS_ONLY: &str = r#"{"address": "0x55", "class": "kitty"}"#;
+
+    #[test]
+    fn parse_active_window_extracts_class_and_title_ignoring_extras() {
+        let window = parse_active_window(ACTIVEWINDOW_JSON).expect("valid json");
+        assert_eq!(window.class(), "firefox");
+        assert_eq!(window.title(), "GitHub");
+    }
+
+    #[test]
+    fn parse_active_window_tolerates_a_missing_title() {
+        let window = parse_active_window(ACTIVEWINDOW_CLASS_ONLY).expect("valid json");
+        assert_eq!(window.class(), "kitty");
+        assert_eq!(window.title(), "");
+    }
+
+    #[test]
+    fn parse_active_window_folds_empty_object_to_empty_snapshot() {
+        let window = parse_active_window("{}").expect("valid json");
+        assert!(window.is_empty());
+    }
+
+    #[test]
+    fn parse_active_window_rejects_malformed_json() {
+        assert!(parse_active_window("not json").is_err());
+    }
+
+    #[test]
+    fn parse_activewindow_stream_handles_both_v1_and_v2_event_names() {
+        assert_eq!(
+            parse_activewindow_stream("activewindow>>firefox,GitHub"),
+            Some(("firefox".to_string(), "GitHub".to_string()))
+        );
+        assert_eq!(
+            parse_activewindow_stream("activewindowv2>>kitty,vim"),
+            Some(("kitty".to_string(), "vim".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_activewindow_stream_returns_none_on_unrelated_events() {
+        // Defensive: callers gate on the event name, but the parser itself
+        // must still refuse non-activewindow payloads.
+        assert!(parse_activewindow_stream("workspace>>2").is_none());
+        assert!(parse_activewindow_stream("activewindow>>").is_none());
+        assert!(parse_activewindow_stream("not an event line").is_none());
+    }
+
+    #[test]
+    fn parse_focusedmon_extracts_the_monitor_name() {
+        assert_eq!(
+            parse_focusedmon("focusedmon>>DP-1,2"),
+            Some("DP-1".to_string())
+        );
+        assert_eq!(
+            parse_focusedmon("focusedmon>>HDMI-A-1,5"),
+            Some("HDMI-A-1".to_string())
+        );
+        assert!(parse_focusedmon("focusedmon>>").is_none());
+        // The parser refuses non-focusedmon payloads even if they have the
+        // `,`-separated shape — callers gate on the event name, but
+        // defense in depth catches misuse.
+        assert!(parse_focusedmon("activewindow>>firefox,GitHub").is_none());
+        assert!(parse_focusedmon("not an event line").is_none());
+    }
+
+    #[test]
+    fn focus_or_lifecycle_events_are_recognized() {
+        assert!(is_focus_or_lifecycle_event("activewindow"));
+        assert!(is_focus_or_lifecycle_event("activewindowv2"));
+        assert!(is_focus_or_lifecycle_event("openwindow"));
+        assert!(is_focus_or_lifecycle_event("closewindow"));
+        assert!(is_focus_or_lifecycle_event("focusedmon"));
+    }
+
+    #[test]
+    fn non_focus_events_are_ignored_for_active_window_tracking() {
+        // Workspace and config events stay on the workspace / no-op path.
+        assert!(!is_focus_or_lifecycle_event("workspace"));
+        assert!(!is_focus_or_lifecycle_event("workspacev2"));
+        assert!(!is_focus_or_lifecycle_event("submap"));
     }
 
     #[test]
