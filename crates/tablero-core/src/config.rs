@@ -261,8 +261,13 @@ impl Default for Bar {
             margin: 0,
             gap: 0,
             modules_left: vec![WidgetKind::Workspaces],
-            modules_center: vec![WidgetKind::Clock],
-            modules_right: vec![WidgetKind::Battery, WidgetKind::System, WidgetKind::Network],
+            modules_center: vec![WidgetKind::Title],
+            modules_right: vec![
+                WidgetKind::Clock,
+                WidgetKind::Battery,
+                WidgetKind::System,
+                WidgetKind::Network,
+            ],
         }
     }
 }
@@ -1002,13 +1007,19 @@ mod tests {
         assert_eq!(config.theme.accent, Color::rgb(0xEA, 0xEA, 0xEA));
         assert_eq!(config.font.family, None);
         assert_eq!(config.font.size, 16.0);
-        // The default zones: workspaces left, clock centered, the status cluster
-        // right; the tray stays opt-in.
+        // The default zones: workspaces left, title centered, the time-and-status
+        // cluster right (clock first, then battery/system/network); the tray
+        // stays opt-in.
         assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
-        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
         assert_eq!(
             config.bar.modules_right,
-            vec![WidgetKind::Battery, WidgetKind::System, WidgetKind::Network,]
+            vec![
+                WidgetKind::Clock,
+                WidgetKind::Battery,
+                WidgetKind::System,
+                WidgetKind::Network,
+            ],
         );
     }
 
@@ -1053,7 +1064,7 @@ mod tests {
         // partial [bar] table did not restate.
         assert_eq!(config.bar.gap, 0);
         assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
-        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
         assert_eq!(config.theme.background, Color::rgb(0x18, 0x18, 0x18));
     }
 
