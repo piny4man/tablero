@@ -24,13 +24,15 @@ height = 32
 margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
-# "workspaces", "clock", "battery", "system", "network", "tray". A widget named
-# in two zones is built once, keeping its first mention. "tray" shows
-# StatusNotifierItem system-tray icons and is opt-in — add it to a zone to enable
-# it, e.g. modules-right = ["tray", "battery", "system", "network"].
+# "workspaces", "clock", "battery", "system", "network", "title", "tray". A
+# widget named in two zones is built once, keeping its first mention. "tray"
+# shows StatusNotifierItem system-tray icons and is opt-in — add it to a
+# zone to enable it, e.g. modules-right = ["tray", "battery", "system",
+# "network"]. "title" shows the focused Hyprland window's title and is the
+# default center module.
 modules-left   = ["workspaces"]
-modules-center = ["clock"]
-modules-right  = ["battery", "system", "network"]
+modules-center = ["title"]
+modules-right  = ["clock", "battery", "system", "network"]
 # An optional bar background that overrides [theme] background — the seam for a
 # translucent bar. Unset by default (the theme background is used):
 # background = "#181818cc"
@@ -59,6 +61,18 @@ size = 16.0
 # padding        = 8            # inset between pill edge and text, logical pixels
 # icon           = "none"       # "none" hides the glyph; any other string overrides
 #                               # it; omit to keep the widget's built-in glyph
+#
+# The title widget (default in modules-center) shows the focused Hyprland
+# window's title. Long titles are truncated at 100 characters with a trailing
+# ellipsis ("..."); setting max-length = 0 disables truncation. icon = "none"
+# keeps the default glyphless look - set icon to any string to draw that
+# glyph before the title.
+# [widget.title]
+# background     = "#2e3440cc"  # pill fill; absent means no pill (text floats)
+# foreground     = "#eceff4"    # text/glyph color; inherits [theme] foreground
+# radius         = 8            # pill corner radius, logical pixels
+# padding        = 8            # inset between pill edge and text, logical pixels
+# icon           = "none"       # see the comment above
 #
 # State colors drive the battery's low-charge warning and the tray's
 # needs-attention highlight. Defaults: a red "#bf616aff" pill with white text.
@@ -93,6 +107,8 @@ size = 16.0
 # size = 18.0                   # larger text on this monitor only
 # [monitor.widget.battery]
 # background = "#3b4252"        # give the battery a pill on this output only
+# [monitor.widget.title]
+# background = "#2e3440"        # give the title a pill on this output only
 #
 # [[monitor]]
 # name = "eDP-1"                # the laptop panel: just a shorter bar, nothing else

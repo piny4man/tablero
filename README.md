@@ -41,6 +41,11 @@ RUST_LOG=info cargo run -p tablero
   architecture, each repainting only when its visible state actually changes:
   - **Workspaces** — the Hyprland workspace set, active one bracketed and drawn
     in the accent color. **Click a workspace to switch to it.**
+  - **Title** — the active window's title on the bound monitor (default in the
+    center zone). Each bar shows its own monitor's focused window; focus changes
+    on one output leave other bars unchanged. Long titles are truncated with
+    `…` at 100 characters by default; `icon = "none"` keeps the default
+    glyphless look.
   - **Clock** — a live local clock (`HH:MM`).
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
@@ -107,11 +112,11 @@ spacing = 0
 # Inner padding inset on each widget column, in pixels.
 padding = 0
 
-# Widgets to render, left to right. Valid names: "workspaces", "clock",
-# "battery", "system", "network", "tray". "tray" is opt-in (not in the default
-# set above) — add it to enable the system tray. Repeats are de-duplicated,
-# keeping first position.
-widgets = ["workspaces", "clock", "battery", "system", "network"]
+# Widgets to render, left to right. Valid names: "workspaces", "title",
+# "clock", "battery", "system", "network", "tray". "tray" is opt-in (not in
+# the default set above) — add it to enable the system tray. Repeats are
+# de-duplicated, keeping first position.
+widgets = ["workspaces", "title", "clock", "battery", "system", "network"]
 
 [theme]
 # Colors are "#rrggbb" hex strings (the leading "#" is optional).
@@ -131,7 +136,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray). |
+| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -160,6 +165,8 @@ size = 18.0            # larger text on this monitor only
 [[monitor]]
 name = "eDP-1"         # the laptop panel: shorter bar, everything else global
 height = 28
+[monitor.widget.title]
+background = "#2e3440" # give the title a pill on this output only
 ```
 
 Every field **except `name` is optional** and overrides are shallow per field: a
@@ -179,6 +186,7 @@ unchanged.
 | `monitor.widgets`    | list of strings | Overrides the widget set/order on this output.                        |
 | `monitor.theme.*`    | hex color       | Per-channel theme override; omitted channels inherit the global theme. |
 | `monitor.font.*`     | family / size   | Per-field font override; omitted fields inherit the global font.      |
+| `monitor.widget.*`  | per-widget table | Per-widget style override (e.g. `[monitor.widget.title] background`); folded per-field onto the global `[widget.<name>]` table. |
 
 ## Manual verification under Hyprland
 
@@ -187,8 +195,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
 
 1. From inside a Hyprland session, run `RUST_LOG=info cargo run -p tablero`.
 2. Confirm a bar appears **pinned to the top** of the screen, spanning its full
-   width, showing a dark background with the workspaces, clock, battery,
-   system, and network widgets laid out left to right.
+   width, showing a dark background with the workspaces, **title**, clock,
+   battery, system, and network widgets laid out left to right.
 3. Confirm the clock **advances once per second** and that the text changes
    exactly on the second boundary (the timer is second-aligned).
 4. Confirm the **workspace indicator tracks Hyprland** — switching workspaces by
@@ -271,3 +279,11 @@ surface placement and input need a live compositor. To verify on Hyprland:
 12. Press the compositor's close path for the layer (or terminate the session)
     and confirm the process exits cleanly: each surface is removed via the
     `closed` handler, and the process shuts down once the last bar is gone.
+13. Verify the **title widget** (default in `modules-center`). With at least
+    two outputs (`hyprctl monitors`), focus a window on output A and confirm
+    that only output A's bar updates; output B's bar should keep its
+    previous title. Switching focus between windows on output A should
+    update only A's title within one frame. A long title (browser tab with
+    a full URL, music player track) should cap at `100` characters with a
+    trailing `…` and never overflow the center zone. Closing the last
+    focused window should leave the center blank.

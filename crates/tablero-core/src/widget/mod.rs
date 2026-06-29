@@ -23,6 +23,7 @@ pub mod battery;
 pub mod clock;
 pub mod network;
 pub mod system;
+pub mod title;
 pub mod tray;
 pub mod workspaces;
 
@@ -30,6 +31,7 @@ pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use clock::ClockWidget;
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use system::{SystemStats, SystemWidget};
+pub use title::{ActiveWindow, TitleWidget};
 pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -69,6 +71,21 @@ pub enum Msg {
     /// The set of registered StatusNotifierItem tray items changed; carries the
     /// normalized snapshot of what the tray should now show.
     Tray(TrayState),
+    /// The active window on a specific Hyprland monitor changed.
+    ///
+    /// Each output's bar carries its own `TitleWidget` bound to a specific
+    /// monitor name; the widget ignores messages for any other monitor so
+    /// focus changes on monitor A update only monitor A's bar. `window` is
+    /// `None` when no window on that monitor is focused (empty desktop or
+    /// compositor has no active window on the named monitor), in which case
+    /// the widget reserves no slot.
+    ActiveWindow {
+        /// The Hyprland connector name (e.g. `"DP-1"`) of the output whose
+        /// bar should update.
+        monitor: String,
+        /// The current active window on that monitor.
+        window: Option<ActiveWindow>,
+    },
 }
 
 impl Msg {
@@ -612,7 +629,8 @@ mod tests {
 
     #[test]
     fn layout_insets_the_row_by_the_bar_margin() {
-        let mut dash = Dashboard::with_zones(vec![one_workspace(1)], vec![], vec![]).with_spacing(4, 0);
+        let mut dash =
+            Dashboard::with_zones(vec![one_workspace(1)], vec![], vec![]).with_spacing(4, 0);
         let mut ctx = RenderContext::new(200, 32);
         dash.layout(&mut ctx, 200, 32);
         // Margin 4 pushes the pill in by 4 and shrinks the row height by 8; the
@@ -625,7 +643,8 @@ mod tests {
         // A clock with no time yet measures zero, so it is parked at zero width
         // and the workspace after it still starts at the origin.
         let clock = ClockWidget::new(Bounds::new(0, 0, 1, 1));
-        let mut dash = Dashboard::with_zones(vec![Box::new(clock), one_workspace(1)], vec![], vec![]);
+        let mut dash =
+            Dashboard::with_zones(vec![Box::new(clock), one_workspace(1)], vec![], vec![]);
         let mut ctx = RenderContext::new(200, 32);
         dash.layout(&mut ctx, 200, 32);
         assert_eq!(dash.left[0].bounds().width, 0);

@@ -68,7 +68,7 @@ use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
     BatteryWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget, StateColors, SystemWidget,
-    TrayWidget, Widget, WidgetStyle, WorkspaceWidget,
+    TitleWidget, TrayWidget, Widget, WidgetStyle, WorkspaceWidget,
 };
 
 /// Default bar height in pixels.
@@ -219,6 +219,8 @@ pub enum WidgetKind {
     Network,
     /// The StatusNotifierItem system tray.
     Tray,
+    /// The focused window's title on the bound monitor.
+    Title,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -259,8 +261,9 @@ impl Default for Bar {
             margin: 0,
             gap: 0,
             modules_left: vec![WidgetKind::Workspaces],
-            modules_center: vec![WidgetKind::Clock],
+            modules_center: vec![WidgetKind::Title],
             modules_right: vec![
+                WidgetKind::Clock,
                 WidgetKind::Battery,
                 WidgetKind::System,
                 WidgetKind::Network,
@@ -409,6 +412,8 @@ pub struct WidgetStyles {
     pub network: WidgetStyleConfig,
     /// Style for the tray widget.
     pub tray: WidgetStyleConfig,
+    /// Style for the title widget.
+    pub title: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -421,6 +426,7 @@ impl WidgetStyles {
             WidgetKind::System => &self.system,
             WidgetKind::Network => &self.network,
             WidgetKind::Tray => &self.tray,
+            WidgetKind::Title => &self.title,
         }
     }
 
@@ -433,6 +439,7 @@ impl WidgetStyles {
         self.system.apply(&mut base.system);
         self.network.apply(&mut base.network);
         self.tray.apply(&mut base.tray);
+        self.title.apply(&mut base.title);
     }
 }
 
@@ -822,10 +829,17 @@ impl WidgetKind {
     /// [`Dashboard::layout`] each frame. `monitor` is the connector name of the
     /// output this dashboard serves, threaded to the workspace widget so it
     /// shows only that monitor's workspaces; `None` builds the global fallback.
-    pub fn build(self, bounds: Bounds, style: WidgetStyle, monitor: Option<&str>) -> Box<dyn Widget> {
+    pub fn build(
+        self,
+        bounds: Bounds,
+        style: WidgetStyle,
+        monitor: Option<&str>,
+    ) -> Box<dyn Widget> {
         match self {
             WidgetKind::Workspaces => match monitor {
-                Some(name) => Box::new(WorkspaceWidget::for_monitor(bounds, name).with_style(style)),
+                Some(name) => {
+                    Box::new(WorkspaceWidget::for_monitor(bounds, name).with_style(style))
+                }
                 None => Box::new(WorkspaceWidget::new(bounds).with_style(style)),
             },
             WidgetKind::Clock => Box::new(ClockWidget::new(bounds).with_style(style)),
@@ -833,6 +847,11 @@ impl WidgetKind {
             WidgetKind::System => Box::new(SystemWidget::new(bounds).with_style(style)),
             WidgetKind::Network => Box::new(NetworkWidget::new(bounds).with_style(style)),
             WidgetKind::Tray => Box::new(TrayWidget::new(bounds).with_style(style)),
+            WidgetKind::Title => Box::new(
+                TitleWidget::new(bounds)
+                    .with_style(style)
+                    .with_monitor(monitor.unwrap_or("")),
+            ),
         }
     }
 }
@@ -845,7 +864,11 @@ impl Config {
     /// [`scaled_render_settings`](Config::scaled_render_settings).
     pub fn render_settings(&self) -> RenderSettings {
         RenderSettings {
-            background: self.bar.background.unwrap_or(self.theme.background).to_rgba(),
+            background: self
+                .bar
+                .background
+                .unwrap_or(self.theme.background)
+                .to_rgba(),
             foreground: self.theme.foreground.to_rgba(),
             accent: self.theme.accent.to_rgba(),
             font_size: self.font.size,
@@ -984,17 +1007,19 @@ mod tests {
         assert_eq!(config.theme.accent, Color::rgb(0xEA, 0xEA, 0xEA));
         assert_eq!(config.font.family, None);
         assert_eq!(config.font.size, 16.0);
-        // The default zones: workspaces left, clock centered, the status cluster
-        // right; the tray stays opt-in.
+        // The default zones: workspaces left, title centered, the time-and-status
+        // cluster right (clock first, then battery/system/network); the tray
+        // stays opt-in.
         assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
-        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
         assert_eq!(
             config.bar.modules_right,
             vec![
+                WidgetKind::Clock,
                 WidgetKind::Battery,
                 WidgetKind::System,
                 WidgetKind::Network,
-            ]
+            ],
         );
     }
 
@@ -1039,7 +1064,7 @@ mod tests {
         // partial [bar] table did not restate.
         assert_eq!(config.bar.gap, 0);
         assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
-        assert_eq!(config.bar.modules_center, vec![WidgetKind::Clock]);
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
         assert_eq!(config.theme.background, Color::rgb(0x18, 0x18, 0x18));
     }
 
@@ -1077,7 +1102,10 @@ mod tests {
         assert_eq!(config.height, 28);
         assert_eq!(config.bar.margin, 4);
         assert_eq!(config.bar.gap, 2);
-        assert_eq!(config.bar.background, Some(Color::rgba(0x10, 0x10, 0x10, 0xCC)));
+        assert_eq!(
+            config.bar.background,
+            Some(Color::rgba(0x10, 0x10, 0x10, 0xCC))
+        );
         assert_eq!(config.theme.background, Color::rgb(0, 0, 0));
         assert_eq!(config.theme.foreground, Color::rgb(0xFF, 0xFF, 0xFF));
         assert_eq!(config.theme.accent, Color::rgb(0, 0xFF, 0));
@@ -1087,7 +1115,10 @@ mod tests {
         assert!(config.bar.modules_center.is_empty());
         assert_eq!(config.bar.modules_right, vec![WidgetKind::Workspaces]);
         // The per-widget style table is captured verbatim.
-        assert_eq!(config.widget.clock.background, Some(Color::rgb(0x22, 0x22, 0x22)));
+        assert_eq!(
+            config.widget.clock.background,
+            Some(Color::rgb(0x22, 0x22, 0x22))
+        );
         assert_eq!(config.widget.clock.radius, Some(10));
         assert_eq!(config.widget.clock.icon.as_deref(), Some("none"));
     }
@@ -1177,6 +1208,23 @@ mod tests {
         .unwrap_err();
         // serde reports the unknown variant; the loader wraps it as invalid config.
         assert!(err.to_string().contains("invalid config"));
+    }
+
+    #[test]
+    fn title_is_a_known_widget_name_and_builds() {
+        // The title widget is recognized by the schema.
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-center = ["title"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
+
+        // And the Unknown-or-known serde arm rejected only the *unknown*
+        // name; "title" constructs without panicking.
+        let _ = WidgetKind::Title.build(Bounds::new(0, 0, 64, 32), WidgetStyle::default(), None);
     }
 
     #[test]
@@ -1434,11 +1482,43 @@ mod tests {
         let resolved = config.resolve_for_output(Some("DP-1"));
         let battery = &resolved.widget.battery;
         // The monitor's set field lands on the resolved widget style...
-        assert_eq!(battery.background, Some(Color::rgba(0xBF, 0x61, 0x6A, 0xFF)));
+        assert_eq!(
+            battery.background,
+            Some(Color::rgba(0xBF, 0x61, 0x6A, 0xFF))
+        );
         // ...while the global fields the monitor left unset are preserved, not
         // reset to the bare default.
         assert_eq!(battery.foreground, Some(Color::rgb(0xEE, 0xEE, 0xEE)));
         assert_eq!(battery.radius, Some(6));
+        // A widget the monitor never mentioned is untouched by the merge.
+        assert_eq!(resolved.widget.clock, WidgetStyleConfig::default());
+    }
+
+    #[test]
+    fn title_widget_style_folds_onto_per_monitor_override() {
+        // The same per-field-merge contract the other widgets enjoy extends
+        // to the new title widget.
+        let config = Config::from_toml_str(
+            r##"
+            [widget.title]
+            foreground = "#eaeaea"
+            radius     = 8
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.title]
+            background = "#2e3440"
+            "##,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        let title = &resolved.widget.title;
+        // Monitor-only field lands...
+        assert_eq!(title.background, Some(Color::rgb(0x2E, 0x34, 0x40)));
+        // ...global fields the monitor left unset are preserved, not reset.
+        assert_eq!(title.foreground, Some(Color::rgb(0xEA, 0xEA, 0xEA)));
+        assert_eq!(title.radius, Some(8));
         // A widget the monitor never mentioned is untouched by the merge.
         assert_eq!(resolved.widget.clock, WidgetStyleConfig::default());
     }
