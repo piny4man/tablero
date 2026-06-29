@@ -24,10 +24,11 @@ height = 32
 margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
-# "workspaces", "clock", "battery", "system", "network", "tray". A widget named
-# in two zones is built once, keeping its first mention. "tray" shows
-# StatusNotifierItem system-tray icons and is opt-in — add it to a zone to enable
-# it, e.g. modules-right = ["tray", "battery", "system", "network"].
+# "workspaces", "clock", "battery", "system", "network", "title", "tray". A
+# widget named in two zones is built once, keeping its first mention. "tray"
+# shows StatusNotifierItem system-tray icons and is opt-in — add it to a
+# zone to enable it, e.g. modules-right = ["tray", "battery", "system",
+# "network"]. "title" shows the focused Hyprland window's title.
 modules-left   = ["workspaces"]
 modules-center = ["clock"]
 modules-right  = ["battery", "system", "network"]
