@@ -102,30 +102,52 @@ fn read_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
 ///
 /// BlueZ may expose multiple adapters on machines with a wired and a
 /// wireless adapter (USB dongles, laptops with both an internal adapter and
-/// an external one); the bar only displays one. We pick the adapter with
-/// the lexicographically smallest object path — BlueZ's adapter paths
-/// conventionally end in `hci0`, `hci1`, … so this picks the lowest-numbered
-/// adapter, the one most users think of as "the Bluetooth adapter". The
-/// connected count is the sum across every adapter's devices, so a user
-/// with two adapters sees the right total even though only one adapter's
-/// power state is shown.
+/// an external one). The bar shows a single power-state word, so the
+/// readings are aggregated across **every** adapter rather than picking one:
+///
+/// * the power state is "on" if **any** adapter is powered, "off" if every
+///   adapter is explicitly off, and "unknown" if no adapter told us (a
+///   transient BlueZ hiccup on every adapter surfaces as `Unavailable`
+///   rather than guessing);
+/// * the connected-device count is the sum across every adapter's devices,
+///   so a user with two adapters sees the right total.
+///
+/// Picking a single adapter and counting devices against it would let the
+/// reported power state and connected count disagree — e.g. the smallest
+/// adapter off, a second adapter on with two devices, the bar would say
+/// "off" but the count would already be 2. Aggregating keeps the two
+/// readings tied to the same scope.
 fn summarize(
     objects: &HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>,
 ) -> (usize, Option<bool>, u32) {
-    let mut adapter_paths: Vec<&str> = objects
-        .iter()
-        .filter_map(|(path, ifaces)| ifaces.contains_key(ADAPTER_IFACE).then_some(path.as_str()))
-        .collect();
-    adapter_paths.sort();
+    let mut adapter_count = 0usize;
+    let mut any_on = false;
+    let mut any_off = false;
 
-    let mut powered: Option<bool> = None;
-    let adapter_count = adapter_paths.len();
-    if let Some(path) = adapter_paths.first()
-        && let Ok(owned) = OwnedObjectPath::try_from(*path)
-        && let Some(adapter_props) = objects.get(&owned).and_then(|i| i.get(ADAPTER_IFACE))
-    {
-        powered = read_bool(adapter_props, "Powered");
+    for interfaces in objects.values() {
+        let Some(adapter_props) = interfaces.get(ADAPTER_IFACE) else {
+            continue;
+        };
+        adapter_count += 1;
+        match read_bool(adapter_props, "Powered") {
+            Some(true) => any_on = true,
+            Some(false) => any_off = true,
+            None => {}
+        }
     }
+
+    // Any-on wins over any-off wins over unknown: if even one adapter is
+    // powered, the bar says "on" and the count below is the total over all
+    // adapters (meaningful only when at least one is on, but the
+    // bluetooth_from_bluez normalization zeroes the count for any other
+    // state so this stays consistent).
+    let powered = if any_on {
+        Some(true)
+    } else if any_off {
+        Some(false)
+    } else {
+        None
+    };
 
     let mut connected: u32 = 0;
     for interfaces in objects.values() {
@@ -346,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn summarize_picks_the_lexicographically_smallest_adapter() {
-        // Two adapters: hci0 powered, hci1 unpowered. We pick hci0
-        // (lexicographically smaller than hci1) and report its powered state.
+    fn summarize_aggregates_power_across_all_adapters() {
+        // Two adapters: hci0 powered, hci1 unpowered. Any-on wins: the bar
+        // sees "on" and counts devices across both adapters.
         let mut objects = empty_objects();
         insert_adapter(&mut objects, "/org/bluez/hci0", adapter_with(Some(true)));
         insert_adapter(&mut objects, "/org/bluez/hci1", adapter_with(Some(false)));
@@ -359,20 +381,75 @@ mod tests {
     }
 
     #[test]
-    fn summarize_pick_is_stable_under_path_insertion_order() {
+    fn summarize_power_is_off_only_when_every_adapter_is_explicitly_off() {
+        // hci0 reports no Powered at all (transient) but hci1 says off:
+        // the bar must not flip to "on" on a partial reading. Only
+        // adapters that explicitly say off count toward "all off".
+        let mut objects = empty_objects();
+        insert_adapter(&mut objects, "/org/bluez/hci0", adapter_with(None));
+        insert_adapter(&mut objects, "/org/bluez/hci1", adapter_with(Some(false)));
+        let (_, powered, _) = summarize(&objects);
+        assert_eq!(powered, Some(false));
+    }
+
+    #[test]
+    fn summarize_power_is_unknown_when_every_adapter_omits_powered() {
+        // No adapter told us anything about power: degrade to "unknown"
+        // rather than guessing.
+        let mut objects = empty_objects();
+        insert_adapter(&mut objects, "/org/bluez/hci0", adapter_with(None));
+        insert_adapter(&mut objects, "/org/bluez/hci1", adapter_with(None));
+        let (_, powered, _) = summarize(&objects);
+        assert_eq!(powered, None);
+    }
+
+    #[test]
+    fn summarize_aggregation_is_independent_of_path_iteration_order() {
         // The same set of adapters inserted in the opposite order must
-        // resolve to the same `powered` reading — HashMap iteration order
-        // is randomized, so the pick has to be done by sort, not by
-        // insertion order.
+        // resolve to the same `powered` reading. `summarize` no longer sorts
+        // adapter paths, so the result has to be independent of HashMap
+        // iteration order — the aggregation iterates every adapter and
+        // combines, which is by definition order-independent.
         let mut objects_a = empty_objects();
         insert_adapter(&mut objects_a, "/org/bluez/hci0", adapter_with(Some(true)));
         insert_adapter(&mut objects_a, "/org/bluez/hci1", adapter_with(Some(false)));
         let mut objects_b = empty_objects();
         insert_adapter(&mut objects_b, "/org/bluez/hci1", adapter_with(Some(false)));
         insert_adapter(&mut objects_b, "/org/bluez/hci0", adapter_with(Some(true)));
-        let (_, powered_a, _) = summarize(&objects_a);
-        let (_, powered_b, _) = summarize(&objects_b);
-        assert_eq!(powered_a, powered_b);
+        let (count_a, powered_a, connected_a) = summarize(&objects_a);
+        let (count_b, powered_b, connected_b) = summarize(&objects_b);
+        assert_eq!((count_a, powered_a, connected_a), (count_b, powered_b, connected_b));
+    }
+
+    #[test]
+    fn summarize_power_state_and_connected_count_share_the_same_scope() {
+        // The bug this regression test pins down: with hci0 off and hci1
+        // on with two devices, the bar must say "on" with 2 connected —
+        // never "off" with 2 connected, which would have been possible if
+        // summarize had picked hci0 for power but summed devices across
+        // both adapters.
+        let mut objects = empty_objects();
+        insert_adapter(&mut objects, "/org/bluez/hci0", adapter_with(Some(false)));
+        insert_adapter(&mut objects, "/org/bluez/hci1", adapter_with(Some(true)));
+        insert_device(
+            &mut objects,
+            "/org/bluez/hci1/dev_AA",
+            device_with(Some(true)),
+        );
+        insert_device(
+            &mut objects,
+            "/org/bluez/hci1/dev_BB",
+            device_with(Some(true)),
+        );
+        let (count, powered, connected) = summarize(&objects);
+        assert_eq!(count, 2);
+        assert_eq!(powered, Some(true));
+        assert_eq!(connected, 2);
+        // And the normalization must surface that as "on" with 2 connected.
+        assert_eq!(
+            bluetooth_from_bluez(count, powered, connected),
+            Bluetooth::new(BluetoothState::On, 2)
+        );
     }
 
     #[test]
