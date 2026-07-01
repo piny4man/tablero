@@ -105,10 +105,9 @@ fn read_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
 /// an external one). The bar shows a single power-state word, so the
 /// readings are aggregated across **every** adapter rather than picking one:
 ///
-/// * the power state is "on" if **any** adapter is powered, "off" if every
-///   adapter is explicitly off, and "unknown" if no adapter told us (a
-///   transient BlueZ hiccup on every adapter surfaces as `Unavailable`
-///   rather than guessing);
+/// * the power state is "on" if **any** adapter is powered, "off" if no
+///   adapter is on and at least one explicitly reports `Powered = false`,
+///   and "unknown" only when every adapter failed to report power at all;
 /// * the connected-device count is the sum across every adapter's devices,
 ///   so a user with two adapters sees the right total.
 ///
@@ -136,9 +135,12 @@ fn summarize(
         }
     }
 
-    // Any-on wins over any-off wins over unknown: if even one adapter is
-    // powered, the bar says "on" and the count below is the total over all
-    // adapters (meaningful only when at least one is on, but the
+    // Power-state rule: any adapter on → on; otherwise, any adapter
+    // explicitly off → off; otherwise unknown. A transient BlueZ hiccup
+    // on every adapter is the only path to `None` — the rule does not
+    // require *every* adapter to be off, only that at least one is and
+    // none is on. The count below is the total over all adapters
+    // (meaningful only when at least one is on, but the
     // bluetooth_from_bluez normalization zeroes the count for any other
     // state so this stays consistent).
     let powered = if any_on {
@@ -381,10 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn summarize_power_is_off_only_when_every_adapter_is_explicitly_off() {
+    fn summarize_power_is_off_when_no_adapter_is_on_and_at_least_one_is() {
         // hci0 reports no Powered at all (transient) but hci1 says off:
-        // the bar must not flip to "on" on a partial reading. Only
-        // adapters that explicitly say off count toward "all off".
+        // no adapter is on, and at least one explicitly says off, so the
+        // bar settles on `off` — the rule does not require *every*
+        // adapter to be off, only that at least one is and none is on.
         let mut objects = empty_objects();
         insert_adapter(&mut objects, "/org/bluez/hci0", adapter_with(None));
         insert_adapter(&mut objects, "/org/bluez/hci1", adapter_with(Some(false)));
