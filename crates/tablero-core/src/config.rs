@@ -67,8 +67,8 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BatteryWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget, StateColors, SystemWidget,
-    TitleWidget, TrayWidget, Widget, WidgetStyle, WorkspaceWidget,
+    BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget,
+    StateColors, SystemWidget, TitleWidget, TrayWidget, Widget, WidgetStyle, WorkspaceWidget,
 };
 
 /// Default bar height in pixels.
@@ -221,6 +221,8 @@ pub enum WidgetKind {
     Tray,
     /// The focused window's title on the bound monitor.
     Title,
+    /// The local Bluetooth adapter state (opt-in: not in the default zones).
+    Bluetooth,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -327,6 +329,17 @@ pub struct WidgetStyleConfig {
     pub warn: StateColorConfig,
     /// Colors for the attention state (e.g. a tray item needing attention).
     pub attention: StateColorConfig,
+    /// Executable path run when the widget is clicked.
+    ///
+    /// When `Some`, a click inside the widget's bounds emits a
+    /// [`Command::RunProgram`](crate::widget::Command::RunProgram) the host
+    /// executor spawns directly (no shell). When `None`, the widget is
+    /// display-only and clicks yield nothing. The path is taken verbatim and
+    /// may use a leading `~` for the user's home, which the executor expands
+    /// at click time. Available on every widget kind for forward
+    /// compatibility; today only the bluetooth widget honors it.
+    #[serde(rename = "on-click")]
+    pub on_click: Option<std::path::PathBuf>,
 }
 
 impl WidgetStyleConfig {
@@ -388,6 +401,9 @@ impl WidgetStyleConfig {
         if self.warn_threshold.is_some() {
             base.warn_threshold = self.warn_threshold;
         }
+        if self.on_click.is_some() {
+            base.on_click = self.on_click.clone();
+        }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
     }
@@ -414,6 +430,8 @@ pub struct WidgetStyles {
     pub tray: WidgetStyleConfig,
     /// Style for the title widget.
     pub title: WidgetStyleConfig,
+    /// Style for the bluetooth widget.
+    pub bluetooth: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -427,6 +445,7 @@ impl WidgetStyles {
             WidgetKind::Network => &self.network,
             WidgetKind::Tray => &self.tray,
             WidgetKind::Title => &self.title,
+            WidgetKind::Bluetooth => &self.bluetooth,
         }
     }
 
@@ -440,6 +459,7 @@ impl WidgetStyles {
         self.network.apply(&mut base.network);
         self.tray.apply(&mut base.tray);
         self.title.apply(&mut base.title);
+        self.bluetooth.apply(&mut base.bluetooth);
     }
 }
 
@@ -829,11 +849,16 @@ impl WidgetKind {
     /// [`Dashboard::layout`] each frame. `monitor` is the connector name of the
     /// output this dashboard serves, threaded to the workspace widget so it
     /// shows only that monitor's workspaces; `None` builds the global fallback.
+    /// `on_click` is the executable path the widget spawns when clicked —
+    /// `None` makes the widget display-only; today only the bluetooth widget
+    /// honors it, but every kind accepts the argument so per-monitor
+    /// `on-click` overrides apply uniformly.
     pub fn build(
         self,
         bounds: Bounds,
         style: WidgetStyle,
         monitor: Option<&str>,
+        on_click: Option<std::path::PathBuf>,
     ) -> Box<dyn Widget> {
         match self {
             WidgetKind::Workspaces => match monitor {
@@ -851,6 +876,11 @@ impl WidgetKind {
                 TitleWidget::new(bounds)
                     .with_style(style)
                     .with_monitor(monitor.unwrap_or("")),
+            ),
+            WidgetKind::Bluetooth => Box::new(
+                BluetoothWidget::new(bounds)
+                    .with_style(style)
+                    .with_on_click(on_click),
             ),
         }
     }
@@ -918,8 +948,9 @@ impl Config {
             kinds
                 .iter()
                 .map(|&kind| {
-                    let style = self.widget.get(kind).resolve(&self.theme);
-                    kind.build(bounds, style, monitor)
+                    let style_config = self.widget.get(kind);
+                    let style = style_config.resolve(&self.theme);
+                    kind.build(bounds, style, monitor, style_config.on_click.clone())
                 })
                 .collect()
         };
@@ -1194,7 +1225,12 @@ mod tests {
         );
 
         // It constructs a widget without panicking.
-        let _ = WidgetKind::Tray.build(Bounds::new(0, 0, 64, 32), WidgetStyle::default(), None);
+        let _ = WidgetKind::Tray.build(
+            Bounds::new(0, 0, 64, 32),
+            WidgetStyle::default(),
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -1211,6 +1247,104 @@ mod tests {
     }
 
     #[test]
+    fn bluetooth_is_an_opt_in_widget_name_and_builds() {
+        // The bluetooth widget is not in any default zone, but naming it in one
+        // is valid and builds — matching the tray pattern. An on-click path is
+        // also accepted on the widget table and threaded through to the widget.
+        let bar = Bar::default();
+        let in_default_zones = bar
+            .modules_left
+            .iter()
+            .chain(&bar.modules_center)
+            .chain(&bar.modules_right)
+            .any(|&kind| kind == WidgetKind::Bluetooth);
+        assert!(!in_default_zones);
+
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["bluetooth", "clock"]
+            [widget.bluetooth]
+            on-click = "/usr/bin/blueman-manager"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.bar.modules_right,
+            vec![WidgetKind::Bluetooth, WidgetKind::Clock]
+        );
+        assert_eq!(
+            config.widget.bluetooth.on_click.as_deref(),
+            Some(std::path::Path::new("/usr/bin/blueman-manager"))
+        );
+
+        // It constructs a widget without panicking, and the configured
+        // on-click path reaches the widget unchanged.
+        let widget = WidgetKind::Bluetooth.build(
+            Bounds::new(0, 0, 64, 32),
+            WidgetStyle::default(),
+            None,
+            config.widget.bluetooth.on_click.clone(),
+        );
+        let click = widget.on_click(10, 10);
+        assert_eq!(
+            click,
+            Some(crate::widget::Command::RunProgram(
+                std::path::PathBuf::from("/usr/bin/blueman-manager")
+            ))
+        );
+    }
+
+    #[test]
+    fn bluetooth_with_no_on_click_is_display_only() {
+        // A bluetooth widget without an on-click path configured never emits
+        // a Command on click, so the host's command fan-out is a no-op for it.
+        let widget = WidgetKind::Bluetooth.build(
+            Bounds::new(0, 0, 64, 32),
+            WidgetStyle::default(),
+            None,
+            None,
+        );
+        assert_eq!(widget.on_click(10, 10), None);
+    }
+
+    #[test]
+    fn bluetooth_on_click_folds_onto_a_monitor_override() {
+        // A [monitor.widget.bluetooth] table sets on-click; a per-monitor
+        // override merges onto the global table and changes the widget's path.
+        let config = Config::from_toml_str(
+            r#"
+            [widget.bluetooth]
+            on-click = "/global/launcher.sh"
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.bluetooth]
+            on-click = "/per-monitor/launcher.sh"
+            "#,
+        )
+        .unwrap();
+        // The global path stays where it was.
+        assert_eq!(
+            config.widget.bluetooth.on_click.as_deref(),
+            Some(std::path::Path::new("/global/launcher.sh"))
+        );
+
+        // The resolved config for DP-1 sees the per-monitor override.
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        assert_eq!(
+            resolved.widget.bluetooth.on_click.as_deref(),
+            Some(std::path::Path::new("/per-monitor/launcher.sh"))
+        );
+
+        // An output with no matching monitor keeps the global on-click.
+        let other = config.resolve_for_output(Some("HDMI-A-1"));
+        assert_eq!(
+            other.widget.bluetooth.on_click.as_deref(),
+            Some(std::path::Path::new("/global/launcher.sh"))
+        );
+    }
+
+    #[test]
     fn title_is_a_known_widget_name_and_builds() {
         // The title widget is recognized by the schema.
         let config = Config::from_toml_str(
@@ -1224,7 +1358,12 @@ mod tests {
 
         // And the Unknown-or-known serde arm rejected only the *unknown*
         // name; "title" constructs without panicking.
-        let _ = WidgetKind::Title.build(Bounds::new(0, 0, 64, 32), WidgetStyle::default(), None);
+        let _ = WidgetKind::Title.build(
+            Bounds::new(0, 0, 64, 32),
+            WidgetStyle::default(),
+            None,
+            None,
+        );
     }
 
     #[test]

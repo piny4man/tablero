@@ -24,12 +24,14 @@ height = 32
 margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
-# "workspaces", "clock", "battery", "system", "network", "title", "tray". A
-# widget named in two zones is built once, keeping its first mention. "tray"
-# shows StatusNotifierItem system-tray icons and is opt-in — add it to a
-# zone to enable it, e.g. modules-right = ["tray", "battery", "system",
-# "network"]. "title" shows the focused Hyprland window's title and is the
-# default center module.
+# "workspaces", "clock", "battery", "system", "network", "title", "tray",
+# "bluetooth". A widget named in two zones is built once, keeping its first
+# mention. "tray" shows StatusNotifierItem system-tray icons and is opt-in —
+# add it to a zone to enable it, e.g. modules-right = ["tray", "battery",
+# "system", "network"]. "title" shows the focused Hyprland window's title and
+# is the default center module. "bluetooth" reads BlueZ over DBus and is also
+# opt-in — add it to a zone to show the local adapter state and connected
+# device count; without an adapter it shows "unavailable".
 modules-left   = ["workspaces"]
 modules-center = ["title"]
 modules-right  = ["clock", "battery", "system", "network"]
@@ -84,6 +86,21 @@ size = 16.0
 #
 # [widget.tray.attention]
 # background     = "#bf616aff"  # pill behind a tray item requesting attention
+#
+# The bluetooth widget (opt-in: name it in a zone to enable) reads BlueZ and
+# shows the local adapter state plus connected-device count: e.g. "on",
+# "off", "2 connected", or "unavailable" when no adapter is present.
+#
+# The `on-click` field is accepted on every [widget.<name>] table (the same
+# config field across all widgets), but **only the bluetooth widget honors it
+# today** — other widgets accept the field and ignore it. When set on
+# [widget.bluetooth], a click inside the widget spawns the executable
+# directly (no shell); the typical use is to launch a Bluetooth manager
+# like blueman-manager. The path may use a leading "~" for the user's home.
+# [bar]
+# modules-right = ["bluetooth", "network"]
+# [widget.bluetooth]
+# on-click = "~/.config/hypr/scripts/bluetooth.sh"
 
 # Per-monitor overrides. tablero shows one bar per connected output; by default
 # every output uses the global settings above. Add a [[monitor]] block to tweak a
@@ -109,6 +126,8 @@ size = 16.0
 # background = "#3b4252"        # give the battery a pill on this output only
 # [monitor.widget.title]
 # background = "#2e3440"        # give the title a pill on this output only
+# [monitor.widget.bluetooth]
+# on-click = "/per-monitor/bluetooth-launcher.sh"  # different launcher per output
 #
 # [[monitor]]
 # name = "eDP-1"                # the laptop panel: just a shorter bar, nothing else

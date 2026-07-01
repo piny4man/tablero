@@ -14,6 +14,7 @@
 //! `set_buffer_scale` maps it back, so the bar stays crisp on HiDPI displays.
 //! The logical→physical conversion lives entirely in [`tablero_core::scale`].
 
+pub mod bluetooth;
 pub mod command;
 pub mod hyprland;
 pub mod networkmanager;
@@ -58,6 +59,7 @@ use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::scale::Scale;
 use tablero_core::widget::{Command, Dashboard, Msg};
 
+use crate::bluetooth::BluetoothProducer;
 use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
@@ -394,10 +396,13 @@ fn output_key(output: &wl_output::WlOutput) -> OutputId {
 /// The bar's height, theme, font, spacing, and widget order all come from
 /// `config` (see [`tablero_core::config::Config`]). Wires the default producer
 /// set — the Hyprland workspace source, the UPower battery source, the procfs
-/// system-stats source, the NetworkManager connectivity source, and the
-/// StatusNotifierItem tray host — so the bar shows live workspaces, battery,
-/// CPU/memory load, network state, and tray icons alongside the clock. The clock
-/// itself is still driven by the synchronous tick timer; see
+/// system-stats source, the NetworkManager connectivity source, the BlueZ
+/// bluetooth source, and the StatusNotifierItem tray host — so the bar shows
+/// live workspaces, battery, CPU/memory load, network state, Bluetooth
+/// adapter state, and tray icons alongside the clock. The bluetooth and tray
+/// producers run even when their widgets are not in any zone; the widget
+/// only appears when the user adds `"bluetooth"` (or `"tray"`) to a zone.
+/// The clock itself is still driven by the synchronous tick timer; see
 /// [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     run_with_producers(
@@ -407,6 +412,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(UPowerProducer::new()),
             Box::new(SystemProducer::new()),
             Box::new(NetworkProducer::new()),
+            Box::new(BluetoothProducer::new()),
             Box::new(SniHostProducer::new()),
         ],
     )
@@ -491,15 +497,19 @@ pub fn run_with_producers(
             bridge.spawn(producer);
         }
         // The reverse path: clicks become commands the executors run against the
-        // compositor and the session bus. The loop holds a sender per executor and
-        // fans each command out to all of them; an executor ignores commands it
-        // does not handle, so workspace switches reach Hyprland and tray
-        // activations reach the SNI items without the loop routing them.
+        // compositor, the session bus, or a user-configured program. The loop
+        // holds a sender per executor and fans each command out to all of them;
+        // an executor ignores commands it does not handle, so workspace
+        // switches reach Hyprland, tray activations reach the SNI items, and
+        // configured on-click programs spawn directly via
+        // `command::run_commands` — without the loop routing them.
         let (hypr_tx, hypr_rx) = command_channel();
         bridge.spawn_task("hyprland-commands", hyprland::run_commands(hypr_rx));
         let (sni_tx, sni_rx) = command_channel();
         bridge.spawn_task("sni-commands", sni::run_commands(sni_rx));
-        app.commands = vec![hypr_tx, sni_tx];
+        let (run_tx, run_rx) = command_channel();
+        bridge.spawn_task("run-commands", command::run_commands(run_rx));
+        app.commands = vec![hypr_tx, sni_tx, run_tx];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
