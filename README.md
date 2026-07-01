@@ -310,7 +310,9 @@ surface placement and input need a live compositor. To verify on Hyprland:
       hardware it should always reserve a slot and read `unavailable`; on a
       laptop with the adapter powered off it reads `off`.
     - Toggle the adapter with `bluetoothctl power on` / `bluetoothctl power
-      off` and confirm the label flips within one frame.
+      off` and confirm the label changes by the next poll (the producer
+      polls BlueZ every two seconds, so allow up to a couple of seconds
+      for the flip).
     - Pair and connect a device (e.g. `bluetoothctl connect <mac>`); confirm
       the label flips to `1 connected` (or higher) and back to `on` on
       disconnect.
