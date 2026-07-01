@@ -15,11 +15,14 @@
 //! See [`Widget`] for the per-widget contract and [`clock::ClockWidget`] for the
 //! reference implementation.
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Local};
 
 use crate::render::{Bounds, FG, RenderContext};
 
 pub mod battery;
+pub mod bluetooth;
 pub mod clock;
 pub mod network;
 pub mod system;
@@ -28,6 +31,7 @@ pub mod tray;
 pub mod workspaces;
 
 pub use battery::{Battery, BatteryState, BatteryWidget};
+pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use system::{SystemStats, SystemWidget};
@@ -68,6 +72,16 @@ pub enum Msg {
     /// The network connectivity changed; `None` means no network is available
     /// (or the network daemon is unreachable), so the widget shows nothing.
     Network(Option<Network>),
+    /// The local Bluetooth adapter state and connected-device count.
+    ///
+    /// Unlike the battery/network messages, the snapshot is **not** wrapped in
+    /// an `Option`: the bluetooth widget always reserves a slot and falls
+    /// back to showing `unavailable` before its first reading or when no
+    /// adapter is present, so there is no value the producer could send that
+    /// means "show nothing". The widget starts in
+    /// [`Unavailable`](BluetoothState::Unavailable) and stays there until the
+    /// producer hands it a reading.
+    Bluetooth(Bluetooth),
     /// The set of registered StatusNotifierItem tray items changed; carries the
     /// normalized snapshot of what the tray should now show.
     Tray(TrayState),
@@ -114,6 +128,11 @@ pub enum Command {
     /// Activate the tray item registered under this address (an SNI
     /// `Activate` request — primary click).
     ActivateTrayItem(String),
+    /// Spawn the executable at this path as a child process directly (no
+    /// shell), used to wire a per-widget `on-click` action (e.g. a Bluetooth
+    /// manager launcher). The host executor resolves a leading `~` to the
+    /// user's home before spawning.
+    RunProgram(PathBuf),
 }
 
 /// How a widget chooses the glyph it draws before its label.

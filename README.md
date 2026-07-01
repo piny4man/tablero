@@ -59,6 +59,14 @@ RUST_LOG=info cargo run -p tablero
     with no native `StatusNotifierWatcher` (e.g. Hyprland) the bar hosts one
     itself. Icons come from an embedded pixmap or a themed PNG; an item with
     neither falls back to its initial letter.
+  - **Bluetooth** — the local adapter state (powered on/off) and connected-
+    device count, read from BlueZ over DBus. Shows `on`, `off`, `N connected`,
+    or `unavailable` when no adapter is present (desktops without Bluetooth
+    hardware always reserve the slot). **Opt-in**: not in the default set;
+    add `"bluetooth"` to a zone to enable it. Any widget can carry an
+    `on-click` config field — when set, a left-click inside the widget spawns
+    that executable directly (no shell), so a typical use is `on-click =
+    "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -113,9 +121,10 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "title",
-# "clock", "battery", "system", "network", "tray". "tray" is opt-in (not in
-# the default set above) — add it to enable the system tray. Repeats are
-# de-duplicated, keeping first position.
+# "clock", "battery", "system", "network", "tray", "bluetooth". "tray" and
+# "bluetooth" are opt-in (not in the default set above) — add them to enable
+# the system tray and the Bluetooth adapter indicator respectively. Repeats
+# are de-duplicated, keeping first position.
 widgets = ["workspaces", "title", "clock", "battery", "system", "network"]
 
 [theme]
@@ -136,12 +145,19 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray). |
+| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray) and `"bluetooth"` (opt-in BlueZ-backed adapter indicator). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
 | `font.family`  | string (opt.)   | unset → system font                           | Font family name.                                                |
 | `font.size`    | float (px)      | `16.0`                                         | Text size.                                                       |
+
+Per-widget click handlers live on every `[widget.<name>]` table as
+`on-click = "/path/to/executable"`. When set, a left-click inside that widget
+spawns the file directly (no shell) — typical use is
+`[widget.bluetooth] on-click = "/path/to/blueman-manager"`. The path may use
+a leading `~` for the user's home, expanded at click time. Today only the
+bluetooth widget honors the field; other widgets ignore it.
 
 ### Per-monitor overrides
 
@@ -287,3 +303,21 @@ surface placement and input need a live compositor. To verify on Hyprland:
     a full URL, music player track) should cap at `100` characters with a
     trailing `…` and never overflow the center zone. Closing the last
     focused window should leave the center blank.
+14. Verify the **bluetooth widget** (opt-in: add `"bluetooth"` to a zone).
+    With BlueZ running:
+    - The widget appears with the bluetooth glyph and a label of `on`, `off`,
+      `N connected`, or `unavailable`. On a desktop with no Bluetooth
+      hardware it should always reserve a slot and read `unavailable`; on a
+      laptop with the adapter powered off it reads `off`.
+    - Toggle the adapter with `bluetoothctl power on` / `bluetoothctl power
+      off` and confirm the label flips within one frame.
+    - Pair and connect a device (e.g. `bluetoothctl connect <mac>`); confirm
+      the label flips to `1 connected` (or higher) and back to `on` on
+      disconnect.
+    - Pair/unpair with the adapter powered off; the count stays at zero and
+      the label stays `off`.
+    - If a `[widget.bluetooth] on-click = "/path/to/executable"` is set,
+      left-click the widget and confirm the configured process is spawned
+      (no shell, direct exec). The script must be marked executable; a
+      missing or non-executable path is logged as an error and does not
+      crash the bar.
