@@ -421,7 +421,10 @@ mod tests {
         insert_adapter(&mut objects_b, "/org/bluez/hci0", adapter_with(Some(true)));
         let (count_a, powered_a, connected_a) = summarize(&objects_a);
         let (count_b, powered_b, connected_b) = summarize(&objects_b);
-        assert_eq!((count_a, powered_a, connected_a), (count_b, powered_b, connected_b));
+        assert_eq!(
+            (count_a, powered_a, connected_a),
+            (count_b, powered_b, connected_b)
+        );
     }
 
     #[test]

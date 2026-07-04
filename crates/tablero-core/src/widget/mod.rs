@@ -28,6 +28,7 @@ pub mod network;
 pub mod system;
 pub mod title;
 pub mod tray;
+pub mod volume;
 pub mod workspaces;
 
 pub use battery::{Battery, BatteryState, BatteryWidget};
@@ -37,6 +38,7 @@ pub use network::{Network, NetworkState, NetworkWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
 pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
+pub use volume::{DeviceKind, Volume, VolumeWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
 /// Alert pill background — a muted red, drawn behind a low-battery reading or a
@@ -100,6 +102,14 @@ pub enum Msg {
         /// The current active window on that monitor.
         window: Option<ActiveWindow>,
     },
+    /// The active PipeWire output sink's volume / mute state changed.
+    ///
+    /// The snapshot carries the level (whole percent) and the current mute
+    /// state, plus the device kind that drives the glyph. `None` means the
+    /// PipeWire server is unreachable or no output sink exists, so the widget
+    /// shows nothing — matching how the `network` and `system` widgets treat
+    /// an absent source.
+    Volume(Option<Volume>),
 }
 
 impl Msg {

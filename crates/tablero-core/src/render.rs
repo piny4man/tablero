@@ -218,8 +218,13 @@ impl RenderContext {
 
         let mut paint = Paint::default();
         paint.set_color_rgba8(r, g, b, a);
-        self.pixmap
-            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     /// Shape and draw `text` in `color` within `bounds`.
@@ -401,7 +406,11 @@ mod tests {
         };
         let mut ctx = RenderContext::with_settings(8, 4, settings);
         ctx.fill_background();
-        assert_eq!(&ctx.pixels()[0..4], &[0, 0, 0, 0], "background not transparent");
+        assert_eq!(
+            &ctx.pixels()[0..4],
+            &[0, 0, 0, 0],
+            "background not transparent"
+        );
     }
 
     #[test]

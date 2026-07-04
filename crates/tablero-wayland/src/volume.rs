@@ -1,0 +1,859 @@
+//! PipeWire native volume source.
+//!
+//! Reads the active output sink's level and mute state over the PipeWire
+//! native wire protocol and emits typed [`Msg::Volume`] snapshots through the
+//! [producer bridge](crate::producer), so the volume widget reaches the render
+//! loop the same way every other message does — the rendering code never
+//! talks to PipeWire directly.
+//!
+//! # Why a dedicated thread
+//!
+//! PipeWire's [`MainLoop`](pipewire::main_loop::MainLoop) is synchronous and
+//! file-descriptor-driven, so it cannot live on the Tokio runtime the way the
+//! zbus-based producers (bluetooth, …) do. The producer's [`run`](Producer::run)
+//! future spawns an OS thread that owns the PipeWire main loop, and the
+//! Tokio future simply `await`s the thread's completion via a
+//! `tokio::sync::oneshot` — the bridge's [`MsgSender`] is moved into the
+//! thread, so the loop reaches the render loop exactly the way every other
+//! producer does. Errors propagate through the oneshot the same way the
+//! bluetooth producer's `?` does.
+//!
+//! # Active-sink selection
+//!
+//! PipeWire may expose many sinks (multiple wired/wireless adapters, HDMI
+//! outputs, USB headphones, virtual sinks). The bar shows a single level and
+//! mute flag, so the readings are aggregated onto one *active* sink. The
+//! heuristic, in order:
+//!
+//! 1. Pick a sink whose [`NodeState`] is [`Running`](NodeState::Running) — a
+//!    sink is "active" the moment any of its streams is playing back. The
+//!    selected id, when multiple are running, is the one with the
+//!    alphabetically first node name (deterministic, no surprises; this is
+//!    the rule the user picked).
+//! 2. If no sink is running, fall back to the sink whose name matches the
+//!    configured default audio sink in the `default.configured.audio.sink`
+//!    metadata — i.e. what the user has actually told the system to use.
+//! 3. If neither resolves, emit [`Msg::Volume(None)`] and `warn!` — a fresh
+//!    bar without a usable audio source reserves no slot for the volume
+//!    widget, matching the absent-source behavior of the `network` and
+//!    `system` widgets.
+//!
+//! Polling (rather than per-property signal subscriptions) is what keeps the
+//! implementation tractable: the volume can change at any time (key press,
+//! GUI slider, app that auto-balances audio), so a static signal subscription
+//! would miss many of those events. A 2-second ticker reads the cached state
+//! and only re-emits when the normalized snapshot actually differs.
+//!
+//! # Pure parsing
+//!
+//! Device-kind classification and active-sink selection are pure functions
+//! tests drive directly with strings and slices — no PipeWire server needed.
+//! The SPA POD decoding for the volume/mute Props is a thin FFI wrapper around
+//! [`Pod::get_float`] / [`Pod::get_bool`] and is exercised by the integration
+//! test in `tests/volume.rs`, not the unit tests.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use log::debug;
+use pipewire::context::ContextRc;
+use pipewire::main_loop::MainLoopRc;
+use pipewire::node::{Node, NodeInfoRef, NodeState};
+use pipewire::registry::{GlobalObject, Listener, RegistryRc};
+use pipewire::spa::pod::Pod;
+use pipewire::spa::utils::dict::DictRef;
+use pipewire::types::ObjectType;
+use tokio::sync::oneshot;
+
+use tablero_core::widget::{DeviceKind, Msg, Volume};
+
+use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
+
+/// How often the producer polls the cached PipeWire state.
+///
+/// Two seconds is frequent enough to track volume keys as they happen, and
+/// far too coarse to keep the loop busy: between ticks the producer is parked
+/// on a timer and the render loop is idle, waking only when a sample changes
+/// a visible label.
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The SPA Props property key for the per-channel linear volume.
+///
+/// `SPA_PROP_volume` is the single f32 reading PipeWire publishes on every
+/// audio sink (0.0 silence, 1.0 no attenuation). Defined in
+/// `<spa/param/props.h>` and re-exported via `spa_sys`; we hard-code the
+/// value here so the producer has no FFI constants leaking into the rest of
+/// the crate.
+const SPA_PROP_VOLUME: u32 = 0x10001;
+/// The SPA Props property key for the mute boolean (`SPA_PROP_mute`).
+const SPA_PROP_MUTE: u32 = 0x10002;
+
+/// The PipeWire metadata key whose value is the configured default audio sink.
+///
+/// Read from the `Metadata` global the server publishes; the value is a JSON
+/// `{"name":"<sink-name>"}` payload, parsed with a simple key/string match
+/// (the JSON is on a single line and the field is always named `name`).
+const DEFAULT_AUDIO_SINK_KEY: &str = "default.audio.sink";
+
+/// Map a `device.icon-name` value (e.g. `audio-headphones`, `video-display`)
+/// to a [`DeviceKind`].
+///
+/// Falls back to [`DeviceKind::Other`] for anything the heuristics did not
+/// classify, so a custom icon on an unusual sink never breaks the bar. The
+/// `Option` input is what [`DictRef::get`] returns for a missing key.
+pub fn device_kind_from_icon_name(icon: Option<&str>) -> DeviceKind {
+    let Some(icon) = icon else {
+        return DeviceKind::Other;
+    };
+    // Match on a stable prefix: `audio-headphones` and `audio-headset` are
+    // the two relevant icon stems PipeWire / wireplumber emit, and the
+    // variant differences inside (e.g. `audio-headphones-analog`) all map to
+    // the same widget glyph.
+    if icon.starts_with("audio-headset") {
+        DeviceKind::Headset
+    } else if icon.starts_with("audio-headphone") {
+        DeviceKind::Headphones
+    } else if icon.starts_with("audio-speaker") {
+        DeviceKind::Speakers
+    } else if icon.starts_with("video-display") || icon.starts_with("video-monitor") {
+        DeviceKind::Monitor
+    } else if icon.starts_with("audio-handsfree")
+        || icon.starts_with("audio-cellphone")
+        || icon == "phone"
+    {
+        DeviceKind::Phone
+    } else if icon.starts_with("tv") || icon.starts_with("television") {
+        DeviceKind::Tv
+    } else {
+        DeviceKind::Other
+    }
+}
+
+/// Map a `device.form-factor` value (e.g. `headphone`, `speaker`, `monitor`)
+/// to a [`DeviceKind`].
+///
+/// Used as a fallback when `device.icon-name` is absent. Like the icon-name
+/// mapper, returns [`DeviceKind::Other`] for anything unrecognized.
+pub fn device_kind_from_form_factor(form: Option<&str>) -> DeviceKind {
+    let Some(form) = form else {
+        return DeviceKind::Other;
+    };
+    match form {
+        "headphone" | "earphone" => DeviceKind::Headphones,
+        "headset" => DeviceKind::Headset,
+        "speaker" | "desk" | "hifi" | "computer" | "portable" => DeviceKind::Speakers,
+        "monitor" => DeviceKind::Monitor,
+        "tv" => DeviceKind::Tv,
+        "handset" | "phone" | "car" => DeviceKind::Phone,
+        _ => DeviceKind::Other,
+    }
+}
+
+/// Classify a node's device kind from its properties dictionary.
+///
+/// Tries `device.icon-name` first (the cleanest signal wireplumber / pipewire
+/// publish — it is a stable, XDG-style icon name) and falls back to
+/// `device.form-factor` (a coarser enum) for sinks that only set the latter.
+pub fn device_kind_from_props(props: &DictRef) -> DeviceKind {
+    let icon = props.get("device.icon-name");
+    let kind = device_kind_from_icon_name(icon);
+    if kind != DeviceKind::Other {
+        return kind;
+    }
+    device_kind_from_form_factor(props.get("device.form-factor"))
+}
+
+/// Whether a node's `media.class` property marks it as an audio output sink.
+///
+/// PipeWire publishes `media.class = "Audio/Sink"` for output sinks and
+/// `"Audio/Source"` for inputs / microphones. The bar reads output only, so
+/// anything that is not `"Audio/Sink"` is filtered out at the registry
+/// listener.
+pub fn is_audio_sink(props: &DictRef) -> bool {
+    props.get("media.class") == Some("Audio/Sink")
+}
+
+/// Pick the id of the active sink from a list of candidates.
+///
+/// Filters to the sinks that are currently running, then sorts the survivors
+/// by their name and returns the id of the first one — a deterministic
+/// tiebreak that is independent of registry iteration order. Returns
+/// `None` when no candidate is running.
+pub fn pick_active_sink_id(candidates: &[(u32, &str, bool)]) -> Option<u32> {
+    candidates
+        .iter()
+        .filter(|(_, _, running)| *running)
+        .min_by(|a, b| a.1.cmp(b.1))
+        .map(|(id, _, _)| *id)
+}
+
+/// Whether the node is currently playing back, regardless of which
+/// [`NodeState`] variant the runtime emits.
+///
+/// `Running` is the only state we treat as "active"; `Suspended` and `Idle`
+/// both mean the sink is not making sound, and `Creating` / `Error(_)` are
+/// transient startup / failure states that should also fall through to the
+/// configured default.
+fn is_node_running(state: &NodeState<'_>) -> bool {
+    matches!(state, NodeState::Running)
+}
+
+/// Extract `(volume, mute)` from a PipeWire `ParamType::Props` POD.
+///
+/// `pod_bytes` is the raw byte slice of a `spa_pod` whose body is a
+/// `SPA_TYPE_OBJECT_Props` (the `ParamType::Props` object). The function
+/// looks up the `volume` (Float) and `mute` (Bool) properties and returns
+/// the parsed values. Returns `None` for any malformed input — a transient
+/// type drift never takes the source down.
+fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
+    let pod = Pod::from_bytes(pod_bytes)?;
+    let obj = pod.as_object().ok()?;
+
+    // The Props object's property keys are SPA_PROP_* constants; the volume
+    // value is a single f32 (one channel) and the mute value is a bool.
+    let volume_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_VOLUME))?;
+    let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_MUTE))?;
+
+    let volume = volume_pod.value().get_float().ok()?;
+    let mute = mute_pod.value().get_bool().ok()?;
+    Some((volume, mute))
+}
+
+/// Cached state for one PipeWire sink node.
+#[derive(Clone)]
+struct SinkEntry {
+    name: String,
+    device: DeviceKind,
+    running: bool,
+    /// `(volume, mute)` from the last Props POD we successfully parsed.
+    volume: Option<(f32, bool)>,
+}
+
+/// A [`Producer`] that polls PipeWire for the active output sink and emits
+/// [`Msg::Volume`] snapshots on every change.
+///
+/// Construct with [`new`](VolumeProducer::new) and hand it to the producer
+/// bridge; it spawns a dedicated PipeWire main-loop thread on [`run`](Producer::run),
+/// reads an initial snapshot, then re-emits on every tick until the system
+/// PipeWire server closes or the render loop shuts down.
+pub struct VolumeProducer {
+    interval: Duration,
+}
+
+impl VolumeProducer {
+    /// Create a volume producer sampling at the default cadence.
+    pub fn new() -> Self {
+        Self {
+            interval: DEFAULT_INTERVAL,
+        }
+    }
+
+    /// Create a producer sampling at a custom `interval` (used by tests).
+    pub fn with_interval(interval: Duration) -> Self {
+        Self { interval }
+    }
+}
+
+impl Default for VolumeProducer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Producer for VolumeProducer {
+    fn name(&self) -> String {
+        "volume".to_string()
+    }
+
+    fn run(self: Box<Self>, tx: MsgSender) -> ProducerFuture {
+        Box::pin(run(tx, self.interval))
+    }
+}
+
+/// Drive the producer: bring up the PipeWire main loop on a dedicated OS
+/// thread, seed the bar with the first reading, and re-emit on every tick.
+///
+/// A failed system-PipeWire connection propagates as an error the bridge logs
+/// and isolates — the bar keeps running, the volume widget simply stays
+/// blank. A per-tick error (malformed POD, dropped metadata, …) degrades to
+/// [`Msg::Volume(None)`] and `warn!`s; the next tick retries the live read.
+async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
+    let (done_tx, done_rx) = oneshot::channel();
+    let tx_for_thread = tx.clone();
+    thread::Builder::new()
+        .name("tablero-volume".to_string())
+        .spawn(move || {
+            // The thread owns the PipeWire main loop and exits when the loop
+            // terminates (server disconnect, OS error, …). The result
+            // travels back via the oneshot so the producer bridge can log it
+            // like any other producer failure.
+            let result = run_main_loop(tx_for_thread, period);
+            let _ = done_tx.send(result);
+        })
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+    match done_rx.await {
+        Ok(result) => result,
+        // The thread was lost (panic, join error, …) — the producer is
+        // effectively dead. Surface the cancellation as an error so the
+        // bridge logs it and isolates, rather than pretending success.
+        Err(_) => Err("volume producer thread dropped its result".into()),
+    }
+}
+
+/// Run the PipeWire main loop until the server goes away or an unrecoverable
+/// error surfaces.
+///
+/// Every read of PipeWire state is funneled through the shared
+/// [`Arc<Mutex<State>>`]; a periodic timer re-evaluates the active sink and
+/// emits a [`Msg::Volume`] if the normalized snapshot changed.
+fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
+    // Initialize PipeWire once. The `init`/`deinit` pair is a global
+    // reference count; calling it per thread is safe, and the static
+    // refcount means a leak-free shutdown is the OS's job when the
+    // process exits.
+    pipewire::init();
+
+    let mainloop = MainLoopRc::new(None)?;
+    let context = ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
+    let registry = core.get_registry_rc()?;
+
+    // The shared state: the active-sink candidate set, the configured
+    // default sink name (set by the `default.audio.sink` metadata), and the
+    // most-recently-emitted snapshot, so re-emits are gated on a real change.
+    let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
+    let state_for_timer = state.clone();
+    let tx_for_timer = tx.clone();
+
+    // Periodic timer: poll the cached state and emit a fresh `Msg::Volume`
+    // when the normalized snapshot changed. The timer is driven by the
+    // PipeWire main loop's own event source, so the thread stays parked
+    // between ticks.
+    let timer = mainloop.loop_().add_timer(move |_expirations| {
+        on_tick(&state_for_timer, &tx_for_timer);
+    });
+    timer.update_timer(Some(period), Some(period));
+
+    // The registry listener is the source of truth for which nodes are
+    // sinks and what their current state is. It captures `state` (a clone
+    // of the shared `Arc<Mutex<State>>`) and the registry (a weak upgrade)
+    // so the callback can bind a `Node` proxy for every audio sink.
+    let _registry_listener = attach_registry_listener(registry.clone(), state.clone());
+
+    // The metadata listener tracks the `default.audio.sink` value, which
+    // is the fallback when no sink is currently running. A separate global
+    // registration makes the metadata node available to the listener.
+    let _metadata_listener = attach_metadata_listener(&registry, state.clone());
+
+    mainloop.run();
+
+    // PipeWire's `deinit` is `unsafe`, and the workspace lints forbid an
+    // `unsafe` block here. Skipping the deinit is safe — the process is
+    // about to exit, so the per-process PipeWire state goes away with it.
+    Ok(())
+}
+
+/// The shared, mutable producer state: cached sinks, the configured default,
+/// and the most recent snapshot we emitted.
+#[derive(Default)]
+struct State {
+    sinks: HashMap<u32, SinkEntry>,
+    default_sink_name: Option<String>,
+    last_emitted: Option<Option<Volume>>,
+}
+
+/// Compute the snapshot to emit on a tick and send it through the
+/// cross-thread `MsgSender` if (and only if) it differs from the last one.
+///
+/// A re-emit happens when the normalized [`Volume`] value changes (level,
+/// mute, or device kind) or when the source goes from absent to present (or
+/// vice versa). Identical snapshots are dropped, so a steady-state machine
+/// costs one PipeWire event and zero render-loop work per tick.
+fn on_tick(state: &Arc<Mutex<State>>, tx: &MsgSender) {
+    let snapshot = compute_snapshot(state);
+    let changed = {
+        let state = state.lock().expect("volume state poisoned");
+        state.last_emitted.as_ref() != Some(&snapshot)
+    };
+    if changed {
+        {
+            let mut state = state.lock().expect("volume state poisoned");
+            state.last_emitted = Some(snapshot);
+        }
+        if tx.send(Msg::Volume(snapshot)).is_err() {
+            // The render loop has gone away — the next timer iteration will
+            // discover the closed channel and the main loop will exit on
+            // its own. Bail out of the callback.
+        }
+    }
+}
+
+/// Compute the normalized [`Volume`] snapshot to emit on a tick.
+///
+/// 1. Pick the active sink id (running, deterministic by name) or the
+///    configured default (any state) if nothing is running.
+/// 2. If a sink resolves, build a [`Volume`] from its cached level/mute/
+///    device kind. A sink that has not yet reported a Props POD (the
+///    `enum_params` round-trip is still in flight) reports the bar as
+///    "absent" until the first parsing succeeds, so a sink appearing in
+///    the registry does not flip the widget to `Vol 0%` and back once the
+///    real reading lands.
+/// 3. If neither resolves, return `None` so the widget reserves no slot.
+fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
+    let state = state.lock().expect("volume state poisoned");
+    let sinks = &state.sinks;
+    if sinks.is_empty() {
+        return None;
+    }
+
+    // Build the active-sink candidate set, in a shape the pure helper can
+    // sort against.
+    let mut candidates: Vec<(u32, &str, bool)> = sinks
+        .iter()
+        .map(|(id, entry)| (*id, entry.name.as_str(), entry.running))
+        .collect();
+    // The pick helper expects the candidates in any order and sorts itself.
+    let active = pick_active_sink_id(&candidates).or_else(|| {
+        // No running sink — fall back to the configured default, if any.
+        let default_name = state.default_sink_name.as_deref()?;
+        candidates.sort_by(|a, b| a.1.cmp(b.1));
+        candidates
+            .into_iter()
+            .find(|(_, name, _)| *name == default_name)
+            .map(|(id, _, _)| id)
+    });
+    let id = active?;
+    let entry = sinks.get(&id)?;
+
+    let (level, muted) = entry.volume?;
+    Some(Volume::new(level, muted, entry.device))
+}
+
+/// Install the registry listener that builds the cached [`SinkEntry`] map.
+///
+/// On every `global` event for an `ObjectType::Node` whose `media.class` is
+/// `"Audio/Sink"`, the listener binds a `Node` proxy, subscribes to its
+/// `ParamType::Props`, and installs `info` and `param` callbacks that
+/// update the shared state. On `global_remove`, the entry is dropped.
+fn attach_registry_listener(registry: RegistryRc, state: Arc<Mutex<State>>) -> Listener {
+    let registry_weak = registry.downgrade();
+    let state_for_global = state.clone();
+    let state_for_remove = state;
+    registry
+        .add_listener_local()
+        .global(move |obj| {
+            if obj.type_ != ObjectType::Node {
+                return;
+            }
+            let Some(props) = obj.props else {
+                return;
+            };
+            if !is_audio_sink(props) {
+                return;
+            }
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            let node: Node = match registry.bind(obj) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!("volume: bind sink node failed: {e}");
+                    return;
+                }
+            };
+            let id = obj.id;
+            let name = props.get("node.name").unwrap_or("?").to_string();
+            let device = device_kind_from_props(props);
+
+            // Seed the entry immediately so the tick can resolve a name and
+            // device kind even before the first `param` event lands. The
+            // `volume` field stays `None` until the Props POD is parsed.
+            {
+                let mut s = state_for_global.lock().expect("volume state poisoned");
+                s.sinks.insert(
+                    id,
+                    SinkEntry {
+                        name: name.clone(),
+                        device,
+                        running: false,
+                        volume: None,
+                    },
+                );
+            }
+
+            // Subscribe to Props so the server pushes updates, and request
+            // an initial enumeration so we do not have to wait for the
+            // first user-driven change.
+            node.subscribe_params(&[pipewire::spa::param::ParamType::Props]);
+            node.enum_params(0, Some(pipewire::spa::param::ParamType::Props), 0, 1);
+
+            let state_for_info = state_for_global.clone();
+            let state_for_param = state_for_global.clone();
+            let _node_listener = node
+                .add_listener_local()
+                .info(move |info: &NodeInfoRef| {
+                    let running = is_node_running(&info.state());
+                    let mut s = state_for_info.lock().expect("volume state poisoned");
+                    if let Some(entry) = s.sinks.get_mut(&id) {
+                        entry.running = running;
+                    }
+                })
+                .param(move |_seq, _id, _index, _next, param: Option<&Pod>| {
+                    let Some(param) = param else {
+                        return;
+                    };
+                    let parsed = parse_props_pod(param.as_bytes());
+                    let Some((level, muted)) = parsed else {
+                        // A malformed POD is not a hard failure — just skip
+                        // this tick for the sink; the next param event will
+                        // retry.
+                        return;
+                    };
+                    let mut s = state_for_param.lock().expect("volume state poisoned");
+                    if let Some(entry) = s.sinks.get_mut(&id) {
+                        entry.volume = Some((level, muted));
+                    }
+                })
+                .register();
+        })
+        .global_remove(move |id| {
+            let mut s = state_for_remove.lock().expect("volume state poisoned");
+            s.sinks.remove(&id);
+        })
+        .register()
+}
+
+/// Install the metadata listener that tracks the configured default sink.
+///
+/// PipeWire exposes the user's "default audio sink" as a `Metadata` global
+/// with property `default.audio.sink`; the value is a JSON payload of the
+/// form `{"name":"<sink-name>"}`. The listener parses it and stashes the
+/// name in the shared state, where the tick handler uses it as the fallback
+/// when no sink is currently running.
+fn attach_metadata_listener(registry: &RegistryRc, state: Arc<Mutex<State>>) -> Listener {
+    use pipewire::metadata::Metadata;
+
+    let registry_weak = registry.downgrade();
+    registry
+        .add_listener_local()
+        .global(move |obj: &GlobalObject<&DictRef>| {
+            if obj.type_ != ObjectType::Metadata {
+                return;
+            }
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            let metadata: Metadata = match registry.bind(obj) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let state_for_property = state.clone();
+            let _listener = metadata
+                .add_listener_local()
+                .property(move |_subject, key, _type_, value| {
+                    if key != Some(DEFAULT_AUDIO_SINK_KEY) {
+                        return 0;
+                    }
+                    let Some(value) = value else {
+                        return 0;
+                    };
+                    let name = parse_metadata_default_name(value);
+                    let mut s = state_for_property.lock().expect("volume state poisoned");
+                    s.default_sink_name = name;
+                    0
+                })
+                .register();
+        })
+        .register()
+}
+
+/// Parse the `default.audio.sink` metadata value, a JSON string of the form
+/// `{"name":"<sink-name>"}`.
+///
+/// The full JSON is on a single line; the only field we care about is
+/// `name`. A simple `key`/`value` scan extracts the string without dragging
+/// in a JSON dependency for one line of input.
+fn parse_metadata_default_name(value: &str) -> Option<String> {
+    let key = "\"name\"";
+    let name_start = value.find(key)?;
+    let after_key = &value[name_start + key.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    let open_quote = after_colon.find('"')?;
+    let after_quote = &after_colon[open_quote + 1..];
+    let close_quote = after_quote.find('"')?;
+    Some(after_quote[..close_quote].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- device_kind_from_icon_name ----
+
+    #[test]
+    fn icon_name_headphones_prefix_maps_to_headphones() {
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-headphones")),
+            DeviceKind::Headphones
+        );
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-headphones-analog")),
+            DeviceKind::Headphones
+        );
+    }
+
+    #[test]
+    fn icon_name_headset_prefix_maps_to_headset() {
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-headset")),
+            DeviceKind::Headset
+        );
+    }
+
+    #[test]
+    fn icon_name_speakers_prefix_maps_to_speakers() {
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-speakers")),
+            DeviceKind::Speakers
+        );
+    }
+
+    #[test]
+    fn icon_name_video_display_maps_to_monitor() {
+        assert_eq!(
+            device_kind_from_icon_name(Some("video-display")),
+            DeviceKind::Monitor
+        );
+        assert_eq!(
+            device_kind_from_icon_name(Some("video-monitor")),
+            DeviceKind::Monitor
+        );
+    }
+
+    #[test]
+    fn icon_name_phone_maps_to_phone() {
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-handsfree")),
+            DeviceKind::Phone
+        );
+        assert_eq!(device_kind_from_icon_name(Some("phone")), DeviceKind::Phone);
+    }
+
+    #[test]
+    fn icon_name_tv_maps_to_tv() {
+        assert_eq!(device_kind_from_icon_name(Some("tv")), DeviceKind::Tv);
+        assert_eq!(
+            device_kind_from_icon_name(Some("television")),
+            DeviceKind::Tv
+        );
+    }
+
+    #[test]
+    fn icon_name_missing_or_unknown_falls_back_to_other() {
+        assert_eq!(device_kind_from_icon_name(None), DeviceKind::Other);
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-card")),
+            DeviceKind::Other
+        );
+    }
+
+    // ---- device_kind_from_form_factor ----
+
+    #[test]
+    fn form_factor_known_values_map_to_their_kinds() {
+        assert_eq!(
+            device_kind_from_form_factor(Some("headphone")),
+            DeviceKind::Headphones
+        );
+        assert_eq!(
+            device_kind_from_form_factor(Some("headset")),
+            DeviceKind::Headset
+        );
+        assert_eq!(
+            device_kind_from_form_factor(Some("speaker")),
+            DeviceKind::Speakers
+        );
+        assert_eq!(
+            device_kind_from_form_factor(Some("monitor")),
+            DeviceKind::Monitor
+        );
+        assert_eq!(device_kind_from_form_factor(Some("tv")), DeviceKind::Tv);
+        assert_eq!(
+            device_kind_from_form_factor(Some("handset")),
+            DeviceKind::Phone
+        );
+    }
+
+    #[test]
+    fn form_factor_missing_or_unknown_falls_back_to_other() {
+        assert_eq!(device_kind_from_form_factor(None), DeviceKind::Other);
+        assert_eq!(
+            device_kind_from_form_factor(Some("wonderful")),
+            DeviceKind::Other
+        );
+    }
+
+    // ---- pick_active_sink_id ----
+
+    #[test]
+    fn pick_active_sink_returns_none_for_no_candidates() {
+        assert_eq!(pick_active_sink_id(&[]), None);
+    }
+
+    #[test]
+    fn pick_active_sink_returns_none_when_nothing_is_running() {
+        let candidates = &[(1u32, "alpha", false), (2, "beta", false)];
+        assert_eq!(pick_active_sink_id(candidates), None);
+    }
+
+    #[test]
+    fn pick_active_sink_picks_the_running_sink() {
+        let candidates = &[
+            (1u32, "alpha", false),
+            (2, "beta", true),
+            (3, "gamma", false),
+        ];
+        assert_eq!(pick_active_sink_id(candidates), Some(2));
+    }
+
+    #[test]
+    fn pick_active_sink_tiebreaks_by_alphabetical_name() {
+        // The deterministic tiebreak: among running sinks, the
+        // alphabetically first name wins. The candidate ordering is
+        // irrelevant — the function sorts.
+        let a = &[
+            (1u32, "charlie", true),
+            (2, "alpha", true),
+            (3, "bravo", true),
+        ];
+        assert_eq!(pick_active_sink_id(a), Some(2));
+        let b = &[
+            (2u32, "alpha", true),
+            (3, "bravo", true),
+            (1, "charlie", true),
+        ];
+        assert_eq!(pick_active_sink_id(b), Some(2));
+    }
+
+    #[test]
+    fn pick_active_sink_ignores_non_running_even_with_earlier_name() {
+        // A non-running "alpha" loses to a running "beta" — the running
+        // filter is applied before the sort, so the sort never sees the
+        // non-running candidate.
+        let candidates = &[(1u32, "alpha", false), (2, "beta", true)];
+        assert_eq!(pick_active_sink_id(candidates), Some(2));
+    }
+
+    // ---- parse_metadata_default_name ----
+
+    #[test]
+    fn parse_metadata_default_name_extracts_name_from_json() {
+        let value = r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#;
+        assert_eq!(
+            parse_metadata_default_name(value).as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+    }
+
+    #[test]
+    fn parse_metadata_default_name_handles_extra_whitespace() {
+        let value = r#"{ "name" :   "my-sink"  }"#;
+        assert_eq!(
+            parse_metadata_default_name(value).as_deref(),
+            Some("my-sink")
+        );
+    }
+
+    #[test]
+    fn parse_metadata_default_name_returns_none_for_missing_name() {
+        assert_eq!(parse_metadata_default_name(r#"{"foo":"bar"}"#), None);
+        assert_eq!(parse_metadata_default_name(""), None);
+    }
+
+    // ---- compute_snapshot ----
+
+    #[test]
+    fn compute_snapshot_returns_none_for_no_sinks() {
+        let state = Arc::new(Mutex::new(State::default()));
+        assert!(compute_snapshot(&state).is_none());
+    }
+
+    #[test]
+    fn compute_snapshot_uses_the_running_sink_when_available() {
+        let mut state = State::default();
+        state.sinks.insert(
+            1,
+            SinkEntry {
+                name: "headphones".to_string(),
+                device: DeviceKind::Headphones,
+                running: true,
+                volume: Some((0.5, false)),
+            },
+        );
+        state.sinks.insert(
+            2,
+            SinkEntry {
+                name: "speakers".to_string(),
+                device: DeviceKind::Speakers,
+                running: false,
+                volume: Some((0.3, true)),
+            },
+        );
+        let state = Arc::new(Mutex::new(state));
+        let snap = compute_snapshot(&state).expect("snapshot");
+        assert_eq!(snap.level(), 50);
+        assert!(!snap.muted());
+        assert_eq!(snap.device(), DeviceKind::Headphones);
+    }
+
+    #[test]
+    fn compute_snapshot_falls_back_to_default_sink_when_none_running() {
+        let mut state = State::default();
+        state.sinks.insert(
+            1,
+            SinkEntry {
+                name: "headphones".to_string(),
+                device: DeviceKind::Headphones,
+                running: false,
+                volume: Some((0.5, false)),
+            },
+        );
+        state.sinks.insert(
+            2,
+            SinkEntry {
+                name: "speakers".to_string(),
+                device: DeviceKind::Speakers,
+                running: false,
+                volume: Some((0.3, true)),
+            },
+        );
+        state.default_sink_name = Some("speakers".to_string());
+        let state = Arc::new(Mutex::new(state));
+        let snap = compute_snapshot(&state).expect("snapshot");
+        // The default-sink path is what wins when no sink is running.
+        assert_eq!(snap.device(), DeviceKind::Speakers);
+        assert!(snap.muted());
+    }
+
+    #[test]
+    fn compute_snapshot_returns_none_when_sink_has_no_volume_yet() {
+        // A sink that has not yet reported a Props POD has `volume: None`,
+        // so the snapshot stays absent until the first parsing lands.
+        let mut state = State::default();
+        state.sinks.insert(
+            1,
+            SinkEntry {
+                name: "speakers".to_string(),
+                device: DeviceKind::Speakers,
+                running: true,
+                volume: None,
+            },
+        );
+        let state = Arc::new(Mutex::new(state));
+        assert!(compute_snapshot(&state).is_none());
+    }
+}

@@ -23,6 +23,7 @@ pub mod producer;
 pub mod sni;
 pub mod sysmon;
 pub mod upower;
+pub mod volume;
 
 use std::error::Error;
 use std::time::Duration;
@@ -68,6 +69,7 @@ use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
 use crate::sysmon::SystemProducer;
 use crate::upower::UPowerProducer;
+use crate::volume::VolumeProducer;
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
@@ -397,13 +399,16 @@ fn output_key(output: &wl_output::WlOutput) -> OutputId {
 /// `config` (see [`tablero_core::config::Config`]). Wires the default producer
 /// set — the Hyprland workspace source, the UPower battery source, the procfs
 /// system-stats source, the NetworkManager connectivity source, the BlueZ
-/// bluetooth source, and the StatusNotifierItem tray host — so the bar shows
-/// live workspaces, battery, CPU/memory load, network state, Bluetooth
-/// adapter state, and tray icons alongside the clock. The bluetooth and tray
-/// producers run even when their widgets are not in any zone; the widget
-/// only appears when the user adds `"bluetooth"` (or `"tray"`) to a zone.
-/// The clock itself is still driven by the synchronous tick timer; see
-/// [`run_with_producers`] to supply a custom producer set.
+/// bluetooth source, the native PipeWire volume source, and the
+/// StatusNotifierItem tray host — so the bar shows live workspaces, battery,
+/// CPU/memory load, network state, Bluetooth adapter state, the active
+/// output sink's volume, and tray icons alongside the clock. The bluetooth,
+/// volume, and tray producers run even when their widgets are not in any
+/// zone; the widget only appears when the user adds `"bluetooth"`, `"volume"`,
+/// or `"tray"` to a zone. The volume source runs on a dedicated OS thread —
+/// PipeWire's main loop is synchronous, unlike the other producers' zbus
+/// backends. The clock itself is still driven by the synchronous tick timer;
+/// see [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     run_with_producers(
         config,
@@ -413,6 +418,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(SystemProducer::new()),
             Box::new(NetworkProducer::new()),
             Box::new(BluetoothProducer::new()),
+            Box::new(VolumeProducer::new()),
             Box::new(SniHostProducer::new()),
         ],
     )
