@@ -48,3 +48,12 @@ PipeWire wire protocol via the freedesktop `pipewire` Rust crate.
 ## Commit
 
 - [x] One `feat(volume): add PipeWire-backed volume widget` commit covering all phases.
+
+## Drift
+
+The commit also includes a few `cargo fmt` reformatings of pre-existing code
+that the stable rustfmt defaults rewrote during the validation step (a
+handful of long lines in `crates/tablero-core/src/render.rs` and
+`crates/tablero-wayland/src/bluetooth.rs`). These are not part of the
+volume feature; per the skill's "formatting changes go in the same
+commit" rule, they were bundled in `3b06fb4` rather than split out.
