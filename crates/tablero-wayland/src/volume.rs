@@ -389,6 +389,9 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
     // The shared state: the active-sink candidate set, the configured
     // default sink name (set by the `default.audio.sink` metadata), and the
     // most-recently-emitted snapshot, so re-emits are gated on a real change.
+    // The state is shared by the periodic timer (the safety-net poll) AND
+    // by the per-sink / metadata listeners (instant feedback on every
+    // PipeWire event).
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
     let state_for_timer = state.clone();
     let tx_for_timer = tx.clone();
@@ -407,10 +410,13 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
     let node_listeners_for_registry = node_listeners.clone();
     let node_listeners_for_metadata = node_listeners.clone();
 
-    // Periodic timer: poll the cached state and emit a fresh `Msg::Volume`
-    // when the normalized snapshot changed. The timer is driven by the
-    // PipeWire main loop's own event source, so the thread stays parked
-    // between ticks.
+    // Periodic timer: a safety-net poll that re-evaluates the snapshot
+    // every `period`. The per-sink and metadata listeners call `on_tick`
+    // directly on every PipeWire event, so this is the fallback for any
+    // missed push (a server that doesn't push, a sink that disconnects
+    // before its `global_remove` is delivered, etc.). The timer is
+    // driven by the PipeWire main loop's own event source, so the thread
+    // stays parked between ticks.
     let timer = mainloop.loop_().add_timer(move |_expirations| {
         on_tick(&state_for_timer, &tx_for_timer);
     });
@@ -425,6 +431,7 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
         state.clone(),
         node_proxies_for_registry,
         node_listeners_for_registry,
+        tx.clone(),
     );
 
     // The metadata listener tracks the `default.audio.sink` value, which
@@ -437,6 +444,7 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
         state.clone(),
         metadata_proxies,
         node_listeners_for_metadata,
+        tx.clone(),
     );
 
     mainloop.run();
@@ -557,17 +565,26 @@ fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
 /// `node_listeners` owns the listener itself. Both are move-cloned into
 /// the closure so the registry's `Fn` bound is satisfied and the
 /// resources live for the rest of the main loop.
+///
+/// The `tx` cross-thread sender is also captured: every per-sink event
+/// (`info` and `param`) re-evaluates the active-sink snapshot via
+/// [`on_tick`] and re-emits on a real change, which is what gives the
+/// widget instant feedback — the 2-second safety-net poll in
+/// [`run_main_loop`] is just a fallback for events the server didn't push.
 fn attach_registry_listener(
     registry: RegistryRc,
     state: Arc<Mutex<State>>,
     node_proxies: Rc<RefCell<Vec<Node>>>,
     node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
+    tx: MsgSender,
 ) -> pipewire::registry::Listener {
     let registry_weak = registry.downgrade();
     let state_for_global = state.clone();
     let state_for_remove = state;
     let node_proxies_for_cb = node_proxies.clone();
     let node_listeners_for_cb = node_listeners.clone();
+    let tx_for_global = tx.clone();
+    let tx_for_remove = tx;
     registry
         .add_listener_local()
         .global(move |obj| {
@@ -612,6 +629,10 @@ fn attach_registry_listener(
 
             let state_for_info = state_for_global.clone();
             let state_for_param = state_for_global.clone();
+            let tx_for_info = tx_for_global.clone();
+            let tx_for_param = tx_for_global.clone();
+            let state_for_tick_after_info = state_for_global.clone();
+            let state_for_tick_after_param = state_for_global.clone();
             let node_listener = node
                 .add_listener_local()
                 .info(move |info: &NodeInfoRef| {
@@ -626,11 +647,18 @@ fn attach_registry_listener(
                         .props()
                         .map(device_kind_from_props)
                         .unwrap_or(DeviceKind::Other);
-                    let mut s = state_for_info.lock().expect("volume state poisoned");
-                    if let Some(entry) = s.sinks.get_mut(&id) {
-                        entry.running = running;
-                        entry.device = device;
+                    {
+                        let mut s = state_for_info.lock().expect("volume state poisoned");
+                        if let Some(entry) = s.sinks.get_mut(&id) {
+                            entry.running = running;
+                            entry.device = device;
+                        }
                     }
+                    // A state change (Running ↔ Suspended ↔ Idle) is a
+                    // visible change too — the active-sink selection
+                    // depends on it, so re-evaluate immediately rather
+                    // than waiting for the next 2s poll.
+                    on_tick(&state_for_tick_after_info, &tx_for_info);
                 })
                 .param(move |_seq, _id, _index, _next, param: Option<&Pod>| {
                     let Some(param) = param else {
@@ -643,10 +671,19 @@ fn attach_registry_listener(
                         // retry.
                         return;
                     };
-                    let mut s = state_for_param.lock().expect("volume state poisoned");
-                    if let Some(entry) = s.sinks.get_mut(&id) {
-                        entry.volume = Some((level, muted));
+                    {
+                        let mut s = state_for_param.lock().expect("volume state poisoned");
+                        if let Some(entry) = s.sinks.get_mut(&id) {
+                            entry.volume = Some((level, muted));
+                        }
                     }
+                    // The volume or mute just changed — re-evaluate the
+                    // active-sink snapshot and re-emit on a real change.
+                    // This is the path that makes the widget feel
+                    // instant: pactl/wpctl triggers a Props push, the
+                    // param event fires, and the widget updates within a
+                    // frame.
+                    on_tick(&state_for_tick_after_param, &tx_for_param);
                 })
                 .register();
             // Both the listener and the Node it references need to outlive
@@ -661,10 +698,19 @@ fn attach_registry_listener(
                 .borrow_mut()
                 .push(Box::new(node_listener));
             node_proxies_for_cb.borrow_mut().push(node);
+            // The sink just appeared in the registry, which is also a
+            // visible change (a new candidate for active-sink selection).
+            // Emit a fresh snapshot so the widget shows up on the first
+            // bind, without waiting for the 2s safety-net poll.
+            on_tick(&state_for_global, &tx_for_global);
         })
         .global_remove(move |id| {
             let mut s = state_for_remove.lock().expect("volume state poisoned");
             s.sinks.remove(&id);
+            // A sink dropping is also a visible change (the active-sink
+            // selection can flip to the next candidate). Re-evaluate
+            // immediately.
+            on_tick(&state_for_remove, &tx_for_remove);
         })
         .register()
 }
@@ -679,17 +725,23 @@ fn attach_registry_listener(
 ///
 /// The function returns the outer registry listener; the inner
 /// per-Metadata listener is stored in the shared `node_listeners` vec
-/// (see [`attach_registry_listener`] for the lifetime rationale).
+/// (see [`attach_registry_listener`] for the lifetime rationale). When
+/// the `default.audio.sink` property arrives or changes, the per-Metadata
+/// `property` callback re-evaluates the snapshot via [`on_tick`], which
+/// is what makes the widget track the user's "default sink" choice the
+/// moment wireplumber publishes the change.
 fn attach_metadata_listener(
     registry: &RegistryRc,
     state: Arc<Mutex<State>>,
     node_proxies: Rc<RefCell<Vec<pipewire::metadata::Metadata>>>,
     node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
+    tx: MsgSender,
 ) -> pipewire::registry::Listener {
     use pipewire::metadata::Metadata;
 
     let registry_weak = registry.downgrade();
     let node_listeners_for_cb = node_listeners.clone();
+    let tx_for_metadata = tx;
     registry
         .add_listener_local()
         .global(move |obj: &GlobalObject<&DictRef>| {
@@ -704,6 +756,8 @@ fn attach_metadata_listener(
                 Err(_) => return,
             };
             let state_for_property = state.clone();
+            let state_for_tick = state.clone();
+            let tx_for_tick = tx_for_metadata.clone();
             let md_listener = metadata
                 .add_listener_local()
                 .property(move |_subject, key, _type_, value| {
@@ -714,8 +768,14 @@ fn attach_metadata_listener(
                         return 0;
                     };
                     let name = parse_metadata_default_name(value);
-                    let mut s = state_for_property.lock().expect("volume state poisoned");
-                    s.default_sink_name = name;
+                    {
+                        let mut s = state_for_property.lock().expect("volume state poisoned");
+                        s.default_sink_name = name;
+                    }
+                    // The default-sink choice is a visible change too —
+                    // re-evaluate immediately so the widget follows the
+                    // user's `wpctl set-default` without the 2s poll.
+                    on_tick(&state_for_tick, &tx_for_tick);
                     0
                 })
                 .register();
