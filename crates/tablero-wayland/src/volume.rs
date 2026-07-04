@@ -483,9 +483,7 @@ fn on_tick(state: &Arc<Mutex<State>>, tx: &MsgSender) {
             state.last_emitted = Some(snapshot);
         }
         if tx.send(Msg::Volume(snapshot)).is_err() {
-            // The render loop has gone away — the next timer iteration will
-            // discover the closed channel and the main loop will exit on
-            // its own. Bail out of the callback.
+            debug!("volume: tx.send returned Closed");
         }
     }
 }
@@ -637,21 +635,29 @@ fn attach_registry_listener(
                 .add_listener_local()
                 .info(move |info: &NodeInfoRef| {
                     let running = is_node_running(&info.state());
+                    let props = info.props();
                     // The full per-node properties (device.icon-name,
                     // device.form-factor, node.description, …) only arrive
                     // in the info callback. Re-classify on every info
                     // event so a wireplumber metadata update that adds an
                     // icon (e.g. when headphones are plugged in) flips
                     // the widget's glyph on the next tick.
-                    let device = info
-                        .props()
+                    let device = props
                         .map(device_kind_from_props)
                         .unwrap_or(DeviceKind::Other);
                     {
                         let mut s = state_for_info.lock().expect("volume state poisoned");
                         if let Some(entry) = s.sinks.get_mut(&id) {
                             entry.running = running;
-                            entry.device = device;
+                            // Only downgrade device-kind on a re-info when
+                            // the props actually carry icon/form-factor.
+                            // A second `info` event for a state change
+                            // (Suspended ↔ Idle) often arrives with
+                            // `info.props()` empty — do not clobber the
+                            // real classification in that case.
+                            if device != DeviceKind::Other || entry.device == DeviceKind::Other {
+                                entry.device = device;
+                            }
                         }
                     }
                     // A state change (Running ↔ Suspended ↔ Idle) is a
@@ -705,8 +711,17 @@ fn attach_registry_listener(
             on_tick(&state_for_global, &tx_for_global);
         })
         .global_remove(move |id| {
-            let mut s = state_for_remove.lock().expect("volume state poisoned");
-            s.sinks.remove(&id);
+            // Scope the guard to a block: this callback then calls
+            // `on_tick`, which takes the same `Mutex` from the same
+            // thread. A `std::sync::Mutex` is non-reentrant — keeping
+            // the guard alive across the `on_tick` call would deadlock
+            // the entire PipeWire main loop (the same pitfall that
+            // caused the widget to stop updating on any
+            // non-sink client disconnect).
+            {
+                let mut s = state_for_remove.lock().expect("volume state poisoned");
+                s.sinks.remove(&id);
+            }
             // A sink dropping is also a visible change (the active-sink
             // selection can flip to the next candidate). Re-evaluate
             // immediately.
