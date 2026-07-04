@@ -13,18 +13,27 @@ use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 use pipewire::node::{Node, NodeInfoRef};
 use pipewire::proxy::Listener;
-use pipewire::spa::pod::Pod;
-use pipewire::spa::sys::{SPA_PROP_mute, SPA_PROP_volume};
+use pipewire::spa::pod::{Pod, Value};
+use pipewire::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
 use pipewire::types::ObjectType;
-use tablero_wayland::volume::device_kind_from_props;
+use tablero_wayland::volume::{average_to_user_volume, device_kind_from_props};
 
 fn parse_props(pod: &Pod) -> Option<(f32, bool)> {
     let obj = pod.as_object().ok()?;
-    let volume_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_volume))?;
+    let channel_volumes_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_channelVolumes))?;
     let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_mute))?;
-    let volume = volume_pod.value().get_float().ok()?;
+    let value: Value = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
+        channel_volumes_pod.value().as_bytes(),
+    )
+    .ok()
+    .map(|(_, v)| v)?;
+    let user_volume = match &value {
+        Value::ValueArray(pipewire::spa::pod::ValueArray::Float(v)) => average_to_user_volume(v)?,
+        Value::Float(v) => average_to_user_volume(&[*v])?,
+        _ => return None,
+    };
     let mute = mute_pod.value().get_bool().ok()?;
-    Some((volume, mute))
+    Some((user_volume, mute))
 }
 
 fn main() {
@@ -104,6 +113,16 @@ fn main() {
                     }
                 })
                 .register();
+            // Subscribe to Props *before* moving the Node into the
+            // shared Vec (subscribe takes `&self`). This is what the
+            // production producer does too.
+            node.subscribe_params(&[pipewire::spa::param::ParamType::Props]);
+            node.enum_params(
+                0,
+                Some(pipewire::spa::param::ParamType::Props),
+                0,
+                1,
+            );
             node_listeners_for_cb
                 .borrow_mut()
                 .push(Box::new(node_listener));

@@ -214,29 +214,76 @@ fn is_node_running(state: &NodeState<'_>) -> bool {
 ///
 /// `pod_bytes` is the raw byte slice of a `spa_pod` whose body is a
 /// `SPA_TYPE_OBJECT_Props` (the `ParamType::Props` object). The function
-/// looks up the `volume` (Float) and `mute` (Bool) properties and returns
-/// the parsed values. Returns `None` for any malformed input — a transient
-/// type drift never takes the source down.
-fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
-    use pipewire::spa::sys::{SPA_PROP_mute, SPA_PROP_volume};
+/// looks up the `channelVolumes` (per-channel Float array) and `mute`
+/// (Bool) properties and returns the parsed values. Returns `None` for any
+/// malformed input — a transient type drift never takes the source down.
+///
+/// **Why `channelVolumes` and not `volume`.** In wireplumber /
+/// pipewire-pulse, the `SPA_PROP_volume` field is the **sink's max
+/// linear amplitude** (always 1.0 in a typical wireplumber setup) and the
+/// per-channel linear amplitudes live in `SPA_PROP_channelVolumes`. The
+/// per-channel values are the **cubic** of the user-set "percent" pactl
+/// shows: pactl at 30% reports `channelVolumes = 0.30^3 = 0.027` and
+/// `SPA_PROP_volume = 1.0`. This function therefore takes the average of
+/// `channelVolumes`, applies `cbrt` to recover the user-volume in
+/// `[0, 1]`, clamps to `[0, 1]`, and returns that — so the widget shows
+/// the same number pactl / waybar do.
+pub fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
+    use pipewire::spa::pod::Value;
+    use pipewire::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
 
     let pod = Pod::from_bytes(pod_bytes)?;
     let obj = pod.as_object().ok()?;
 
-    // The Props object's property keys are SPA_PROP_* constants from
-    // `<spa/param/props.h>`: `SPA_PROP_volume` is the single f32 reading
-    // PipeWire publishes on every audio sink (0.0 silence, 1.0 no
-    // attenuation), `SPA_PROP_mute` is a bool. The libspa-sys bindgen
-    // output pins the values at `0x10003` and `0x10004` respectively, so
-    // using the constants directly here is the right level of indirection
-    // — and the test in this file asserts the wire format to catch a
-    // header / bindgen drift.
-    let volume_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_volume))?;
+    // `SPA_PROP_channelVolumes` is a per-channel Float array. The
+    // libspa-sys bindgen output pins the key at `0x10008`; the test in
+    // this file asserts the wire format to catch a header / bindgen
+    // drift.
+    let channel_volumes_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_channelVolumes))?;
     let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_mute))?;
 
-    let volume = volume_pod.value().get_float().ok()?;
+    // Deserialize the channel-volumes value into a `Value` enum so we
+    // can pull the per-channel Float array out of whatever shape the
+    // serializer chose.
+    let value: Value = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
+        channel_volumes_pod.value().as_bytes(),
+    )
+    .ok()
+    .map(|(_, v)| v)?;
+    // Compute the user-volume from the per-channel Float array (or a
+    // single Float for mono sinks). The `Value` owns the data, so we
+    // borrow into it; binding `value` to a name keeps it alive for the
+    // duration of the borrow.
+    let user_volume = match &value {
+        Value::ValueArray(pipewire::spa::pod::ValueArray::Float(v)) => average_to_user_volume(v)?,
+        Value::Float(v) => average_to_user_volume(&[*v])?,
+        _ => return None,
+    };
     let mute = mute_pod.value().get_bool().ok()?;
-    Some((volume, mute))
+    Some((user_volume, mute))
+}
+
+/// Average a slice of per-channel linear amplitudes and apply the cubic
+/// inverse (`cbrt`) to recover the user-volume in `[0, 1]`. Returns
+/// `None` for an empty slice.
+pub fn average_to_user_volume(channels: &[f32]) -> Option<f32> {
+    if channels.is_empty() {
+        return None;
+    }
+    let sum: f32 = channels.iter().filter(|v| v.is_finite() && **v > 0.0).sum();
+    let n = channels
+        .iter()
+        .filter(|v| v.is_finite() && **v > 0.0)
+        .count() as f32;
+    if n == 0.0 {
+        return Some(0.0);
+    }
+    let avg = sum / n;
+    // cbrt is monotonic and well-defined for non-negative finite values;
+    // we already filtered negatives, and a NaN/Inf upstream yields a
+    // user-volume of 0.
+    let cbrt = avg.max(0.0).cbrt();
+    Some(cbrt.clamp(0.0, 1.0))
 }
 
 /// Cached state for one PipeWire sink node.
@@ -931,12 +978,15 @@ mod tests {
         use pipewire::spa::pod::PropertyFlags;
         use pipewire::spa::pod::serialize::{GenError, PodSerialize, PodSerializer};
         use pipewire::spa::sys::{
-            SPA_PARAM_Props, SPA_PROP_mute, SPA_PROP_volume, SPA_TYPE_OBJECT_Props,
+            SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props,
         };
         use std::io::Cursor;
 
         struct MyProps {
-            volume: f32,
+            /// The per-channel linear amplitudes. The user-volume percent
+            /// `pactl` reports is `cbrt(avg(channels)) * 100`; this test
+            /// stores `0.5^3` per channel so the expected `cbrt` is 0.5.
+            channels: Vec<f32>,
             muted: bool,
         }
 
@@ -948,8 +998,8 @@ mod tests {
                 let mut obj_serializer =
                     serializer.serialize_object(SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
                 obj_serializer.serialize_property(
-                    SPA_PROP_volume,
-                    &self.volume,
+                    SPA_PROP_channelVolumes,
+                    self.channels.as_slice(),
                     PropertyFlags::empty(),
                 )?;
                 obj_serializer.serialize_property(
@@ -964,11 +1014,17 @@ mod tests {
         // Sanity: the constants the production code uses match the values
         // bindgen ships today. If a future libspa-sys bumps the header
         // version, the test catches it before the producer does.
-        assert_eq!(SPA_PROP_volume, 65539, "SPA_PROP_volume drifted");
+        assert_eq!(
+            SPA_PROP_channelVolumes, 65544,
+            "SPA_PROP_channelVolumes drifted"
+        );
         assert_eq!(SPA_PROP_mute, 65540, "SPA_PROP_mute drifted");
 
+        // Wireplumber stores user-volume as `user^3` per channel; 0.5^3
+        // = 0.125 per channel, average = 0.125, cbrt(0.125) = 0.5.
+        let cubic = 0.5_f32.powi(3);
         let props = MyProps {
-            volume: 0.42,
+            channels: vec![cubic, cubic],
             muted: true,
         };
         let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &props)
@@ -976,7 +1032,35 @@ mod tests {
             .0
             .into_inner();
         let parsed = parse_props_pod(&bytes);
-        assert_eq!(parsed, Some((0.42, true)));
+        assert_eq!(parsed, Some((0.5, true)));
+    }
+
+    #[test]
+    fn average_to_user_volume_inverts_wireplumbers_cubic_ramp() {
+        // The wireplumber per-channel volume is the user-volume raised to
+        // the third power. For a 50% user-volume the per-channel is
+        // 0.5^3 = 0.125, and the inverse is `cbrt(0.125) = 0.5`.
+        let channels = vec![0.5_f32.powi(3), 0.5_f32.powi(3)];
+        let user_volume = average_to_user_volume(&channels).unwrap();
+        assert!((user_volume - 0.5).abs() < 1e-5);
+
+        // Same with 30% user-volume: 0.3^3 = 0.027 per channel, cbrt
+        // recovers 0.3. This is the pactl `Volume: 19661 / 30%` reading
+        // mapped back to the linear 0..=1 scale.
+        let cubic = 0.3_f32.powi(3);
+        let user_volume = average_to_user_volume(&[cubic, cubic]).unwrap();
+        assert!((user_volume - 0.3).abs() < 1e-5);
+
+        // An empty channel list returns None — the snapshot stays absent
+        // until the server publishes real channels.
+        assert_eq!(average_to_user_volume(&[]), None);
+
+        // Non-finite and non-positive channel values are filtered out, so
+        // a transient NaN/negative reading cannot poison the snapshot.
+        let user_volume = average_to_user_volume(&[f32::NAN, 0.5_f32.powi(3)]).unwrap();
+        assert!((user_volume - 0.5).abs() < 1e-5);
+        let user_volume = average_to_user_volume(&[-0.1, 0.5_f32.powi(3)]).unwrap();
+        assert!((user_volume - 0.5).abs() < 1e-5);
     }
 
     #[test]
