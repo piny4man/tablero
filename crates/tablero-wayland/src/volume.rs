@@ -52,7 +52,9 @@
 //! [`Pod::get_float`] / [`Pod::get_bool`] and is exercised by the integration
 //! test in `tests/volume.rs`, not the unit tests.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -61,7 +63,8 @@ use log::debug;
 use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 use pipewire::node::{Node, NodeInfoRef, NodeState};
-use pipewire::registry::{GlobalObject, Listener, RegistryRc};
+use pipewire::proxy::Listener;
+use pipewire::registry::{GlobalObject, RegistryRc};
 use pipewire::spa::pod::Pod;
 use pipewire::spa::utils::dict::DictRef;
 use pipewire::types::ObjectType;
@@ -79,17 +82,6 @@ use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 /// a visible label.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The SPA Props property key for the per-channel linear volume.
-///
-/// `SPA_PROP_volume` is the single f32 reading PipeWire publishes on every
-/// audio sink (0.0 silence, 1.0 no attenuation). Defined in
-/// `<spa/param/props.h>` and re-exported via `spa_sys`; we hard-code the
-/// value here so the producer has no FFI constants leaking into the rest of
-/// the crate.
-const SPA_PROP_VOLUME: u32 = 0x10001;
-/// The SPA Props property key for the mute boolean (`SPA_PROP_mute`).
-const SPA_PROP_MUTE: u32 = 0x10002;
-
 /// The PipeWire metadata key whose value is the configured default audio sink.
 ///
 /// Read from the `Metadata` global the server publishes; the value is a JSON
@@ -103,19 +95,37 @@ const DEFAULT_AUDIO_SINK_KEY: &str = "default.audio.sink";
 /// Falls back to [`DeviceKind::Other`] for anything the heuristics did not
 /// classify, so a custom icon on an unusual sink never breaks the bar. The
 /// `Option` input is what [`DictRef::get`] returns for a missing key.
+///
+/// The wireplumber/pipewire-pulse default icon naming scheme is
+/// `<category>-<kind>[-<variant>]`:
+/// `audio-headphones`, `audio-headset`, `audio-speakers`,
+/// `audio-card-analog`, `video-display`, `video-monitor`, `tv`, `phone`.
+/// The `audio-card-*` family is what wireplumber emits for built-in sound
+/// cards and HDMI outputs without a more specific icon — `audio-card-analog`
+/// is a typical internal speaker, `audio-card-hdmi` an HDMI output, etc.
+/// All `audio-card-*` icons default to [`DeviceKind::Speakers`] (an internal
+/// card without headphones plugged in is the most common state), with the
+/// `audio-card-hdmi` / `audio-card-spdif` / `*-dp` variants falling through
+/// to [`DeviceKind::Monitor`] when the icon name says so.
 pub fn device_kind_from_icon_name(icon: Option<&str>) -> DeviceKind {
     let Some(icon) = icon else {
         return DeviceKind::Other;
     };
-    // Match on a stable prefix: `audio-headphones` and `audio-headset` are
-    // the two relevant icon stems PipeWire / wireplumber emit, and the
-    // variant differences inside (e.g. `audio-headphones-analog`) all map to
-    // the same widget glyph.
     if icon.starts_with("audio-headset") {
         DeviceKind::Headset
     } else if icon.starts_with("audio-headphone") {
         DeviceKind::Headphones
     } else if icon.starts_with("audio-speaker") {
+        DeviceKind::Speakers
+    } else if icon.starts_with("audio-card-hdmi")
+        || icon.starts_with("audio-card-dp")
+        || icon.starts_with("audio-card-displayport")
+    {
+        DeviceKind::Monitor
+    } else if icon.starts_with("audio-card") {
+        // `audio-card-analog`, `audio-card-spdif`, `audio-card-usb`, …
+        // Built-in sound cards without a more specific signal. Internal
+        // speakers are the most common case.
         DeviceKind::Speakers
     } else if icon.starts_with("video-display") || icon.starts_with("video-monitor") {
         DeviceKind::Monitor
@@ -208,13 +218,21 @@ fn is_node_running(state: &NodeState<'_>) -> bool {
 /// the parsed values. Returns `None` for any malformed input — a transient
 /// type drift never takes the source down.
 fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
+    use pipewire::spa::sys::{SPA_PROP_mute, SPA_PROP_volume};
+
     let pod = Pod::from_bytes(pod_bytes)?;
     let obj = pod.as_object().ok()?;
 
-    // The Props object's property keys are SPA_PROP_* constants; the volume
-    // value is a single f32 (one channel) and the mute value is a bool.
-    let volume_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_VOLUME))?;
-    let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_MUTE))?;
+    // The Props object's property keys are SPA_PROP_* constants from
+    // `<spa/param/props.h>`: `SPA_PROP_volume` is the single f32 reading
+    // PipeWire publishes on every audio sink (0.0 silence, 1.0 no
+    // attenuation), `SPA_PROP_mute` is a bool. The libspa-sys bindgen
+    // output pins the values at `0x10003` and `0x10004` respectively, so
+    // using the constants directly here is the right level of indirection
+    // — and the test in this file asserts the wire format to catch a
+    // header / bindgen drift.
+    let volume_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_volume))?;
+    let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_mute))?;
 
     let volume = volume_pod.value().get_float().ok()?;
     let mute = mute_pod.value().get_bool().ok()?;
@@ -328,6 +346,20 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
     let state_for_timer = state.clone();
     let tx_for_timer = tx.clone();
 
+    // The per-Node listeners (and the Node proxies themselves — the
+    // listener's internal hook references the proxy, so dropping the
+    // proxy invalidates the listener) must outlive the callback that
+    // creates them. The whole producer is single-threaded (PipeWire's
+    // main loop is synchronous and the `Listener` trait is `!Send`),
+    // so a thread-local `Rc<RefCell<Vec<…>>>` is the right level of
+    // sharing — exactly the `Proxies` struct pw-mon uses for the same
+    // reason.
+    let node_proxies: Rc<RefCell<Vec<Node>>> = Rc::new(RefCell::new(Vec::new()));
+    let node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>> = Rc::new(RefCell::new(Vec::new()));
+    let node_proxies_for_registry = node_proxies.clone();
+    let node_listeners_for_registry = node_listeners.clone();
+    let node_listeners_for_metadata = node_listeners.clone();
+
     // Periodic timer: poll the cached state and emit a fresh `Msg::Volume`
     // when the normalized snapshot changed. The timer is driven by the
     // PipeWire main loop's own event source, so the thread stays parked
@@ -341,12 +373,24 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
     // sinks and what their current state is. It captures `state` (a clone
     // of the shared `Arc<Mutex<State>>`) and the registry (a weak upgrade)
     // so the callback can bind a `Node` proxy for every audio sink.
-    let _registry_listener = attach_registry_listener(registry.clone(), state.clone());
+    let _registry_listener: pipewire::registry::Listener = attach_registry_listener(
+        registry.clone(),
+        state.clone(),
+        node_proxies_for_registry,
+        node_listeners_for_registry,
+    );
 
     // The metadata listener tracks the `default.audio.sink` value, which
     // is the fallback when no sink is currently running. A separate global
     // registration makes the metadata node available to the listener.
-    let _metadata_listener = attach_metadata_listener(&registry, state.clone());
+    let metadata_proxies: Rc<RefCell<Vec<pipewire::metadata::Metadata>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let _metadata_listener: pipewire::registry::Listener = attach_metadata_listener(
+        &registry,
+        state.clone(),
+        metadata_proxies,
+        node_listeners_for_metadata,
+    );
 
     mainloop.run();
 
@@ -393,15 +437,20 @@ fn on_tick(state: &Arc<Mutex<State>>, tx: &MsgSender) {
 
 /// Compute the normalized [`Volume`] snapshot to emit on a tick.
 ///
-/// 1. Pick the active sink id (running, deterministic by name) or the
-///    configured default (any state) if nothing is running.
-/// 2. If a sink resolves, build a [`Volume`] from its cached level/mute/
-///    device kind. A sink that has not yet reported a Props POD (the
-///    `enum_params` round-trip is still in flight) reports the bar as
-///    "absent" until the first parsing succeeds, so a sink appearing in
-///    the registry does not flip the widget to `Vol 0%` and back once the
-///    real reading lands.
-/// 3. If neither resolves, return `None` so the widget reserves no slot.
+/// 1. Pick the active sink id (running, deterministic by name), or
+/// 2. The configured default (any state) from `default.audio.sink` metadata,
+///    or
+/// 3. The first sink sorted by name (so the volume is *always* shown when
+///    at least one sink exists — even when nothing is playing right now
+///    and the wireplumber user daemon has not pushed the metadata). This
+///    is what keeps the widget useful: a `Vol 50%` reading is the user's
+///    most common reference point, regardless of whether audio is
+///    playing.
+///
+/// A sink that has not yet reported a Props POD (the `enum_params` round-
+/// trip is still in flight) reports the bar as "absent" until the first
+/// parsing succeeds, so a sink appearing in the registry does not flip
+/// the widget to `Vol 0%` and back once the real reading lands.
 fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
     let state = state.lock().expect("volume state poisoned");
     let sinks = &state.sinks;
@@ -409,22 +458,33 @@ fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
         return None;
     }
 
-    // Build the active-sink candidate set, in a shape the pure helper can
-    // sort against.
-    let mut candidates: Vec<(u32, &str, bool)> = sinks
+    // Build the candidate set, in a shape the pure helper can sort against.
+    let candidates: Vec<(u32, &str, bool)> = sinks
         .iter()
         .map(|(id, entry)| (*id, entry.name.as_str(), entry.running))
         .collect();
-    // The pick helper expects the candidates in any order and sorts itself.
-    let active = pick_active_sink_id(&candidates).or_else(|| {
-        // No running sink — fall back to the configured default, if any.
-        let default_name = state.default_sink_name.as_deref()?;
-        candidates.sort_by(|a, b| a.1.cmp(b.1));
-        candidates
-            .into_iter()
-            .find(|(_, name, _)| *name == default_name)
-            .map(|(id, _, _)| id)
-    });
+
+    // (1) running wins.
+    let active = pick_active_sink_id(&candidates)
+        // (2) configured default (any state) wins next.
+        .or_else(|| {
+            let default_name = state.default_sink_name.as_deref()?;
+            let mut sorted = candidates.clone();
+            sorted.sort_by(|a, b| a.1.cmp(b.1));
+            sorted
+                .into_iter()
+                .find(|(_, name, _)| *name == default_name)
+                .map(|(id, _, _)| id)
+        })
+        // (3) deterministic-by-name: the first sink alphabetically. This
+        // is what keeps the widget always showing a value when at least
+        // one sink is reachable.
+        .or_else(|| {
+            let mut sorted = candidates.clone();
+            sorted.sort_by(|a, b| a.1.cmp(b.1));
+            sorted.into_iter().next().map(|(id, _, _)| id)
+        });
+
     let id = active?;
     let entry = sinks.get(&id)?;
 
@@ -438,10 +498,29 @@ fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
 /// `"Audio/Sink"`, the listener binds a `Node` proxy, subscribes to its
 /// `ParamType::Props`, and installs `info` and `param` callbacks that
 /// update the shared state. On `global_remove`, the entry is dropped.
-fn attach_registry_listener(registry: RegistryRc, state: Arc<Mutex<State>>) -> Listener {
+///
+/// The registry's `global` callback only exposes the global-level
+/// properties (`factory.id`, `client.id`, `node.name`, `media.class`).
+/// The full per-node properties (`device.icon-name`, `device.form-factor`,
+/// `node.description`, `node.nick`, …) arrive in the `Node`'s `info`
+/// callback, so the device-kind classification uses the info-time props.
+///
+/// `node_proxies` owns every bound `Node` (a listener's internal hook
+/// references the proxy, so the proxy must outlive the listener);
+/// `node_listeners` owns the listener itself. Both are move-cloned into
+/// the closure so the registry's `Fn` bound is satisfied and the
+/// resources live for the rest of the main loop.
+fn attach_registry_listener(
+    registry: RegistryRc,
+    state: Arc<Mutex<State>>,
+    node_proxies: Rc<RefCell<Vec<Node>>>,
+    node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
+) -> pipewire::registry::Listener {
     let registry_weak = registry.downgrade();
     let state_for_global = state.clone();
     let state_for_remove = state;
+    let node_proxies_for_cb = node_proxies.clone();
+    let node_listeners_for_cb = node_listeners.clone();
     registry
         .add_listener_local()
         .global(move |obj| {
@@ -466,39 +545,44 @@ fn attach_registry_listener(registry: RegistryRc, state: Arc<Mutex<State>>) -> L
             };
             let id = obj.id;
             let name = props.get("node.name").unwrap_or("?").to_string();
-            let device = device_kind_from_props(props);
 
-            // Seed the entry immediately so the tick can resolve a name and
-            // device kind even before the first `param` event lands. The
-            // `volume` field stays `None` until the Props POD is parsed.
+            // Seed the entry immediately with a placeholder device kind so
+            // the tick can resolve a name even before the first `info`
+            // event lands. The `info` listener overwrites `device` with the
+            // full classification once the per-node properties arrive.
             {
                 let mut s = state_for_global.lock().expect("volume state poisoned");
                 s.sinks.insert(
                     id,
                     SinkEntry {
                         name: name.clone(),
-                        device,
+                        device: DeviceKind::Other,
                         running: false,
                         volume: None,
                     },
                 );
             }
 
-            // Subscribe to Props so the server pushes updates, and request
-            // an initial enumeration so we do not have to wait for the
-            // first user-driven change.
-            node.subscribe_params(&[pipewire::spa::param::ParamType::Props]);
-            node.enum_params(0, Some(pipewire::spa::param::ParamType::Props), 0, 1);
-
             let state_for_info = state_for_global.clone();
             let state_for_param = state_for_global.clone();
-            let _node_listener = node
+            let node_listener = node
                 .add_listener_local()
                 .info(move |info: &NodeInfoRef| {
                     let running = is_node_running(&info.state());
+                    // The full per-node properties (device.icon-name,
+                    // device.form-factor, node.description, …) only arrive
+                    // in the info callback. Re-classify on every info
+                    // event so a wireplumber metadata update that adds an
+                    // icon (e.g. when headphones are plugged in) flips
+                    // the widget's glyph on the next tick.
+                    let device = info
+                        .props()
+                        .map(device_kind_from_props)
+                        .unwrap_or(DeviceKind::Other);
                     let mut s = state_for_info.lock().expect("volume state poisoned");
                     if let Some(entry) = s.sinks.get_mut(&id) {
                         entry.running = running;
+                        entry.device = device;
                     }
                 })
                 .param(move |_seq, _id, _index, _next, param: Option<&Pod>| {
@@ -518,6 +602,18 @@ fn attach_registry_listener(registry: RegistryRc, state: Arc<Mutex<State>>) -> L
                     }
                 })
                 .register();
+            // Both the listener and the Node it references need to outlive
+            // the closure. The subscriptions are issued on a `&Node`
+            // borrow first; then the listener is moved into the shared
+            // Vec; then the Node itself is moved into the proxy Vec so
+            // the listener's internal hook reference stays valid for the
+            // rest of the main loop.
+            node.subscribe_params(&[pipewire::spa::param::ParamType::Props]);
+            node.enum_params(0, Some(pipewire::spa::param::ParamType::Props), 0, 1);
+            node_listeners_for_cb
+                .borrow_mut()
+                .push(Box::new(node_listener));
+            node_proxies_for_cb.borrow_mut().push(node);
         })
         .global_remove(move |id| {
             let mut s = state_for_remove.lock().expect("volume state poisoned");
@@ -533,10 +629,20 @@ fn attach_registry_listener(registry: RegistryRc, state: Arc<Mutex<State>>) -> L
 /// form `{"name":"<sink-name>"}`. The listener parses it and stashes the
 /// name in the shared state, where the tick handler uses it as the fallback
 /// when no sink is currently running.
-fn attach_metadata_listener(registry: &RegistryRc, state: Arc<Mutex<State>>) -> Listener {
+///
+/// The function returns the outer registry listener; the inner
+/// per-Metadata listener is stored in the shared `node_listeners` vec
+/// (see [`attach_registry_listener`] for the lifetime rationale).
+fn attach_metadata_listener(
+    registry: &RegistryRc,
+    state: Arc<Mutex<State>>,
+    node_proxies: Rc<RefCell<Vec<pipewire::metadata::Metadata>>>,
+    node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
+) -> pipewire::registry::Listener {
     use pipewire::metadata::Metadata;
 
     let registry_weak = registry.downgrade();
+    let node_listeners_for_cb = node_listeners.clone();
     registry
         .add_listener_local()
         .global(move |obj: &GlobalObject<&DictRef>| {
@@ -551,7 +657,7 @@ fn attach_metadata_listener(registry: &RegistryRc, state: Arc<Mutex<State>>) -> 
                 Err(_) => return,
             };
             let state_for_property = state.clone();
-            let _listener = metadata
+            let md_listener = metadata
                 .add_listener_local()
                 .property(move |_subject, key, _type_, value| {
                     if key != Some(DEFAULT_AUDIO_SINK_KEY) {
@@ -566,6 +672,14 @@ fn attach_metadata_listener(registry: &RegistryRc, state: Arc<Mutex<State>>) -> 
                     0
                 })
                 .register();
+            node_listeners_for_cb
+                .borrow_mut()
+                .push(Box::new(md_listener));
+            // The Metadata proxy has to outlive the listener too, but the
+            // wireplumber "default" metadata is a single global, so leaking
+            // it would be acceptable. We keep a ref-counted pointer in a
+            // separate Vec.
+            node_proxies.borrow_mut().push(metadata);
         })
         .register()
 }
@@ -655,9 +769,41 @@ mod tests {
     #[test]
     fn icon_name_missing_or_unknown_falls_back_to_other() {
         assert_eq!(device_kind_from_icon_name(None), DeviceKind::Other);
+        // A truly unknown icon (not even an `audio-card-*` prefix) keeps
+        // the generic `Other` so the bar never shows a wrong glyph.
+        assert_eq!(
+            device_kind_from_icon_name(Some("totally-unknown-icon")),
+            DeviceKind::Other
+        );
+    }
+
+    #[test]
+    fn icon_name_audio_card_analog_maps_to_speakers() {
+        // The wireplumber default for a built-in sound card without
+        // headphones plugged in: `audio-card-analog`. It is the most
+        // common case and maps to Speakers (internal sound).
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-card-analog")),
+            DeviceKind::Speakers
+        );
         assert_eq!(
             device_kind_from_icon_name(Some("audio-card")),
-            DeviceKind::Other
+            DeviceKind::Speakers
+        );
+    }
+
+    #[test]
+    fn icon_name_audio_card_hdmi_maps_to_monitor() {
+        // HDMI / DisplayPort output of a built-in card uses the
+        // `audio-card-hdmi` / `audio-card-dp` / `audio-card-displayport`
+        // icon family and is treated as a monitor.
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-card-hdmi")),
+            DeviceKind::Monitor
+        );
+        assert_eq!(
+            device_kind_from_icon_name(Some("audio-card-dp")),
+            DeviceKind::Monitor
         );
     }
 
@@ -772,6 +918,73 @@ mod tests {
     fn parse_metadata_default_name_returns_none_for_missing_name() {
         assert_eq!(parse_metadata_default_name(r#"{"foo":"bar"}"#), None);
         assert_eq!(parse_metadata_default_name(""), None);
+    }
+
+    // ---- parse_props_pod ----
+
+    #[test]
+    fn parse_props_pod_round_trip_extracts_volume_and_mute() {
+        // Build a real `ParamType::Props` POD the same way wireplumber does,
+        // round-trip through the libspa serialize / deserialize machinery.
+        // A future bindgen / header drift that renumbers the property keys
+        // will fail this test loudly.
+        use pipewire::spa::pod::PropertyFlags;
+        use pipewire::spa::pod::serialize::{GenError, PodSerialize, PodSerializer};
+        use pipewire::spa::sys::{
+            SPA_PARAM_Props, SPA_PROP_mute, SPA_PROP_volume, SPA_TYPE_OBJECT_Props,
+        };
+        use std::io::Cursor;
+
+        struct MyProps {
+            volume: f32,
+            muted: bool,
+        }
+
+        impl PodSerialize for MyProps {
+            fn serialize<O: std::io::Write + std::io::Seek>(
+                &self,
+                serializer: PodSerializer<O>,
+            ) -> Result<pipewire::spa::pod::serialize::SerializeSuccess<O>, GenError> {
+                let mut obj_serializer =
+                    serializer.serialize_object(SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
+                obj_serializer.serialize_property(
+                    SPA_PROP_volume,
+                    &self.volume,
+                    PropertyFlags::empty(),
+                )?;
+                obj_serializer.serialize_property(
+                    SPA_PROP_mute,
+                    &self.muted,
+                    PropertyFlags::empty(),
+                )?;
+                obj_serializer.end()
+            }
+        }
+
+        // Sanity: the constants the production code uses match the values
+        // bindgen ships today. If a future libspa-sys bumps the header
+        // version, the test catches it before the producer does.
+        assert_eq!(SPA_PROP_volume, 65539, "SPA_PROP_volume drifted");
+        assert_eq!(SPA_PROP_mute, 65540, "SPA_PROP_mute drifted");
+
+        let props = MyProps {
+            volume: 0.42,
+            muted: true,
+        };
+        let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &props)
+            .unwrap()
+            .0
+            .into_inner();
+        let parsed = parse_props_pod(&bytes);
+        assert_eq!(parsed, Some((0.42, true)));
+    }
+
+    #[test]
+    fn parse_props_pod_returns_none_for_garbage() {
+        // Anything that does not parse as a `ParamType::Props` object is
+        // skipped — a transient type drift never takes the source down.
+        assert_eq!(parse_props_pod(&[]), None);
+        assert_eq!(parse_props_pod(&[0xff; 16]), None);
     }
 
     // ---- compute_snapshot ----
