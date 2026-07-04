@@ -25,13 +25,19 @@ margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
 # "workspaces", "clock", "battery", "system", "network", "title", "tray",
-# "bluetooth". A widget named in two zones is built once, keeping its first
-# mention. "tray" shows StatusNotifierItem system-tray icons and is opt-in —
-# add it to a zone to enable it, e.g. modules-right = ["tray", "battery",
-# "system", "network"]. "title" shows the focused Hyprland window's title and
-# is the default center module. "bluetooth" reads BlueZ over DBus and is also
-# opt-in — add it to a zone to show the local adapter state and connected
-# device count; without an adapter it shows "unavailable".
+# "bluetooth", "volume". A widget named in two zones is built once, keeping
+# its first mention. "tray" shows StatusNotifierItem system-tray icons and
+# is opt-in — add it to a zone to enable it, e.g. modules-right = ["tray",
+# "battery", "system", "network"]. "title" shows the focused Hyprland
+# window's title and is the default center module. "bluetooth" reads BlueZ
+# over DBus and is also opt-in — add it to a zone to show the local adapter
+# state and connected device count; without an adapter it shows
+# "unavailable". "volume" reads the active output sink's level / mute state
+# over the native PipeWire wire protocol (requires a running PipeWire server
+# and the system's `libpipewire`); without a sink the widget reserves no
+# slot. The label is just `Vol N%` (or `Mute`), and the glyph swaps between
+# headphones / speakers / monitor / phone / TV based on the active sink's
+# device kind.
 modules-left   = ["workspaces"]
 modules-center = ["title"]
 modules-right  = ["clock", "battery", "system", "network"]
@@ -92,15 +98,18 @@ size = 16.0
 # "off", "2 connected", or "unavailable" when no adapter is present.
 #
 # The `on-click` field is accepted on every [widget.<name>] table (the same
-# config field across all widgets), but **only the bluetooth widget honors it
-# today** — other widgets accept the field and ignore it. When set on
-# [widget.bluetooth], a click inside the widget spawns the executable
-# directly (no shell); the typical use is to launch a Bluetooth manager
-# like blueman-manager. The path may use a leading "~" for the user's home.
+# config field across all widgets), but **only the bluetooth and volume
+# widgets honor it today** — other widgets accept the field and ignore it.
+# When set on [widget.bluetooth] or [widget.volume], a click inside the
+# widget spawns the executable directly (no shell); the typical use is to
+# launch a Bluetooth manager like blueman-manager, or a volume manager like
+# pavucontrol. The path may use a leading "~" for the user's home.
 # [bar]
-# modules-right = ["bluetooth", "network"]
+# modules-right = ["bluetooth", "volume", "network"]
 # [widget.bluetooth]
 # on-click = "~/.config/hypr/scripts/bluetooth.sh"
+# [widget.volume]
+# on-click = "/usr/bin/pavucontrol"
 
 # Per-monitor overrides. tablero shows one bar per connected output; by default
 # every output uses the global settings above. Add a [[monitor]] block to tweak a
@@ -128,6 +137,8 @@ size = 16.0
 # background = "#2e3440"        # give the title a pill on this output only
 # [monitor.widget.bluetooth]
 # on-click = "/per-monitor/bluetooth-launcher.sh"  # different launcher per output
+# [monitor.widget.volume]
+# on-click = "/per-monitor/pavucontrol"             # different volume manager per output
 #
 # [[monitor]]
 # name = "eDP-1"                # the laptop panel: just a shorter bar, nothing else

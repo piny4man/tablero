@@ -67,6 +67,16 @@ RUST_LOG=info cargo run -p tablero
     `on-click` config field — when set, a left-click inside the widget spawns
     that executable directly (no shell), so a typical use is `on-click =
     "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
+  - **Volume** — the active output sink's level (`Vol N%`) and mute state
+    (`Mute`), read over the native PipeWire wire protocol. The glyph swaps
+    between headphones / speakers / monitor / phone / TV based on the
+    active sink's device kind, so the user can tell at a glance which
+    output the level they see is on. **Opt-in**: not in the default set;
+    add `"volume"` to a zone to enable it. The widget reserves no slot
+    when no PipeWire server is reachable (or no output sink exists),
+    matching how the `network` and `system` widgets treat an absent
+    source. The `on-click` field wires a click to a launcher (e.g.
+    `on-click = "/usr/bin/pavucontrol"`).
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -79,7 +89,10 @@ RUST_LOG=info cargo run -p tablero
 - Pulls live data from **async producers** (Hyprland IPC, UPower, procfs,
   NetworkManager over DBus) running on an off-thread Tokio runtime; they reach
   the synchronous render loop only by sending messages through a `calloop`
-  channel.
+  channel. The PipeWire volume source is the one exception: it runs on a
+  dedicated OS thread (PipeWire's `MainLoop` is synchronous and
+  file-descriptor-driven, unlike zbus), and reaches the Tokio runtime the
+  same way — by sending `Msg::Volume`s through the cross-thread `MsgSender`.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
@@ -145,7 +158,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray) and `"bluetooth"` (opt-in BlueZ-backed adapter indicator). |
+| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), and `"volume"` (opt-in PipeWire-backed output volume). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -155,9 +168,10 @@ size = 16.0
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget
 spawns the file directly (no shell) — typical use is
-`[widget.bluetooth] on-click = "/path/to/blueman-manager"`. The path may use
+`[widget.bluetooth] on-click = "/path/to/blueman-manager"` or
+`[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
 a leading `~` for the user's home, expanded at click time. Today only the
-bluetooth widget honors the field; other widgets ignore it.
+bluetooth and volume widgets honor the field; other widgets ignore it.
 
 ### Per-monitor overrides
 
@@ -323,3 +337,31 @@ surface placement and input need a live compositor. To verify on Hyprland:
       (no shell, direct exec). The script must be marked executable; a
       missing or non-executable path is logged as an error and does not
       crash the bar.
+ 15. Verify the **volume widget** (opt-in: add `"volume"` to a zone). With
+     a running PipeWire server (pipewire + wireplumber / pipewire-pulse)
+     and at least one output sink configured:
+     - The widget appears with a device-kind glyph (headphones, speakers,
+       monitor, …) and a label of `Vol N%` (where `N` is the active sink's
+       level). On a system with PipeWire but no output sink configured,
+       the widget reserves no slot (matching the `network` / `system`
+       pattern); on a system with no PipeWire running, the widget also
+       reserves no slot.
+     - Change the volume with `pactl set-sink-volume @DEFAULT_SINK@ 50%`
+       (or `wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.5`) and confirm the
+       label updates by the next poll (the producer re-emits every two
+       seconds when the cached state changes). The widget should track
+       per-cent: `12%`, `13%`, …
+     - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
+       the label flips to `Mute` with the volume-mute glyph; toggling
+       mute back restores `Vol N%` with the device glyph.
+     - With multiple sinks configured (e.g. headphones + monitor speakers),
+       play audio through one and confirm the widget tracks *that* sink
+       (active sink has its `NodeState` set to `Running`); switching
+       playback to a different sink updates the widget to that sink
+       within a poll, and the glyph follows the device kind (e.g.
+       headphones → speakers).
+     - If a `[widget.volume] on-click = "/path/to/executable"` is set
+       (typical: `pavucontrol`), left-click the widget and confirm the
+       configured process is spawned (no shell, direct exec). A missing
+       or non-executable path is logged as an error and does not crash
+       the bar.
