@@ -13,7 +13,7 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use tablero_core::render::Bounds;
-use tablero_core::widget::{Dashboard, DeviceKind, Msg, Volume, VolumeWidget, Widget};
+use tablero_core::widget::{ClickButton, Dashboard, DeviceKind, Msg, Volume, VolumeWidget, Widget};
 use tablero_wayland::producer::{ProducerBridge, from_fn};
 
 /// Stands in for the bar: owns a volume widget and records what it rendered.
@@ -227,7 +227,7 @@ fn a_run_program_command_actually_spawns_the_program() {
     std::fs::set_permissions(&script, perms).expect("chmod");
 
     let widget = VolumeWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(script.clone()));
-    let Some(Command::RunProgram(path)) = widget.on_click(10, 10) else {
+    let Some(Command::RunProgram(path)) = widget.on_click(10, 10, ClickButton::Left) else {
         panic!("widget should emit a RunProgram command");
     };
     assert_eq!(path, PathBuf::from(&script));

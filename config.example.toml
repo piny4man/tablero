@@ -25,19 +25,23 @@ margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
 # "workspaces", "clock", "battery", "system", "network", "title", "tray",
-# "bluetooth", "volume". A widget named in two zones is built once, keeping
-# its first mention. "tray" shows StatusNotifierItem system-tray icons and
-# is opt-in — add it to a zone to enable it, e.g. modules-right = ["tray",
-# "battery", "system", "network"]. "title" shows the focused Hyprland
-# window's title and is the default center module. "bluetooth" reads BlueZ
-# over DBus and is also opt-in — add it to a zone to show the local adapter
-# state and connected device count; without an adapter it shows
-# "unavailable". "volume" reads the active output sink's level / mute state
-# over the native PipeWire wire protocol (requires a running PipeWire server
-# and the system's `libpipewire`); without a sink the widget reserves no
-# slot. The label is just `Vol N%` (or `Mute`), and the glyph swaps between
-# headphones / speakers / monitor / phone / TV based on the active sink's
-# device kind.
+# "bluetooth", "volume", "notifications". A widget named in two zones is
+# built once, keeping its first mention. "tray" shows StatusNotifierItem
+# system-tray icons and is opt-in — add it to a zone to enable it, e.g.
+# modules-right = ["tray", "battery", "system", "network"]. "title" shows
+# the focused Hyprland window's title and is the default center module.
+# "bluetooth" reads BlueZ over DBus and is also opt-in — add it to a zone to
+# show the local adapter state and connected device count; without an
+# adapter it shows "unavailable". "volume" reads the active output sink's
+# level / mute state over the native PipeWire wire protocol (requires a
+# running PipeWire server and the system's `libpipewire`); without a sink
+# the widget reserves no slot. The label is just `Vol N%` (or `Mute`), and
+# the glyph swaps between headphones / speakers / monitor / phone / TV based
+# on the active sink's device kind. "notifications" follows swaync
+# (SwayNotificationCenter) over DBus and is opt-in: a bell glyph with a
+# small dot while notifications are pending, slashed and dimmed under
+# Do-Not-Disturb; left-click toggles the swaync panel, right-click toggles
+# DND. While swaync is not running the widget reserves no slot.
 modules-left   = ["workspaces"]
 modules-center = ["title"]
 modules-right  = ["clock", "battery", "system", "network"]
@@ -92,6 +96,10 @@ size = 16.0
 #
 # [widget.tray.attention]
 # background     = "#bf616aff"  # pill behind a tray item requesting attention
+#
+# The notifications widget's pending dot uses its attention background:
+# [widget.notifications.attention]
+# background     = "#bf616aff"  # the dot shown while notifications are pending
 #
 # The bluetooth widget (opt-in: name it in a zone to enable) reads BlueZ and
 # shows the local adapter state plus connected-device count: e.g. "on",

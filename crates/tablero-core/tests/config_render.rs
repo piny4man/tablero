@@ -8,7 +8,7 @@
 
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{Command, Dashboard, Msg, Workspaces};
+use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, Workspaces};
 
 /// Build the dashboard a TOML document describes over a 200x32 surface, seed it
 /// with a one-workspace snapshot, then lay it out.
@@ -40,8 +40,11 @@ fn zone_placement_packs_widgets_to_their_configured_edges() {
         modules-right = ["clock"]
         "#,
     );
-    assert_eq!(left.on_click(10, 16), Some(Command::SwitchWorkspace(1)));
-    assert_eq!(left.on_click(100, 16), None);
+    assert_eq!(
+        left.on_click(10, 16, ClickButton::Left),
+        Some(Command::SwitchWorkspace(1))
+    );
+    assert_eq!(left.on_click(100, 16, ClickButton::Left), None);
 
     // Moving workspaces to the right edge moves its clickable cell with it: the
     // single cell packs flush against the far edge at [168, 200).
@@ -53,8 +56,11 @@ fn zone_placement_packs_widgets_to_their_configured_edges() {
         modules-right = ["workspaces"]
         "#,
     );
-    assert_eq!(right.on_click(180, 16), Some(Command::SwitchWorkspace(1)));
-    assert_eq!(right.on_click(10, 16), None);
+    assert_eq!(
+        right.on_click(180, 16, ClickButton::Left),
+        Some(Command::SwitchWorkspace(1))
+    );
+    assert_eq!(right.on_click(10, 16, ClickButton::Left), None);
 }
 
 #[test]
@@ -69,7 +75,10 @@ fn a_single_widget_builds_just_that_widget() {
         modules-right = []
         "#,
     );
-    assert_eq!(dash.on_click(0, 0), Some(Command::SwitchWorkspace(1)));
+    assert_eq!(
+        dash.on_click(0, 0, ClickButton::Left),
+        Some(Command::SwitchWorkspace(1))
+    );
 }
 
 #[test]

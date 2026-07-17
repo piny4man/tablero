@@ -13,7 +13,9 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use tablero_core::render::Bounds;
-use tablero_core::widget::{Bluetooth, BluetoothState, BluetoothWidget, Dashboard, Msg, Widget};
+use tablero_core::widget::{
+    Bluetooth, BluetoothState, BluetoothWidget, ClickButton, Dashboard, Msg, Widget,
+};
 use tablero_wayland::bluetooth::bluetooth_from_bluez;
 use tablero_wayland::producer::{ProducerBridge, from_fn};
 
@@ -199,12 +201,12 @@ fn a_configured_on_click_emits_a_run_program_command() {
     use tablero_core::widget::Command;
 
     let no_click = BluetoothWidget::new(Bounds::new(0, 0, 200, 32));
-    assert_eq!(no_click.on_click(10, 10), None);
+    assert_eq!(no_click.on_click(10, 10, ClickButton::Left), None);
 
     let clicked = BluetoothWidget::new(Bounds::new(0, 0, 200, 32))
         .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
     assert_eq!(
-        clicked.on_click(10, 10),
+        clicked.on_click(10, 10, ClickButton::Left),
         Some(Command::RunProgram(PathBuf::from(
             "/usr/bin/blueman-manager"
         )))
@@ -214,8 +216,8 @@ fn a_configured_on_click_emits_a_run_program_command() {
     // (260, 10) is past the right edge.
     let far_clicked = BluetoothWidget::new(Bounds::new(50, 10, 200, 32))
         .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
-    assert_eq!(far_clicked.on_click(0, 0), None);
-    assert_eq!(far_clicked.on_click(260, 10), None);
+    assert_eq!(far_clicked.on_click(0, 0, ClickButton::Left), None);
+    assert_eq!(far_clicked.on_click(260, 10, ClickButton::Left), None);
 }
 
 #[test]
@@ -241,7 +243,7 @@ fn a_run_program_command_actually_spawns_the_program() {
 
     let widget =
         BluetoothWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(script.clone()));
-    let Some(Command::RunProgram(path)) = widget.on_click(10, 10) else {
+    let Some(Command::RunProgram(path)) = widget.on_click(10, 10, ClickButton::Left) else {
         panic!("widget should emit a RunProgram command");
     };
     assert_eq!(path, PathBuf::from(&script));

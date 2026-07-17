@@ -215,7 +215,11 @@ impl Widget for BluetoothWidget {
         self.bounds = bounds;
     }
 
-    fn on_click(&self, px: u32, py: u32) -> Option<super::Command> {
+    fn on_click(&self, px: u32, py: u32, button: super::ClickButton) -> Option<super::Command> {
+        // Single-action widget: only the primary button launches the manager.
+        if button != super::ClickButton::Left {
+            return None;
+        }
         // Only interactive when an on-click path was configured at build time;
         // otherwise the default (None) is correct.
         let path = self.on_click.as_ref()?;
@@ -230,6 +234,7 @@ impl Widget for BluetoothWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ClickButton;
     use chrono::{Local, TimeZone};
 
     fn bt(state: BluetoothState, count: u32) -> Msg {
@@ -366,7 +371,7 @@ mod tests {
     #[test]
     fn without_on_click_a_click_is_a_no_op() {
         let widget = BluetoothWidget::new(Bounds::new(0, 0, 200, 32));
-        assert_eq!(widget.on_click(10, 10), None);
+        assert_eq!(widget.on_click(10, 10, ClickButton::Left), None);
     }
 
     #[test]
@@ -374,7 +379,7 @@ mod tests {
         let widget = BluetoothWidget::new(Bounds::new(0, 0, 200, 32))
             .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
         assert_eq!(
-            widget.on_click(10, 10),
+            widget.on_click(10, 10, ClickButton::Left),
             Some(super::super::Command::RunProgram(PathBuf::from(
                 "/usr/bin/blueman-manager"
             )))
@@ -386,10 +391,10 @@ mod tests {
         let widget = BluetoothWidget::new(Bounds::new(10, 0, 200, 32))
             .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
         // x=0 is left of bounds.x=10; click is outside the pill.
-        assert_eq!(widget.on_click(0, 10), None);
+        assert_eq!(widget.on_click(0, 10, ClickButton::Left), None);
         // x=210 is at/past the right edge (x + width = 210), outside.
-        assert_eq!(widget.on_click(210, 10), None);
+        assert_eq!(widget.on_click(210, 10, ClickButton::Left), None);
         // y=32 is at the bottom edge (height = 32 → y range [0, 32)), outside.
-        assert_eq!(widget.on_click(50, 32), None);
+        assert_eq!(widget.on_click(50, 32, ClickButton::Left), None);
     }
 }

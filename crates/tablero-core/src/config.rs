@@ -68,8 +68,8 @@ use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
     BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget,
-    StateColors, SystemWidget, TitleWidget, TrayWidget, VolumeWidget, Widget, WidgetStyle,
-    WorkspaceWidget,
+    NotificationsWidget, StateColors, SystemWidget, TitleWidget, TrayWidget, VolumeWidget, Widget,
+    WidgetStyle, WorkspaceWidget,
 };
 
 /// Default bar height in pixels.
@@ -227,6 +227,8 @@ pub enum WidgetKind {
     /// The active PipeWire output sink's volume / mute state (opt-in: not in
     /// the default zones).
     Volume,
+    /// The swaync notification indicator (opt-in: not in the default zones).
+    Notifications,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -438,6 +440,8 @@ pub struct WidgetStyles {
     pub bluetooth: WidgetStyleConfig,
     /// Style for the volume widget.
     pub volume: WidgetStyleConfig,
+    /// Style for the notifications widget.
+    pub notifications: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -453,6 +457,7 @@ impl WidgetStyles {
             WidgetKind::Title => &self.title,
             WidgetKind::Bluetooth => &self.bluetooth,
             WidgetKind::Volume => &self.volume,
+            WidgetKind::Notifications => &self.notifications,
         }
     }
 
@@ -468,6 +473,7 @@ impl WidgetStyles {
         self.title.apply(&mut base.title);
         self.bluetooth.apply(&mut base.bluetooth);
         self.volume.apply(&mut base.volume);
+        self.notifications.apply(&mut base.notifications);
     }
 }
 
@@ -895,6 +901,11 @@ impl WidgetKind {
                     .with_style(style)
                     .with_on_click(on_click),
             ),
+            // Clicks are typed swaync commands, not a spawned program, so the
+            // per-widget `on-click` path does not apply here.
+            WidgetKind::Notifications => {
+                Box::new(NotificationsWidget::new(bounds).with_style(style))
+            }
         }
     }
 }
@@ -1038,6 +1049,7 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ClickButton;
 
     #[test]
     fn default_is_the_documented_baseline() {
@@ -1299,7 +1311,7 @@ mod tests {
             None,
             config.widget.bluetooth.on_click.clone(),
         );
-        let click = widget.on_click(10, 10);
+        let click = widget.on_click(10, 10, ClickButton::Left);
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
@@ -1318,7 +1330,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(widget.on_click(10, 10), None);
+        assert_eq!(widget.on_click(10, 10, ClickButton::Left), None);
     }
 
     #[test]
@@ -1398,7 +1410,7 @@ mod tests {
             None,
             config.widget.volume.on_click.clone(),
         );
-        let click = widget.on_click(10, 10);
+        let click = widget.on_click(10, 10, ClickButton::Left);
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
@@ -1417,7 +1429,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(widget.on_click(10, 10), None);
+        assert_eq!(widget.on_click(10, 10, ClickButton::Left), None);
     }
 
     #[test]
@@ -1453,6 +1465,74 @@ mod tests {
         assert_eq!(
             other.widget.volume.on_click.as_deref(),
             Some(std::path::Path::new("/global/launcher.sh"))
+        );
+    }
+
+    #[test]
+    fn notifications_is_an_opt_in_widget_name_and_builds() {
+        // The notifications widget is not in any default zone, but naming it
+        // in one is valid and builds — matching the volume / bluetooth
+        // pattern. Its clicks are typed swaync commands, so before its first
+        // reading (daemon absent) it stays display-only.
+        let bar = Bar::default();
+        let in_default_zones = bar
+            .modules_left
+            .iter()
+            .chain(&bar.modules_center)
+            .chain(&bar.modules_right)
+            .any(|&kind| kind == WidgetKind::Notifications);
+        assert!(!in_default_zones);
+
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["notifications", "clock"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.bar.modules_right,
+            vec![WidgetKind::Notifications, WidgetKind::Clock]
+        );
+
+        let widget = WidgetKind::Notifications.build(
+            Bounds::new(0, 0, 64, 32),
+            WidgetStyle::default(),
+            None,
+            None,
+        );
+        assert_eq!(widget.on_click(10, 10, ClickButton::Left), None);
+    }
+
+    #[test]
+    fn notifications_style_table_resolves_and_folds_per_monitor() {
+        // A [widget.notifications] table is accepted and per-monitor overrides
+        // fold onto it field-by-field — including the attention colors that
+        // drive the pending-notification dot.
+        let config = Config::from_toml_str(
+            r##"
+            [widget.notifications]
+            foreground = "#111111"
+            [widget.notifications.attention]
+            background = "#ff0000"
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.notifications]
+            foreground = "#222222"
+            "##,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_for_output(Some("DP-1"));
+        let notifications = &resolved.widget.notifications;
+        // The per-monitor foreground wins...
+        assert_eq!(notifications.foreground, Some(Color::rgb(0x22, 0x22, 0x22)));
+        // ...while the untouched attention background is inherited from the
+        // global table, not reset.
+        assert_eq!(
+            notifications.attention.background,
+            Some(Color::rgb(0xFF, 0x00, 0x00))
         );
     }
 

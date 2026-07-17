@@ -25,6 +25,7 @@ pub mod battery;
 pub mod bluetooth;
 pub mod clock;
 pub mod network;
+pub mod notifications;
 pub mod system;
 pub mod title;
 pub mod tray;
@@ -35,6 +36,7 @@ pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
 pub use network::{Network, NetworkState, NetworkWidget};
+pub use notifications::{Notifications, NotificationsWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
 pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
@@ -110,6 +112,12 @@ pub enum Msg {
     /// shows nothing — matching how the `network` and `system` widgets treat
     /// an absent source.
     Volume(Option<Volume>),
+    /// The notification daemon's (swaync) visible state changed: pending count
+    /// and Do-Not-Disturb.
+    ///
+    /// `None` means swaync is not on the session bus, so the widget shows
+    /// nothing — the same absent-source convention as [`Msg::Volume`].
+    Notifications(Option<Notifications>),
 }
 
 impl Msg {
@@ -143,6 +151,27 @@ pub enum Command {
     /// manager launcher). The host executor resolves a leading `~` to the
     /// user's home before spawning.
     RunProgram(PathBuf),
+    /// Toggle the notification daemon's control-center panel (swaync
+    /// `ToggleVisibility` — the notifications widget's primary click).
+    ToggleNotificationPanel,
+    /// Toggle the notification daemon's Do-Not-Disturb mode (swaync
+    /// `ToggleDnd` — the notifications widget's secondary click).
+    ToggleNotificationsDnd,
+}
+
+/// Which pointer button produced a click, normalized from the compositor's
+/// input codes at the platform boundary.
+///
+/// Widgets branch on this to offer distinct primary/secondary actions (e.g.
+/// the notifications widget toggles the panel on `Left` and Do-Not-Disturb on
+/// `Right`). Buttons the bar does not handle are filtered out before reaching
+/// the widgets, so no `Other` variant is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickButton {
+    /// The primary (left) pointer button.
+    Left,
+    /// The secondary (right) pointer button.
+    Right,
 }
 
 /// How a widget chooses the glyph it draws before its label.
@@ -364,13 +393,14 @@ pub trait Widget {
     /// Reposition the widget into a new layout slot.
     fn set_bounds(&mut self, bounds: Bounds);
 
-    /// Handle a click at surface pixel `(px, py)`.
+    /// Handle a `button` click at surface pixel `(px, py)`.
     ///
     /// Returns a [`Command`] when the widget owns an interactive region at that
     /// pixel, or `None` when it does not. The default is non-interactive, so a
     /// widget opts into input only by overriding this — clicks on display-only
-    /// widgets (and on empty space) are ignored safely.
-    fn on_click(&self, _px: u32, _py: u32) -> Option<Command> {
+    /// widgets (and on empty space) are ignored safely. Widgets with a single
+    /// action should answer only [`ClickButton::Left`] and ignore the rest.
+    fn on_click(&self, _px: u32, _py: u32, _button: ClickButton) -> Option<Command> {
         None
     }
 }
@@ -524,18 +554,18 @@ impl Dashboard {
         }
     }
 
-    /// Route a click at surface pixel `(px, py)` to the widgets.
+    /// Route a `button` click at surface pixel `(px, py)` to the widgets.
     ///
     /// Returns the [`Command`] of the first widget (in zone then draw order) that
     /// claims the pixel, or `None` if none do — clicks on empty space or
     /// display-only widgets produce nothing. Zones never overlap after
     /// [`layout`](Dashboard::layout), so order only breaks ties on empty space.
-    pub fn on_click(&self, px: u32, py: u32) -> Option<Command> {
+    pub fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
         self.left
             .iter()
             .chain(&self.center)
             .chain(&self.right)
-            .find_map(|widget| widget.on_click(px, py))
+            .find_map(|widget| widget.on_click(px, py, button))
     }
 }
 
@@ -693,14 +723,32 @@ mod tests {
         let mut ctx = RenderContext::new(200, 32);
         dash.layout(&mut ctx, 200, 32);
         // The right workspace cell owns [168, 200).
-        assert_eq!(dash.on_click(180, 16), Some(Command::SwitchWorkspace(1)));
-        assert_eq!(dash.on_click(100, 16), None);
+        assert_eq!(
+            dash.on_click(180, 16, ClickButton::Left),
+            Some(Command::SwitchWorkspace(1))
+        );
+        assert_eq!(dash.on_click(100, 16, ClickButton::Left), None);
+    }
+
+    #[test]
+    fn on_click_threads_the_button_through_to_the_widget() {
+        // The workspace widget only answers the primary button, so the same
+        // pixel that switches on a left click stays inert on a right click —
+        // proving the dashboard hands the button through unchanged.
+        let mut dash = Dashboard::with_zones(vec![], vec![], vec![one_workspace(1)]);
+        let mut ctx = RenderContext::new(200, 32);
+        dash.layout(&mut ctx, 200, 32);
+        assert_eq!(
+            dash.on_click(180, 16, ClickButton::Left),
+            Some(Command::SwitchWorkspace(1))
+        );
+        assert_eq!(dash.on_click(180, 16, ClickButton::Right), None);
     }
 
     #[test]
     fn on_click_on_empty_dashboard_is_none() {
         let dash = Dashboard::new(vec![]);
-        assert_eq!(dash.on_click(0, 0), None);
+        assert_eq!(dash.on_click(0, 0, ClickButton::Left), None);
     }
 
     #[test]

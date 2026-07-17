@@ -392,7 +392,11 @@ impl Widget for TrayWidget {
         self.bounds = bounds;
     }
 
-    fn on_click(&self, px: u32, py: u32) -> Option<Command> {
+    fn on_click(&self, px: u32, py: u32, button: super::ClickButton) -> Option<Command> {
+        // Only the primary button activates an item (SNI `Activate`).
+        if button != super::ClickButton::Left {
+            return None;
+        }
         self.item_cells()
             .into_iter()
             .find(|(_, cell)| cell.contains(px, py))
@@ -403,6 +407,7 @@ impl Widget for TrayWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ClickButton;
     use std::io::Cursor;
 
     /// A solid-color RGBA PNG of the given size, for icon-decode tests.
@@ -556,7 +561,7 @@ mod tests {
     #[test]
     fn empty_tray_before_any_message_takes_no_clicks() {
         let widget = TrayWidget::new(Bounds::new(0, 0, 320, 32));
-        assert_eq!(widget.on_click(0, 0), None);
+        assert_eq!(widget.on_click(0, 0, ClickButton::Left), None);
     }
 
     #[test]
@@ -569,15 +574,15 @@ mod tests {
         // Square cells of side 32 packed from the origin: :1.1 -> [0,32),
         // :1.2 -> [32,64).
         assert_eq!(
-            widget.on_click(10, 16),
+            widget.on_click(10, 16, ClickButton::Left),
             Some(Command::ActivateTrayItem(":1.1".to_string()))
         );
         assert_eq!(
-            widget.on_click(40, 16),
+            widget.on_click(40, 16, ClickButton::Left),
             Some(Command::ActivateTrayItem(":1.2".to_string()))
         );
         // Past the last cell is empty space.
-        assert_eq!(widget.on_click(100, 16), None);
+        assert_eq!(widget.on_click(100, 16, ClickButton::Left), None);
     }
 
     #[test]
@@ -593,7 +598,7 @@ mod tests {
         // the bar can reach it.
         for x in [0, 16, 31] {
             assert_eq!(
-                widget.on_click(x, 16),
+                widget.on_click(x, 16, ClickButton::Left),
                 Some(Command::ActivateTrayItem(":1.1".to_string()))
             );
         }
