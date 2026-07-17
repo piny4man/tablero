@@ -14,7 +14,7 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{Command, Dashboard, Msg, TrayItem, TrayState, TrayWidget};
+use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, TrayItem, TrayState, TrayWidget};
 use tablero_wayland::producer::{ProducerBridge, from_fn};
 use tablero_wayland::sni::tray_item_from_props;
 
@@ -188,13 +188,13 @@ fn clicking_a_tray_item_activates_it_by_address() {
     // Square cells of side 32 packed from the origin: address-sorted, :1.1 owns
     // [0,32) and :1.2 owns [32,64).
     assert_eq!(
-        dashboard.on_click(16, 16),
+        dashboard.on_click(16, 16, ClickButton::Left),
         Some(Command::ActivateTrayItem(":1.1".to_string()))
     );
     assert_eq!(
-        dashboard.on_click(48, 16),
+        dashboard.on_click(48, 16, ClickButton::Left),
         Some(Command::ActivateTrayItem(":1.2".to_string()))
     );
     // Empty space past the items activates nothing.
-    assert_eq!(dashboard.on_click(200, 16), None);
+    assert_eq!(dashboard.on_click(200, 16, ClickButton::Left), None);
 }

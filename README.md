@@ -77,6 +77,14 @@ RUST_LOG=info cargo run -p tablero
     matching how the `network` and `system` widgets treat an absent
     source. The `on-click` field wires a click to a launcher (e.g.
     `on-click = "/usr/bin/pavucontrol"`).
+  - **Notifications** — a bell indicator for swaync (SwayNotificationCenter),
+    followed natively over DBus (no `swaync-client` subprocess). A small dot
+    in the bell's corner while notifications are pending; slashed and dimmed
+    under Do-Not-Disturb. **Left-click toggles the swaync panel, right-click
+    toggles DND.** **Opt-in**: not in the default set; add `"notifications"`
+    to a zone to enable it. Requires swaync running as the notification
+    daemon; while it is not on the bus the widget reserves no slot, and it
+    reappears automatically when swaync (re)starts.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -134,10 +142,12 @@ spacing = 0
 padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "title",
-# "clock", "battery", "system", "network", "tray", "bluetooth". "tray" and
-# "bluetooth" are opt-in (not in the default set above) — add them to enable
-# the system tray and the Bluetooth adapter indicator respectively. Repeats
-# are de-duplicated, keeping first position.
+# "clock", "battery", "system", "network", "tray", "bluetooth", "volume",
+# "notifications". "tray", "bluetooth", "volume", and "notifications" are
+# opt-in (not in the default set above) — add them to enable the system tray,
+# the Bluetooth adapter indicator, the output volume, and the swaync
+# notification indicator respectively. Repeats are de-duplicated, keeping
+# first position.
 widgets = ["workspaces", "title", "clock", "battery", "system", "network"]
 
 [theme]
@@ -158,7 +168,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), and `"volume"` (opt-in PipeWire-backed output volume). |
+| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), `"volume"` (opt-in PipeWire-backed output volume), and `"notifications"` (opt-in swaync-backed notification indicator). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -365,3 +375,25 @@ surface placement and input need a live compositor. To verify on Hyprland:
        configured process is spawned (no shell, direct exec). A missing
        or non-executable path is logged as an error and does not crash
        the bar.
+ 16. Verify the **notifications widget** (opt-in: add `"notifications"` to a
+     zone). With swaync running as the session's notification daemon:
+     - The widget appears as a bell glyph with no dot. With swaync not
+       running, the widget reserves no slot.
+     - Send `notify-send test`; swaync shows its popup and a small dot
+       appears in the bell's upper-right corner. Clearing the notification
+       (from the popup or the panel) removes the dot.
+     - Left-click the bell and confirm the swaync control-center panel
+       toggles open/closed.
+     - Right-click the bell and confirm Do-Not-Disturb toggles: the bell
+       swaps to the slashed glyph and dims; right-clicking again restores
+       it. The DND state stays in sync when toggled from inside the swaync
+       panel instead.
+     - Restart resilience: stopping swaync removes the widget from the bar;
+       starting it again brings it back with the current state, without
+       restarting tablero. Note that swaync is usually DBus-activatable, so
+       on most setups `pkill swaync` resurrects it near-instantly (any bus
+       call to its name starts it again) — `systemctl --user mask swaync`
+       first (and `unmask` after) to observe the widget-hidden state.
+       tablero itself never triggers that activation: its presence probe is
+       sent with the `NO_AUTO_START` flag, so it observes the daemon rather
+       than restarting one the user stopped.

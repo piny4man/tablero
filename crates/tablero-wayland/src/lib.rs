@@ -18,6 +18,7 @@ pub mod bluetooth;
 pub mod command;
 pub mod hyprland;
 pub mod networkmanager;
+pub mod notifications;
 pub mod outputs;
 pub mod producer;
 pub mod sni;
@@ -42,7 +43,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
-        pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{BTN_LEFT, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
         WaylandSurface,
@@ -58,12 +59,13 @@ use tablero_core::clock::millis_until_next_minute;
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::scale::Scale;
-use tablero_core::widget::{Command, Dashboard, Msg};
+use tablero_core::widget::{ClickButton, Command, Dashboard, Msg};
 
 use crate::bluetooth::BluetoothProducer;
 use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
+use crate::notifications::NotificationsProducer;
 use crate::outputs::{OutputId, Outputs};
 use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
@@ -215,11 +217,11 @@ impl Surface {
         self.draw(pool);
     }
 
-    /// Resolve a left-button press at surface coordinates `(x, y)` to a
+    /// Resolve a `button` press at surface coordinates `(x, y)` to a
     /// [`Command`], if any. Pure: the caller fans the command out to the
     /// executors. Clicks that hit no interactive region — empty space,
     /// display-only widgets, or off-surface negative coordinates — yield `None`.
-    fn on_click(&self, x: f64, y: f64) -> Option<Command> {
+    fn on_click(&self, x: f64, y: f64, button: ClickButton) -> Option<Command> {
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -228,7 +230,8 @@ impl Surface {
         // factor before the half-open hit-test — the one conversion that keeps
         // input and layout in the same space.
         let s = self.scale.get() as f64;
-        self.dashboard.on_click((x * s) as u32, (y * s) as u32)
+        self.dashboard
+            .on_click((x * s) as u32, (y * s) as u32, button)
     }
 
     /// Adopt the compositor's configure, seeding and drawing the first frame.
@@ -399,13 +402,14 @@ fn output_key(output: &wl_output::WlOutput) -> OutputId {
 /// `config` (see [`tablero_core::config::Config`]). Wires the default producer
 /// set — the Hyprland workspace source, the UPower battery source, the procfs
 /// system-stats source, the NetworkManager connectivity source, the BlueZ
-/// bluetooth source, the native PipeWire volume source, and the
-/// StatusNotifierItem tray host — so the bar shows live workspaces, battery,
-/// CPU/memory load, network state, Bluetooth adapter state, the active
-/// output sink's volume, and tray icons alongside the clock. The bluetooth,
-/// volume, and tray producers run even when their widgets are not in any
-/// zone; the widget only appears when the user adds `"bluetooth"`, `"volume"`,
-/// or `"tray"` to a zone. The volume source runs on a dedicated OS thread —
+/// bluetooth source, the native PipeWire volume source, the
+/// StatusNotifierItem tray host, and the swaync notification source — so the
+/// bar shows live workspaces, battery, CPU/memory load, network state,
+/// Bluetooth adapter state, the active output sink's volume, tray icons, and
+/// the notification indicator alongside the clock. The bluetooth, volume,
+/// tray, and notifications producers run even when their widgets are not in
+/// any zone; the widget only appears when the user adds `"bluetooth"`,
+/// `"volume"`, `"tray"`, or `"notifications"` to a zone. The volume source runs on a dedicated OS thread —
 /// PipeWire's main loop is synchronous, unlike the other producers' zbus
 /// backends. The clock itself is still driven by the synchronous tick timer;
 /// see [`run_with_producers`] to supply a custom producer set.
@@ -420,6 +424,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(BluetoothProducer::new()),
             Box::new(VolumeProducer::new()),
             Box::new(SniHostProducer::new()),
+            Box::new(NotificationsProducer::new()),
         ],
     )
 }
@@ -515,7 +520,12 @@ pub fn run_with_producers(
         bridge.spawn_task("sni-commands", sni::run_commands(sni_rx));
         let (run_tx, run_rx) = command_channel();
         bridge.spawn_task("run-commands", command::run_commands(run_rx));
-        app.commands = vec![hypr_tx, sni_tx, run_tx];
+        let (notif_tx, notif_rx) = command_channel();
+        bridge.spawn_task(
+            "notifications-commands",
+            notifications::run_commands(notif_rx),
+        );
+        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
@@ -712,9 +722,15 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if let PointerEventKind::Press { button, .. } = event.kind
-                && button == BTN_LEFT
-            {
+            if let PointerEventKind::Press { button, .. } = event.kind {
+                // Normalize the kernel input code to the typed button the
+                // widgets branch on; other buttons (middle, side, scroll
+                // clicks) are ignored here so widgets never see them.
+                let click = match button {
+                    BTN_LEFT => ClickButton::Left,
+                    BTN_RIGHT => ClickButton::Right,
+                    _ => continue,
+                };
                 let (x, y) = event.position;
                 // Resolve the click against the surface it landed on, then fan the
                 // resulting command out to the executors. The immutable lookup ends
@@ -723,7 +739,7 @@ impl PointerHandler for App {
                     .outputs
                     .values()
                     .find(|bar| bar.owns(&event.surface))
-                    .and_then(|bar| bar.on_click(x, y));
+                    .and_then(|bar| bar.on_click(x, y, click));
                 if let Some(command) = command {
                     for sender in &self.commands {
                         if sender.send(command.clone()).is_err() {

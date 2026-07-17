@@ -247,6 +247,7 @@ fn truncate_chars(s: &str, max_length: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ClickButton;
 
     /// A widget pre-bound to `"DP-1"` so we exercise the per-monitor routing.
     fn widget() -> TitleWidget {
@@ -445,6 +446,6 @@ mod tests {
         let mut widget = TitleWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(widget.update(&focus("DP-1", "firefox", "GitHub")));
         // Display-only widget: no command on click.
-        assert_eq!(widget.on_click(16, 16), None);
+        assert_eq!(widget.on_click(16, 16, ClickButton::Left), None);
     }
 }

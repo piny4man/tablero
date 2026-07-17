@@ -340,7 +340,11 @@ impl Widget for WorkspaceWidget {
         self.bounds = bounds;
     }
 
-    fn on_click(&self, px: u32, py: u32) -> Option<Command> {
+    fn on_click(&self, px: u32, py: u32, button: super::ClickButton) -> Option<Command> {
+        // Single-action widget: only the primary button switches workspaces.
+        if button != super::ClickButton::Left {
+            return None;
+        }
         self.item_cells()
             .into_iter()
             .find(|(_, cell)| cell.contains(px, py))
@@ -351,6 +355,7 @@ impl Widget for WorkspaceWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ClickButton;
     use chrono::{Local, TimeZone};
 
     fn ws(ids: impl IntoIterator<Item = i32>, active: i32) -> Msg {
@@ -424,9 +429,18 @@ mod tests {
         widget.update(&ws([1, 2, 3], 1));
         // Square cells as wide as the 32px-tall widget, packed from the origin:
         // 1 -> [0,32), 2 -> [32,64), 3 -> [64,96).
-        assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(1)));
-        assert_eq!(widget.on_click(50, 16), Some(Command::SwitchWorkspace(2)));
-        assert_eq!(widget.on_click(80, 31), Some(Command::SwitchWorkspace(3)));
+        assert_eq!(
+            widget.on_click(0, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(1))
+        );
+        assert_eq!(
+            widget.on_click(50, 16, ClickButton::Left),
+            Some(Command::SwitchWorkspace(2))
+        );
+        assert_eq!(
+            widget.on_click(80, 31, ClickButton::Left),
+            Some(Command::SwitchWorkspace(3))
+        );
     }
 
     #[test]
@@ -434,13 +448,13 @@ mod tests {
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
         widget.update(&ws([1, 2, 3], 1));
         // Past the third item's cell (ends at 96) there is only empty slot.
-        assert_eq!(widget.on_click(200, 16), None);
+        assert_eq!(widget.on_click(200, 16, ClickButton::Left), None);
     }
 
     #[test]
     fn click_before_the_first_snapshot_is_ignored() {
         let widget = WorkspaceWidget::new(Bounds::new(0, 0, 320, 32));
-        assert_eq!(widget.on_click(0, 0), None);
+        assert_eq!(widget.on_click(0, 0, ClickButton::Left), None);
     }
 
     #[test]
@@ -448,9 +462,15 @@ mod tests {
         let mut widget = WorkspaceWidget::new(Bounds::new(100, 0, 220, 32));
         widget.update(&ws([1, 2], 1));
         // Cells start at the widget origin: 1 -> [100,132), 2 -> [132,164).
-        assert_eq!(widget.on_click(90, 0), None);
-        assert_eq!(widget.on_click(110, 0), Some(Command::SwitchWorkspace(1)));
-        assert_eq!(widget.on_click(150, 0), Some(Command::SwitchWorkspace(2)));
+        assert_eq!(widget.on_click(90, 0, ClickButton::Left), None);
+        assert_eq!(
+            widget.on_click(110, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(1))
+        );
+        assert_eq!(
+            widget.on_click(150, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(2))
+        );
     }
 
     #[test]
@@ -458,11 +478,20 @@ mod tests {
         // A slot only wide enough for one-and-a-bit cells drops the overflow.
         let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 40, 32));
         widget.update(&ws([1, 2, 3], 1));
-        assert_eq!(widget.on_click(10, 0), Some(Command::SwitchWorkspace(1)));
+        assert_eq!(
+            widget.on_click(10, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(1))
+        );
         // Second item starts at x=32, within the 40px slot, clipped to 8px.
-        assert_eq!(widget.on_click(38, 0), Some(Command::SwitchWorkspace(2)));
+        assert_eq!(
+            widget.on_click(38, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(2))
+        );
         // Third item would start at x=64, past the slot: never placed.
-        assert_eq!(widget.on_click(39, 0), Some(Command::SwitchWorkspace(2)));
+        assert_eq!(
+            widget.on_click(39, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(2))
+        );
     }
 
     #[test]
@@ -564,8 +593,14 @@ mod tests {
             w
         };
         // Cells pack from the origin over this monitor's ids: 3 -> [0,32), 4 -> [32,64).
-        assert_eq!(widget.on_click(0, 0), Some(Command::SwitchWorkspace(3)));
-        assert_eq!(widget.on_click(50, 0), Some(Command::SwitchWorkspace(4)));
+        assert_eq!(
+            widget.on_click(0, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(3))
+        );
+        assert_eq!(
+            widget.on_click(50, 0, ClickButton::Left),
+            Some(Command::SwitchWorkspace(4))
+        );
     }
 
     #[test]
