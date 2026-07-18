@@ -56,6 +56,7 @@
 //! background = "#3b4252"
 //! ```
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -68,8 +69,9 @@ use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting,
-    NetworkWidget, NotificationsWidget, StateColors, SystemWidget, TitleWidget, TrayWidget,
-    VolumeWidget, Widget, WidgetStyle, WorkspaceWidget, backlight::validate_backlight_format,
+    NetworkWidget, NotificationsWidget, PowerProfilesWidget, StateColors, SystemWidget,
+    TitleWidget, TrayWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
+    backlight::validate_backlight_format, power_profiles::validate_power_profiles_format,
 };
 
 /// Default bar height in pixels.
@@ -231,6 +233,9 @@ pub enum WidgetKind {
     Volume,
     /// The swaync notification indicator (opt-in: not in the default zones).
     Notifications,
+    /// The active power-profiles-daemon profile.
+    #[serde(rename = "power-profiles-daemon")]
+    PowerProfilesDaemon,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -277,6 +282,7 @@ impl Default for Bar {
                 WidgetKind::Battery,
                 WidgetKind::System,
                 WidgetKind::Network,
+                WidgetKind::PowerProfilesDaemon,
             ],
         }
     }
@@ -350,14 +356,45 @@ pub struct WidgetStyleConfig {
     pub on_click: Option<std::path::PathBuf>,
     /// Backlight label format. Supports `{icon}` and `{percent}`.
     pub format: Option<String>,
-    /// Backlight icon ramp, selected from low to high brightness.
+    /// Widget-specific icon configuration: a backlight ramp or named profile map.
     #[serde(rename = "format-icons")]
-    pub format_icons: Option<Vec<String>>,
+    pub format_icons: Option<FormatIconsConfig>,
     /// Percentage points changed by one backlight scroll step.
     #[serde(rename = "scroll-step")]
     pub scroll_step: Option<f64>,
     /// Preferred kernel backlight device name.
     pub device: Option<String>,
+    /// Whether a supported widget displays its hover tooltip.
+    pub tooltip: Option<bool>,
+    /// Tooltip format for widgets that expose structured hover details.
+    #[serde(rename = "tooltip-format")]
+    pub tooltip_format: Option<String>,
+}
+
+/// The two Waybar-style shapes accepted by `format-icons`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum FormatIconsConfig {
+    /// Ordered low-to-high icon ramp, used by backlight.
+    Ramp(Vec<String>),
+    /// Named state icons, used by power-profiles-daemon.
+    Named(BTreeMap<String, String>),
+}
+
+impl FormatIconsConfig {
+    fn ramp(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Ramp(icons) => Some(icons),
+            Self::Named(_) => None,
+        }
+    }
+
+    fn named(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::Named(icons) => Some(icons),
+            Self::Ramp(_) => None,
+        }
+    }
 }
 
 impl WidgetStyleConfig {
@@ -434,6 +471,12 @@ impl WidgetStyleConfig {
         if self.device.is_some() {
             base.device = self.device.clone();
         }
+        if self.tooltip.is_some() {
+            base.tooltip = self.tooltip;
+        }
+        if self.tooltip_format.is_some() {
+            base.tooltip_format = self.tooltip_format.clone();
+        }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
     }
@@ -468,6 +511,9 @@ pub struct WidgetStyles {
     pub volume: WidgetStyleConfig,
     /// Style for the notifications widget.
     pub notifications: WidgetStyleConfig,
+    /// Style and behavior for the power-profiles-daemon widget.
+    #[serde(rename = "power-profiles-daemon")]
+    pub power_profiles_daemon: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -485,6 +531,7 @@ impl WidgetStyles {
             WidgetKind::Bluetooth => &self.bluetooth,
             WidgetKind::Volume => &self.volume,
             WidgetKind::Notifications => &self.notifications,
+            WidgetKind::PowerProfilesDaemon => &self.power_profiles_daemon,
         }
     }
 
@@ -502,6 +549,8 @@ impl WidgetStyles {
         self.bluetooth.apply(&mut base.bluetooth);
         self.volume.apply(&mut base.volume);
         self.notifications.apply(&mut base.notifications);
+        self.power_profiles_daemon
+            .apply(&mut base.power_profiles_daemon);
     }
 }
 
@@ -753,6 +802,10 @@ impl Config {
         validate_range("bar.margin", self.bar.margin, 0, MAX_GAP)?;
         validate_range("bar.gap", self.bar.gap, 0, MAX_GAP)?;
         validate_backlight_config("widget.backlight", &self.widget.backlight)?;
+        validate_power_profiles_config(
+            "widget.power-profiles-daemon",
+            &self.widget.power_profiles_daemon,
+        )?;
 
         for monitor in &self.monitors {
             if monitor.name.trim().is_empty() {
@@ -782,6 +835,10 @@ impl Config {
             validate_backlight_config(
                 &format!("monitor {who:?} widget.backlight"),
                 &monitor.widget.backlight,
+            )?;
+            validate_power_profiles_config(
+                &format!("monitor {who:?} widget.power-profiles-daemon"),
+                &monitor.widget.power_profiles_daemon,
             )?;
         }
         Ok(())
@@ -892,10 +949,13 @@ fn validate_backlight_config(field: &str, config: &WidgetStyleConfig) -> Result<
     if let Some(format) = &config.format {
         validate_backlight_format(format).map_err(|error| format!("{field}.format {error}"))?;
     }
-    if let Some(icons) = &config.format_icons
-        && (icons.is_empty() || icons.iter().any(String::is_empty))
-    {
-        return Err(format!("{field}.format-icons must contain non-empty icons"));
+    if let Some(icons) = &config.format_icons {
+        let Some(icons) = icons.ramp() else {
+            return Err(format!("{field}.format-icons must be an icon array"));
+        };
+        if icons.is_empty() || icons.iter().any(String::is_empty) {
+            return Err(format!("{field}.format-icons must contain non-empty icons"));
+        }
     }
     if let Some(step) = config.scroll_step
         && (!step.is_finite() || step <= 0.0 || step > 100.0)
@@ -910,6 +970,32 @@ fn validate_backlight_config(field: &str, config: &WidgetStyleConfig) -> Result<
         return Err(format!(
             "{field}.device must be a non-empty sysfs device name, got {device:?}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_power_profiles_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    if let Some(format) = &config.format {
+        validate_power_profiles_format(format)
+            .map_err(|error| format!("{field}.format {error}"))?;
+    }
+    if let Some(format) = &config.tooltip_format {
+        validate_power_profiles_format(format)
+            .map_err(|error| format!("{field}.tooltip-format {error}"))?;
+    }
+    if let Some(icons) = &config.format_icons {
+        let Some(icons) = icons.named() else {
+            return Err(format!("{field}.format-icons must be a named icon table"));
+        };
+        if icons.is_empty()
+            || icons
+                .iter()
+                .any(|(name, icon)| name.trim().is_empty() || icon.is_empty())
+        {
+            return Err(format!(
+                "{field}.format-icons must contain non-empty names and icons"
+            ));
+        }
     }
     Ok(())
 }
@@ -965,6 +1051,9 @@ impl WidgetKind {
             // per-widget `on-click` path does not apply here.
             WidgetKind::Notifications => {
                 Box::new(NotificationsWidget::new(bounds).with_style(style))
+            }
+            WidgetKind::PowerProfilesDaemon => {
+                Box::new(PowerProfilesWidget::new(bounds).with_style(style))
             }
         }
     }
@@ -1034,17 +1123,36 @@ impl Config {
                 .map(|&kind| {
                     let style_config = self.widget.get(kind);
                     let style = style_config.resolve(&self.theme);
-                    if kind == WidgetKind::Backlight {
-                        Box::new(
+                    match kind {
+                        WidgetKind::Backlight => Box::new(
                             BacklightWidget::new(bounds)
                                 .with_style(style)
                                 .with_device(style_config.device.clone())
                                 .with_format(style_config.format.clone())
-                                .with_format_icons(style_config.format_icons.clone())
+                                .with_format_icons(
+                                    style_config
+                                        .format_icons
+                                        .as_ref()
+                                        .and_then(FormatIconsConfig::ramp)
+                                        .cloned(),
+                                )
                                 .with_scroll_step(style_config.scroll_step),
-                        ) as Box<dyn Widget>
-                    } else {
-                        kind.build(bounds, style, monitor, style_config.on_click.clone())
+                        ) as Box<dyn Widget>,
+                        WidgetKind::PowerProfilesDaemon => Box::new(
+                            PowerProfilesWidget::new(bounds)
+                                .with_style(style)
+                                .with_format(style_config.format.clone())
+                                .with_format_icons(
+                                    style_config
+                                        .format_icons
+                                        .as_ref()
+                                        .and_then(FormatIconsConfig::named)
+                                        .cloned(),
+                                )
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone()),
+                        ),
+                        _ => kind.build(bounds, style, monitor, style_config.on_click.clone()),
                     }
                 })
                 .collect()
@@ -1135,8 +1243,8 @@ mod tests {
         assert_eq!(config.font.family, None);
         assert_eq!(config.font.size, 16.0);
         // The default zones: workspaces left, title centered, the time-and-status
-        // cluster right (clock first, then battery/system/network); the tray
-        // stays opt-in.
+        // cluster right (clock first, then battery/system/network and power
+        // profiles); the tray stays opt-in.
         assert_eq!(config.bar.modules_left, vec![WidgetKind::Workspaces]);
         assert_eq!(config.bar.modules_center, vec![WidgetKind::Title]);
         assert_eq!(
@@ -1146,6 +1254,7 @@ mod tests {
                 WidgetKind::Battery,
                 WidgetKind::System,
                 WidgetKind::Network,
+                WidgetKind::PowerProfilesDaemon,
             ],
         );
     }
@@ -2090,7 +2199,13 @@ mod tests {
             Some("intel_backlight")
         );
         assert_eq!(
-            config.widget.backlight.format_icons.as_deref(),
+            config
+                .widget
+                .backlight
+                .format_icons
+                .as_ref()
+                .and_then(FormatIconsConfig::ramp)
+                .map(Vec::as_slice),
             Some(&["low".to_string(), "high".to_string()][..])
         );
         let resolved = config.resolve_for_output(Some("eDP-1"));
@@ -2115,6 +2230,57 @@ mod tests {
                 "{doc}: {error:?}"
             );
             assert!(error.to_string().contains("widget.backlight"));
+        }
+    }
+
+    #[test]
+    fn power_profiles_configuration_parses_and_merges_per_monitor() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.power-profiles-daemon]
+            format = "{icon} {profile}"
+            tooltip = true
+            tooltip-format = "Power profile: {profile}\nDriver: {driver}"
+            [widget.power-profiles-daemon.format-icons]
+            default = "sun"
+            balanced = "balance"
+            performance = "bolt"
+            power-saver = "leaf"
+
+            [[monitor]]
+            name = "eDP-1"
+            [monitor.widget.power-profiles-daemon]
+            tooltip = false
+            "#,
+        )
+        .unwrap();
+        let widget = &config.widget.power_profiles_daemon;
+        assert_eq!(widget.format.as_deref(), Some("{icon} {profile}"));
+        assert_eq!(widget.tooltip, Some(true));
+        let icons = widget
+            .format_icons
+            .as_ref()
+            .and_then(FormatIconsConfig::named)
+            .expect("named icons");
+        assert_eq!(icons.get("performance").map(String::as_str), Some("bolt"));
+
+        let resolved = config.resolve_for_output(Some("eDP-1"));
+        assert_eq!(resolved.widget.power_profiles_daemon.tooltip, Some(false));
+        assert_eq!(
+            resolved.widget.power_profiles_daemon.format.as_deref(),
+            Some("{icon} {profile}")
+        );
+    }
+
+    #[test]
+    fn invalid_power_profiles_configuration_is_rejected() {
+        for doc in [
+            "[widget.power-profiles-daemon]\nformat = \"{percent}\"",
+            "[widget.power-profiles-daemon]\ntooltip-format = \"{unknown}\"",
+            "[widget.power-profiles-daemon]\nformat-icons = []",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err().to_string();
+            assert!(error.contains("power-profiles-daemon"), "message: {error}");
         }
     }
 

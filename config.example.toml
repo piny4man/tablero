@@ -25,7 +25,8 @@ margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
 # "workspaces", "clock", "battery", "system", "network", "title", "tray",
-# "bluetooth", "volume", "backlight", "notifications". A widget named in two zones is
+# "bluetooth", "volume", "backlight", "notifications", "power-profiles-daemon".
+# A widget named in two zones is
 # built once, keeping its first mention. "tray" shows StatusNotifierItem
 # system-tray icons and is opt-in — add it to a zone to enable it, e.g.
 # modules-right = ["tray", "battery", "system", "network"]. "title" shows
@@ -45,9 +46,12 @@ gap    = 0
 # "backlight" follows native Linux screen-backlight events and is opt-in. Scroll
 # up/down over it to adjust brightness through systemd-logind; without a device
 # it reserves no slot.
+# "power-profiles-daemon" follows the system daemon over DBus, rotates the
+# advertised profiles on click, and is enabled by default. It reserves no slot
+# when the daemon is unavailable.
 modules-left   = ["workspaces"]
 modules-center = ["title"]
-modules-right  = ["clock", "battery", "system", "network"]
+modules-right  = ["clock", "battery", "system", "network", "power-profiles-daemon"]
 # An optional bar background that overrides [theme] background — the seam for a
 # translucent bar. Unset by default (the theme background is used):
 # background = "#181818cc"
@@ -132,6 +136,19 @@ size = 16.0
 # format = "{icon}  {percent}%"
 # format-icons = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
 # scroll-step = 1
+#
+# The power-profiles-daemon module uses named icons rather than an ordered ramp.
+# Left-click selects the next advertised profile; right-click selects the
+# previous one. Hovering shows the configured multiline tooltip.
+# [widget.power-profiles-daemon]
+# format = "{icon}"
+# tooltip-format = "Power profile: {profile}\nDriver: {driver}"
+# tooltip = true
+# [widget.power-profiles-daemon.format-icons]
+# default = ""
+# performance = ""
+# balanced = ""
+# power-saver = ""
 
 # Per-monitor overrides. tablero shows one bar per connected output; by default
 # every output uses the global settings above. Add a [[monitor]] block to tweak a

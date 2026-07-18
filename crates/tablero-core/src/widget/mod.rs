@@ -27,6 +27,7 @@ pub mod bluetooth;
 pub mod clock;
 pub mod network;
 pub mod notifications;
+pub mod power_profiles;
 pub mod system;
 pub mod title;
 pub mod tray;
@@ -39,6 +40,7 @@ pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use notifications::{Notifications, NotificationsWidget};
+pub use power_profiles::{PowerProfile, PowerProfilesState, PowerProfilesWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
 pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
@@ -122,6 +124,8 @@ pub enum Msg {
     /// `None` means swaync is not on the session bus, so the widget shows
     /// nothing — the same absent-source convention as [`Msg::Volume`].
     Notifications(Option<Notifications>),
+    /// The power-profiles-daemon state; `None` means the daemon is unavailable.
+    PowerProfiles(Option<PowerProfilesState>),
 }
 
 impl Msg {
@@ -170,6 +174,8 @@ pub enum Command {
         /// Percentage points changed by one logical scroll step.
         step: f64,
     },
+    /// Select one of power-profiles-daemon's advertised profiles.
+    SetPowerProfile(String),
 }
 
 /// A normalized logical scroll direction.
@@ -194,6 +200,15 @@ pub enum ClickButton {
     Left,
     /// The secondary (right) pointer button.
     Right,
+}
+
+/// Tooltip content and the widget bounds it should be anchored to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tooltip {
+    /// Expanded, possibly multiline tooltip text.
+    pub text: String,
+    /// The widget's current physical-pixel layout slot.
+    pub bounds: Bounds,
 }
 
 /// How a widget chooses the glyph it draws before its label.
@@ -430,6 +445,11 @@ pub trait Widget {
     fn on_scroll(&self, _px: u32, _py: u32, _direction: ScrollDirection) -> Option<Command> {
         None
     }
+
+    /// Return a tooltip when `(px, py)` lies over a tooltip-enabled region.
+    fn tooltip_at(&self, _px: u32, _py: u32) -> Option<Tooltip> {
+        None
+    }
 }
 
 /// The widgets composing the bar, grouped into left/center/right zones, plus the
@@ -595,6 +615,12 @@ impl Dashboard {
             .find_map(|widget| widget.on_click(px, py, button))
     }
 
+    /// Whether any widget exposes a primary or secondary click at `(px, py)`.
+    pub fn is_clickable_at(&self, px: u32, py: u32) -> bool {
+        self.on_click(px, py, ClickButton::Left).is_some()
+            || self.on_click(px, py, ClickButton::Right).is_some()
+    }
+
     /// Route one logical scroll step to the widget under the pointer.
     pub fn on_scroll(&self, px: u32, py: u32, direction: ScrollDirection) -> Option<Command> {
         self.left
@@ -602,6 +628,15 @@ impl Dashboard {
             .chain(&self.center)
             .chain(&self.right)
             .find_map(|widget| widget.on_scroll(px, py, direction))
+    }
+
+    /// Resolve tooltip content for the widget under `(px, py)`.
+    pub fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        self.left
+            .iter()
+            .chain(&self.center)
+            .chain(&self.right)
+            .find_map(|widget| widget.tooltip_at(px, py))
     }
 }
 
@@ -779,6 +814,16 @@ mod tests {
             Some(Command::SwitchWorkspace(1))
         );
         assert_eq!(dash.on_click(180, 16, ClickButton::Right), None);
+    }
+
+    #[test]
+    fn clickable_regions_match_widgets_with_click_actions() {
+        let mut dash = Dashboard::with_zones(vec![], vec![], vec![one_workspace(1)]);
+        let mut ctx = RenderContext::new(200, 32);
+        dash.layout(&mut ctx, 200, 32);
+
+        assert!(dash.is_clickable_at(180, 16));
+        assert!(!dash.is_clickable_at(100, 16));
     }
 
     #[test]
