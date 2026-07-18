@@ -164,6 +164,7 @@ impl Widget for NotificationsWidget {
         let colors = super::StateColors {
             background: self.style.background,
             foreground: self.foreground(),
+            border: self.style.border,
         };
         draw_text_pill(ctx, &self.style, self.bounds, &self.display_text(), colors);
 

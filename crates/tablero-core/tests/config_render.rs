@@ -8,7 +8,9 @@
 
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
-use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, Workspaces};
+use tablero_core::widget::{
+    Battery, BatteryState, ClickButton, Command, Dashboard, Msg, Workspaces,
+};
 
 /// Build the dashboard a TOML document describes over a 200x32 surface, seed it
 /// with a one-workspace snapshot, then lay it out.
@@ -128,4 +130,76 @@ fn bar_background_overrides_the_theme_for_painted_pixels() {
 
     let settings = config.render_settings();
     assert_eq!(settings.background, (0x20, 0x40, 0x60, 0xFF));
+}
+
+#[test]
+fn widget_border_config_reaches_painted_workspace_pixels() {
+    let config = Config::from_toml_str(
+        r##"
+        [bar]
+        modules-left = ["workspaces"]
+        modules-center = []
+        modules-right = []
+
+        [widget.workspaces]
+        background = "#204020"
+        accent = "#204020"
+        border = "#e0a020"
+        border-width = 2
+        radius = 0
+        "##,
+    )
+    .expect("valid config");
+    let mut dash = config.build_dashboard(Bounds::new(0, 0, 64, 32), None);
+    dash.update(&Msg::Workspaces(Workspaces::new([1], 1)));
+    let mut ctx = RenderContext::with_settings(64, 32, config.render_settings());
+    dash.layout(&mut ctx, 64, 32);
+    dash.draw(&mut ctx);
+
+    let px = ctx.pixels();
+    let border = (16 * 64) * 4;
+    assert!(
+        px[border] > 0xB0 && px[border + 1] > 0x70 && px[border + 2] < 0x50,
+        "configured workspace border did not render: {:?}",
+        &px[border..border + 4]
+    );
+}
+
+#[test]
+fn charging_battery_config_reaches_its_border_and_compact_format() {
+    let config = Config::from_toml_str(
+        r##"
+        [bar]
+        modules-left = ["battery"]
+        modules-center = []
+        modules-right = []
+
+        [widget.battery]
+        format = "{icon} {percent}%"
+        padding = 4
+        radius = 0
+
+        [widget.battery.charging]
+        background = "#2df18520"
+        foreground = "#5ff5a0"
+        border = "#2df185"
+        "##,
+    )
+    .expect("valid config");
+    let mut dash = config.build_dashboard(Bounds::new(0, 0, 96, 32), None);
+    dash.update(&Msg::Battery(Some(Battery::new(
+        BatteryState::Charging,
+        81.0,
+    ))));
+    let mut ctx = RenderContext::with_settings(96, 32, config.render_settings());
+    dash.layout(&mut ctx, 96, 32);
+    dash.draw(&mut ctx);
+
+    let px = ctx.pixels();
+    let border = (16 * 96) * 4;
+    assert!(
+        px[border + 1] > 0xB0 && px[border + 2] > 0x60,
+        "charging border did not render green: {:?}",
+        &px[border..border + 4]
+    );
 }

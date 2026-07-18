@@ -15,6 +15,33 @@ use super::{
     Msg, StateColors, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
 };
 
+/// Validate the battery format placeholders accepted by [`BatteryWidget`].
+pub fn validate_battery_format(format: &str) -> Result<(), String> {
+    let mut rest = format;
+    while !rest.is_empty() {
+        let next_open = rest.find('{');
+        let next_close = rest.find('}');
+        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
+            return Err("contains an unmatched `}`".to_string());
+        }
+        let Some(open) = next_open else {
+            break;
+        };
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('}') else {
+            return Err("contains an unmatched `{`".to_string());
+        };
+        let placeholder = &rest[..close];
+        if !matches!(placeholder, "icon" | "percent" | "state") {
+            return Err(format!(
+                "contains unsupported placeholder `{{{placeholder}}}`"
+            ));
+        }
+        rest = &rest[close + 1..];
+    }
+    Ok(())
+}
+
 /// Default battery glyphs (Font Awesome, via Nerd Font): a discharge ramp picked
 /// by charge quintile, plus a bolt shown while charging or topped off on AC.
 const BATTERY_EMPTY: &str = "\u{f244}"; // nf-fa-battery_empty
@@ -131,6 +158,7 @@ pub struct BatteryWidget {
     bounds: Bounds,
     state: Option<Battery>,
     style: WidgetStyle,
+    format: Option<String>,
 }
 
 impl BatteryWidget {
@@ -142,6 +170,7 @@ impl BatteryWidget {
             bounds,
             state: None,
             style: WidgetStyle::default(),
+            format: None,
         }
     }
 
@@ -149,6 +178,12 @@ impl BatteryWidget {
     /// chains off [`new`](BatteryWidget::new) at build time.
     pub fn with_style(mut self, style: WidgetStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Set the optional `{icon}` / `{percent}` / `{state}` display format.
+    pub fn with_format(mut self, format: Option<String>) -> Self {
+        self.format = format;
         self
     }
 
@@ -163,7 +198,14 @@ impl BatteryWidget {
     fn display_text(&self) -> String {
         match self.state {
             Some(battery) => {
-                glyph_label(self.style.glyph(default_glyph(battery)), &battery.label())
+                let icon = self.style.glyph(default_glyph(battery));
+                match &self.format {
+                    Some(format) => format
+                        .replace("{icon}", icon)
+                        .replace("{percent}", &battery.percent().to_string())
+                        .replace("{state}", battery.state().label()),
+                    None => glyph_label(icon, &battery.label()),
+                }
             }
             None => String::new(),
         }
@@ -172,7 +214,9 @@ impl BatteryWidget {
     /// The pill colors for the current reading: the style's warn colors when a
     /// discharging battery is below its threshold, otherwise the base colors.
     fn state_colors(&self, battery: Battery) -> StateColors {
-        if battery.state() == BatteryState::Discharging
+        if battery.state() == BatteryState::Charging {
+            self.style.charging
+        } else if battery.state() == BatteryState::Discharging
             && u32::from(battery.percent()) < self.style.warn_threshold
         {
             self.style.warn
@@ -373,6 +417,40 @@ mod tests {
         assert_eq!(
             widget.display_text(),
             format!("{BATTERY_FULL} 85% discharging")
+        );
+    }
+
+    #[test]
+    fn configured_format_can_keep_percentage_and_drop_state_text() {
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format(Some("{icon} {percent}%".to_string()));
+        widget.update(&battery(BatteryState::Charging, 81.0));
+        assert_eq!(widget.display_text(), format!("{BATTERY_CHARGING} 81%"));
+    }
+
+    #[test]
+    fn battery_format_rejects_unknown_or_unbalanced_placeholders() {
+        assert!(validate_battery_format("{icon} {percent}% {state}").is_ok());
+        assert!(validate_battery_format("{watts}").is_err());
+        assert!(validate_battery_format("{percent").is_err());
+        assert!(validate_battery_format("percent}").is_err());
+    }
+
+    #[test]
+    fn charging_battery_uses_its_charging_colors() {
+        let charging = StateColors {
+            background: Some((0x2D, 0xF1, 0x85, 0x20)),
+            foreground: (0x5F, 0xF5, 0xA0, 0xFF),
+            border: Some((0x2D, 0xF1, 0x85, 0xFF)),
+        };
+        let style = WidgetStyle {
+            charging,
+            ..WidgetStyle::default()
+        };
+        let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32)).with_style(style);
+        assert_eq!(
+            widget.state_colors(Battery::new(BatteryState::Charging, 81.0)),
+            charging
         );
     }
 

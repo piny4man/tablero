@@ -1,186 +1,210 @@
-# tablero configuration — the uncommented values below are the built-in defaults.
+# ARC Raiders-inspired field terminal preset for tablero.
 #
-# Copy this file to `$XDG_CONFIG_HOME/tablero/config.toml` (or
-# `~/.config/tablero/config.toml`) and edit only what you want to change: the
-# file may be partial, and any omitted field falls back to the default shown
-# here. An unknown key, an unknown widget name, or a malformed color is a hard
-# error — tablero refuses to start rather than silently ignoring it.
+# Copy to `$XDG_CONFIG_HOME/tablero/config.toml` (or
+# `~/.config/tablero/config.toml`) and restart tablero. This is an opinionated
+# desktop loadout, not the built-in default configuration. Any omitted field
+# still falls back to tablero's built-in value.
 #
-# Colors are "#rrggbb" or "#rrggbbaa" hex strings (the leading "#" is optional).
-# The eight-digit form adds an alpha channel: "#181818ff" is the opaque default
-# background, "#181818cc" is the same color at ~80% opacity. A translucent bar
-# background plus a non-zero [bar] margin/gap is what makes pills "float".
+# Colors accept "#rrggbb" or "#rrggbbaa". This preset follows the shared ARC
+# Raiders palette: purple-black surfaces, warm cream text, cyan focus, rainbow
+# semantic accents, and translucent state fills.
 
-# Bar height in pixels. The width always spans the output.
-height = 32
+height = 38
 
-# Bar layout. Placement (which zone a widget sits in) lives here; per-widget
-# *styling* lives in the separate [widget.<name>] tables below, so moving a
-# widget between zones never disturbs its colors.
 [bar]
-# margin insets the whole pill row from the screen edges; gap separates adjacent
-# pills within a zone. Both are logical pixels — leave them 0 for a flush,
-# edge-to-edge bar, or raise them to let pills float on a translucent background.
-margin = 0
-gap    = 0
-# Each zone is a list of widget names, in display order. Valid names:
-# "workspaces", "clock", "battery", "system", "network", "title", "tray",
-# "bluetooth", "volume", "backlight", "notifications", "power-profiles-daemon".
-# A widget named in two zones is
-# built once, keeping its first mention. "tray" shows StatusNotifierItem
-# system-tray icons and is opt-in — add it to a zone to enable it, e.g.
-# modules-right = ["tray", "battery", "system", "network"]. "title" shows
-# the focused Hyprland window's title and is the default center module.
-# "bluetooth" reads BlueZ over DBus and is also opt-in — add it to a zone to
-# show the local adapter state and connected device count; without an
-# adapter it shows "unavailable". "volume" reads the active output sink's
-# level / mute state over the native PipeWire wire protocol (requires a
-# running PipeWire server and the system's `libpipewire`); without a sink
-# the widget reserves no slot. The label is just `Vol N%` (or `Mute`), and
-# the glyph swaps between headphones / speakers / monitor / phone / TV based
-# on the active sink's device kind. "notifications" follows swaync
-# (SwayNotificationCenter) over DBus and is opt-in: a bell glyph with a
-# small dot while notifications are pending, slashed and dimmed under
-# Do-Not-Disturb; left-click toggles the swaync panel, right-click toggles
-# DND. While swaync is not running the widget reserves no slot.
-# "backlight" follows native Linux screen-backlight events and is opt-in. Scroll
-# up/down over it to adjust brightness through systemd-logind; without a device
-# it reserves no slot.
-# "power-profiles-daemon" follows the system daemon over DBus, rotates the
-# advertised profiles on click, and is enabled by default. It reserves no slot
-# when the daemon is unavailable.
-modules-left   = ["workspaces"]
-modules-center = ["title"]
-modules-right  = ["clock", "battery", "system", "network", "power-profiles-daemon"]
-# An optional bar background that overrides [theme] background — the seam for a
-# translucent bar. Unset by default (the theme background is used):
-# background = "#181818cc"
+background = "#00000000"
+margin = 4
+gap = 4
+modules-left = ["workspaces", "title"]
+modules-center = []
+modules-right = [
+  "bluetooth",
+  "backlight",
+  "volume",
+  "system",
+  "network",
+  "tray",
+  "notifications",
+  "battery",
+  "power-profiles-daemon",
+  "clock",
+]
 
 [theme]
-background = "#181818" # fill behind the bar (and pills, unless [bar] overrides)
-foreground = "#eaeaea" # default text/glyph color
-accent     = "#eaeaea" # emphasis color (e.g. the active workspace)
+background = "#140917"
+foreground = "#eae2cf"
+accent = "#7decff"
 
 [font]
-# family is unset by default, which uses the system default font. A Nerd Font is
-# recommended so widget glyph icons render (without one they fall back to tofu,
-# but the text stays readable). Uncomment to pick a specific family:
-# family = "JetBrains Mono"
-size = 16.0
+# Install this Nerd Font for the intended compact telemetry look and glyphs.
+# Remove `family` to use the system default if it is unavailable.
+family = "JetBrainsMono Nerd Font"
+size = 15.0
 
-# Per-widget styling is opt-in: an absent [widget.<name>] table leaves that widget
-# flat (no pill, theme foreground) — which is what keeps the default bar looking
-# minimal. Every field below is optional and falls back to the value shown.
-#
-# [widget.clock]
-# background     = "#2e3440cc"  # pill fill; absent means no pill (text floats)
-# foreground     = "#eceff4"    # text/glyph color; inherits [theme] foreground
-# accent         = "#88c0d0"    # emphasis (active workspace); inherits theme accent
-# radius         = 8            # pill corner radius, logical pixels
-# padding        = 8            # inset between pill edge and text, logical pixels
-# icon           = "none"       # "none" hides the glyph; any other string overrides
-#                               # it; omit to keep the widget's built-in glyph
-#
-# The title widget (default in modules-center) shows the focused Hyprland
-# window's title. Long titles are truncated at 100 characters with a trailing
-# ellipsis ("..."); setting max-length = 0 disables truncation. icon = "none"
-# keeps the default glyphless look - set icon to any string to draw that
-# glyph before the title.
-# [widget.title]
-# background     = "#2e3440cc"  # pill fill; absent means no pill (text floats)
-# foreground     = "#eceff4"    # text/glyph color; inherits [theme] foreground
-# radius         = 8            # pill corner radius, logical pixels
-# padding        = 8            # inset between pill edge and text, logical pixels
-# icon           = "none"       # see the comment above
-#
-# State colors drive the battery's low-charge warning and the tray's
-# needs-attention highlight. Defaults: a red "#bf616aff" pill with white text.
-# [widget.battery]
-# warn-threshold = 20           # below this discharging percent, show warn colors
-# [widget.battery.warn]
-# background     = "#bf616aff"  # low-battery pill fill
-# foreground     = "#ffffff"    # low-battery text/glyph color
-#
-# [widget.tray.attention]
-# background     = "#bf616aff"  # pill behind a tray item requesting attention
-#
-# The notifications widget's pending dot uses its attention background:
-# [widget.notifications.attention]
-# background     = "#bf616aff"  # the dot shown while notifications are pending
-#
-# The bluetooth widget (opt-in: name it in a zone to enable) reads BlueZ and
-# shows the local adapter state plus connected-device count: e.g. "on",
-# "off", "2 connected", or "unavailable" when no adapter is present.
-#
-# The `on-click` field is accepted on every [widget.<name>] table (the same
-# config field across all widgets), but **only the bluetooth and volume
-# widgets honor it today** — other widgets accept the field and ignore it.
-# When set on [widget.bluetooth] or [widget.volume], a click inside the
-# widget spawns the executable directly (no shell); the typical use is to
-# launch a Bluetooth manager like blueman-manager, or a volume manager like
-# pavucontrol. The path may use a leading "~" for the user's home.
-# [bar]
-# modules-right = ["bluetooth", "volume", "network"]
-# [widget.bluetooth]
-# on-click = "~/.config/hypr/scripts/bluetooth.sh"
-# [widget.volume]
+# Workspace cells are the strongest signal: purple-black equipment keys with a
+# cyan active slab. A two-pixel radius keeps them machined, not pillowy.
+[widget.workspaces]
+background = "#1c0e1ee8"
+foreground = "#9a8a98"
+accent = "#7decff"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+
+# The focused mission context follows the workspaces as a single left-side strip.
+# Its quieter outline separates context from the cyan selection without making
+# the title compete with live alerts.
+[widget.title]
+background = "#1c0e1ee8"
+foreground = "#eae2cf"
+border = "#2a1428"
+border-width = 1
+radius = 2
+padding = 12
+icon = "none"
+
+[widget.tray]
+background = "#1c0e1ee8"
+foreground = "#eae2cf"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 6
+
+[widget.tray.attention]
+background = "#f7080b30"
+foreground = "#ff4a4d"
+border = "#f7080b"
+
+[widget.notifications]
+background = "#1c0e1ee8"
+foreground = "#eae2cf"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+
+[widget.notifications.attention]
+background = "#f7080b30"
+foreground = "#ff4a4d"
+border = "#f7080b"
+
+[widget.bluetooth]
+background = "#1c0e1ee8"
+foreground = "#7decff"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+# on-click = "/usr/bin/blueman-manager"
+
+[widget.backlight]
+background = "#1c0e1ee8"
+foreground = "#f9cf07"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+format = "{icon} {percent}%"
+scroll-step = 5
+
+[widget.battery]
+background = "#1c0e1ee8"
+foreground = "#f5c70f"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+format = "{icon} {percent}%"
+warn-threshold = 20
+
+[widget.battery.warn]
+background = "#f7080b30"
+foreground = "#ff4a4d"
+border = "#f7080b"
+
+# Charging is unmistakable without spelling it out: bolt + percentage, green
+# telemetry, a crisp success border, and a low-alpha green surface.
+[widget.battery.charging]
+background = "#2df18520"
+foreground = "#5ff5a0"
+border = "#2df185"
+
+[widget.volume]
+background = "#1c0e1ee8"
+foreground = "#eae2cf"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
 # on-click = "/usr/bin/pavucontrol"
-#
-# The backlight module supports the Waybar-style {icon} and {percent}
-# placeholders. `device` is optional; when absent or not found, the screen
-# backlight with the largest brightness range is selected automatically.
-# [bar]
-# modules-right = ["backlight", "battery", "network"]
-# [widget.backlight]
-# device = "intel_backlight"
-# format = "{icon}  {percent}%"
-# format-icons = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
-# scroll-step = 1
-#
-# The power-profiles-daemon module uses named icons rather than an ordered ramp.
-# Left-click selects the next advertised profile; right-click selects the
-# previous one. Hovering shows the configured multiline tooltip.
-# [widget.power-profiles-daemon]
-# format = "{icon}"
-# tooltip-format = "Power profile: {profile}\nDriver: {driver}"
-# tooltip = true
-# [widget.power-profiles-daemon.format-icons]
-# default = ""
-# performance = ""
-# balanced = ""
-# power-saver = ""
 
-# Per-monitor overrides. tablero shows one bar per connected output; by default
-# every output uses the global settings above. Add a [[monitor]] block to tweak a
-# specific output, matched by its Hyprland connector name (`hyprctl monitors`
-# lists them, e.g. "DP-1", "HDMI-A-1", "eDP-1"). Every field except `name` is
-# optional — omit one and that output keeps the global value, so you only state
-# what differs. An output with no matching [[monitor]] block uses the global
-# defaults unchanged.
-#
+[widget.network]
+background = "#1c0e1ee8"
+foreground = "#7decff"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+
+[widget.system]
+background = "#1c0e1ee8"
+foreground = "#eae2cf"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+
+[widget.clock]
+background = "#1c0e1ee8"
+foreground = "#f5f0e0"
+border = "#7decff"
+border-width = 1
+radius = 2
+padding = 10
+
+[widget.power-profiles-daemon]
+background = "#1c0e1ee8"
+foreground = "#f5c70f"
+border = "#3d1f3a"
+border-width = 1
+radius = 2
+padding = 8
+format = "{icon} {profile}"
+tooltip = true
+tooltip-format = "POWER MODE: {profile}\nDRIVER: {driver}"
+
+[widget.power-profiles-daemon.format-icons]
+default = ""
+performance = ""
+balanced = ""
+power-saver = ""
+
+# Per-monitor overrides remain available. For example, this keeps a laptop bar
+# shorter while adding controls useful away from a desk:
 # [[monitor]]
-# name = "DP-1"                  # required: the connector to match
-# height = 40                   # taller bar on this monitor only
+# name = "eDP-1"
+# height = 34
 # [monitor.bar]
-# modules-center = ["clock", "system"]  # a different center zone here (replaces it
-#                                        # wholesale; unset zones inherit the global)
-# background = "#000000aa"       # a translucent bar on this output only
-# margin = 8
-# [monitor.theme]
-# accent = "#88c0d0"            # only the accent changes; background/foreground inherit
+# modules-right = ["notifications", "volume", "backlight", "battery", "network", "clock"]
 # [monitor.font]
-# size = 18.0                   # larger text on this monitor only
-# [monitor.widget.battery]
-# background = "#3b4252"        # give the battery a pill on this output only
-# [monitor.widget.title]
-# background = "#2e3440"        # give the title a pill on this output only
-# [monitor.widget.bluetooth]
-# on-click = "/per-monitor/bluetooth-launcher.sh"  # different launcher per output
-# [monitor.widget.volume]
-# on-click = "/per-monitor/pavucontrol"             # different volume manager per output
+# size = 14.0
 # [monitor.widget.backlight]
-# device = "amdgpu_bl1"                             # select another panel on this output
-#
-# [[monitor]]
-# name = "eDP-1"                # the laptop panel: just a shorter bar, nothing else
-# height = 28
+# background = "#1c0e1e"
+# foreground = "#f9cf07"
+# border = "#3d1f3a"
+# border-width = 1
+# radius = 2
+# padding = 8
+# [monitor.widget.battery]
+# background = "#1c0e1e"
+# foreground = "#f5c70f"
+# border = "#3d1f3a"
+# border-width = 1
+# radius = 2
+# padding = 8
+# warn-threshold = 20
+# [monitor.widget.battery.warn]
+# background = "#f7080b30"
+# foreground = "#ff4a4d"
+# border = "#f7080b"
