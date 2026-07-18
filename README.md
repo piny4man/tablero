@@ -49,6 +49,11 @@ RUST_LOG=info cargo run -p tablero
   - **Clock** — a live local clock (`HH:MM`).
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
+  - **Backlight** — screen brightness read directly from Linux sysfs. **Opt-in**:
+    add `"backlight"` to a zone. Scroll up/down over the widget to adjust the
+    selected device through systemd-logind, without `brightnessctl` or another
+    status bar. Device state follows native udev events with periodic recovery
+    polling, and the widget reserves no slot when no screen backlight is present.
   - **System** — CPU and memory load sampled from procfs.
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
@@ -143,7 +148,8 @@ padding = 0
 
 # Widgets to render, left to right. Valid names: "workspaces", "title",
 # "clock", "battery", "system", "network", "tray", "bluetooth", "volume",
-# "notifications". "tray", "bluetooth", "volume", and "notifications" are
+# "backlight", "notifications". "tray", "bluetooth", "volume", "backlight",
+# and "notifications" are
 # opt-in (not in the default set above) — add them to enable the system tray,
 # the Bluetooth adapter indicator, the output volume, and the swaync
 # notification indicator respectively. Repeats are de-duplicated, keeping
@@ -168,7 +174,7 @@ size = 16.0
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
 | `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), `"volume"` (opt-in PipeWire-backed output volume), and `"notifications"` (opt-in swaync-backed notification indicator). |
+| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), `"volume"` (opt-in PipeWire-backed output volume), `"backlight"` (opt-in native brightness display/control), and `"notifications"` (opt-in swaync-backed notification indicator). |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -182,6 +188,23 @@ spawns the file directly (no shell) — typical use is
 `[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
 a leading `~` for the user's home, expanded at click time. Today only the
 bluetooth and volume widgets honor the field; other widgets ignore it.
+
+The backlight module has four module-specific fields:
+
+```toml
+[bar]
+modules-right = ["backlight", "battery", "network"]
+
+[widget.backlight]
+device = "intel_backlight" # optional; auto-selects the largest range when absent
+format = "{icon}  {percent}%"
+format-icons = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+scroll-step = 1
+```
+
+Only `{icon}` and `{percent}` are accepted in `format`. Icons are selected from
+low to high brightness. Scrolling requires an active systemd-logind session;
+display remains available if logind cannot perform writes.
 
 ### Per-monitor overrides
 

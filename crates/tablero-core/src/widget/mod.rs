@@ -21,6 +21,7 @@ use chrono::{DateTime, Local};
 
 use crate::render::{Bounds, FG, RenderContext};
 
+pub mod backlight;
 pub mod battery;
 pub mod bluetooth;
 pub mod clock;
@@ -32,6 +33,7 @@ pub mod tray;
 pub mod volume;
 pub mod workspaces;
 
+pub use backlight::{Backlight, BacklightWidget};
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
@@ -71,6 +73,8 @@ pub enum Msg {
     /// The battery reading changed; `None` means no battery is present (or the
     /// power daemon is unavailable), so the widget shows nothing.
     Battery(Option<Battery>),
+    /// The available Linux screen-backlight devices changed.
+    Backlight(Vec<Backlight>),
     /// A fresh system-pressure sample: current CPU and memory load.
     System(SystemStats),
     /// The network connectivity changed; `None` means no network is available
@@ -139,7 +143,7 @@ impl Msg {
 /// handling stays a pure, testable decision. Marked `#[non_exhaustive]` for the
 /// same forward-compatibility reason as [`Msg`].
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Switch the compositor to the workspace with this id.
     SwitchWorkspace(i32),
@@ -157,6 +161,24 @@ pub enum Command {
     /// Toggle the notification daemon's Do-Not-Disturb mode (swaync
     /// `ToggleDnd` — the notifications widget's secondary click).
     ToggleNotificationsDnd,
+    /// Adjust one kernel backlight by a percentage step through systemd-logind.
+    AdjustBacklight {
+        /// Kernel device name under `/sys/class/backlight`.
+        device: String,
+        /// Whether brightness should increase or decrease.
+        direction: ScrollDirection,
+        /// Percentage points changed by one logical scroll step.
+        step: f64,
+    },
+}
+
+/// A normalized logical scroll direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDirection {
+    /// Increase the widget's controlled value.
+    Increase,
+    /// Decrease the widget's controlled value.
+    Decrease,
 }
 
 /// Which pointer button produced a click, normalized from the compositor's
@@ -403,6 +425,11 @@ pub trait Widget {
     fn on_click(&self, _px: u32, _py: u32, _button: ClickButton) -> Option<Command> {
         None
     }
+
+    /// Handle one logical scroll step at surface pixel `(px, py)`.
+    fn on_scroll(&self, _px: u32, _py: u32, _direction: ScrollDirection) -> Option<Command> {
+        None
+    }
 }
 
 /// The widgets composing the bar, grouped into left/center/right zones, plus the
@@ -566,6 +593,15 @@ impl Dashboard {
             .chain(&self.center)
             .chain(&self.right)
             .find_map(|widget| widget.on_click(px, py, button))
+    }
+
+    /// Route one logical scroll step to the widget under the pointer.
+    pub fn on_scroll(&self, px: u32, py: u32, direction: ScrollDirection) -> Option<Command> {
+        self.left
+            .iter()
+            .chain(&self.center)
+            .chain(&self.right)
+            .find_map(|widget| widget.on_scroll(px, py, direction))
     }
 }
 

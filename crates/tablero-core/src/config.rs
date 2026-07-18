@@ -67,9 +67,9 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting, NetworkWidget,
-    NotificationsWidget, StateColors, SystemWidget, TitleWidget, TrayWidget, VolumeWidget, Widget,
-    WidgetStyle, WorkspaceWidget,
+    BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting,
+    NetworkWidget, NotificationsWidget, StateColors, SystemWidget, TitleWidget, TrayWidget,
+    VolumeWidget, Widget, WidgetStyle, WorkspaceWidget, backlight::validate_backlight_format,
 };
 
 /// Default bar height in pixels.
@@ -214,6 +214,8 @@ pub enum WidgetKind {
     Clock,
     /// The battery indicator.
     Battery,
+    /// The screen brightness indicator and scroll control (opt-in).
+    Backlight,
     /// The CPU/memory indicator.
     System,
     /// The network connectivity indicator.
@@ -346,6 +348,16 @@ pub struct WidgetStyleConfig {
     /// compatibility; today only the bluetooth widget honors it.
     #[serde(rename = "on-click")]
     pub on_click: Option<std::path::PathBuf>,
+    /// Backlight label format. Supports `{icon}` and `{percent}`.
+    pub format: Option<String>,
+    /// Backlight icon ramp, selected from low to high brightness.
+    #[serde(rename = "format-icons")]
+    pub format_icons: Option<Vec<String>>,
+    /// Percentage points changed by one backlight scroll step.
+    #[serde(rename = "scroll-step")]
+    pub scroll_step: Option<f64>,
+    /// Preferred kernel backlight device name.
+    pub device: Option<String>,
 }
 
 impl WidgetStyleConfig {
@@ -410,6 +422,18 @@ impl WidgetStyleConfig {
         if self.on_click.is_some() {
             base.on_click = self.on_click.clone();
         }
+        if self.format.is_some() {
+            base.format = self.format.clone();
+        }
+        if self.format_icons.is_some() {
+            base.format_icons = self.format_icons.clone();
+        }
+        if self.scroll_step.is_some() {
+            base.scroll_step = self.scroll_step;
+        }
+        if self.device.is_some() {
+            base.device = self.device.clone();
+        }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
     }
@@ -428,6 +452,8 @@ pub struct WidgetStyles {
     pub clock: WidgetStyleConfig,
     /// Style for the battery widget.
     pub battery: WidgetStyleConfig,
+    /// Style and behavior for the backlight widget.
+    pub backlight: WidgetStyleConfig,
     /// Style for the system widget.
     pub system: WidgetStyleConfig,
     /// Style for the network widget.
@@ -451,6 +477,7 @@ impl WidgetStyles {
             WidgetKind::Workspaces => &self.workspaces,
             WidgetKind::Clock => &self.clock,
             WidgetKind::Battery => &self.battery,
+            WidgetKind::Backlight => &self.backlight,
             WidgetKind::System => &self.system,
             WidgetKind::Network => &self.network,
             WidgetKind::Tray => &self.tray,
@@ -467,6 +494,7 @@ impl WidgetStyles {
         self.workspaces.apply(&mut base.workspaces);
         self.clock.apply(&mut base.clock);
         self.battery.apply(&mut base.battery);
+        self.backlight.apply(&mut base.backlight);
         self.system.apply(&mut base.system);
         self.network.apply(&mut base.network);
         self.tray.apply(&mut base.tray);
@@ -724,6 +752,7 @@ impl Config {
         validate_font_size("font.size", self.font.size)?;
         validate_range("bar.margin", self.bar.margin, 0, MAX_GAP)?;
         validate_range("bar.gap", self.bar.gap, 0, MAX_GAP)?;
+        validate_backlight_config("widget.backlight", &self.widget.backlight)?;
 
         for monitor in &self.monitors {
             if monitor.name.trim().is_empty() {
@@ -750,6 +779,10 @@ impl Config {
             if let Some(gap) = monitor.bar.gap {
                 validate_range(&format!("monitor {who:?} bar.gap"), gap, 0, MAX_GAP)?;
             }
+            validate_backlight_config(
+                &format!("monitor {who:?} widget.backlight"),
+                &monitor.widget.backlight,
+            )?;
         }
         Ok(())
     }
@@ -855,6 +888,32 @@ fn validate_font_size(field: &str, size: f32) -> Result<(), String> {
     }
 }
 
+fn validate_backlight_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    if let Some(format) = &config.format {
+        validate_backlight_format(format).map_err(|error| format!("{field}.format {error}"))?;
+    }
+    if let Some(icons) = &config.format_icons
+        && (icons.is_empty() || icons.iter().any(String::is_empty))
+    {
+        return Err(format!("{field}.format-icons must contain non-empty icons"));
+    }
+    if let Some(step) = config.scroll_step
+        && (!step.is_finite() || step <= 0.0 || step > 100.0)
+    {
+        return Err(format!(
+            "{field}.scroll-step must be a finite number between 0 and 100, got {step}"
+        ));
+    }
+    if let Some(device) = &config.device
+        && (device.trim().is_empty() || device.contains('/') || device == "." || device == "..")
+    {
+        return Err(format!(
+            "{field}.device must be a non-empty sysfs device name, got {device:?}"
+        ));
+    }
+    Ok(())
+}
+
 impl WidgetKind {
     /// Construct the widget this kind names, occupying `bounds` and carrying its
     /// resolved `style`.
@@ -883,6 +942,7 @@ impl WidgetKind {
             },
             WidgetKind::Clock => Box::new(ClockWidget::new(bounds).with_style(style)),
             WidgetKind::Battery => Box::new(BatteryWidget::new(bounds).with_style(style)),
+            WidgetKind::Backlight => Box::new(BacklightWidget::new(bounds).with_style(style)),
             WidgetKind::System => Box::new(SystemWidget::new(bounds).with_style(style)),
             WidgetKind::Network => Box::new(NetworkWidget::new(bounds).with_style(style)),
             WidgetKind::Tray => Box::new(TrayWidget::new(bounds).with_style(style)),
@@ -974,7 +1034,18 @@ impl Config {
                 .map(|&kind| {
                     let style_config = self.widget.get(kind);
                     let style = style_config.resolve(&self.theme);
-                    kind.build(bounds, style, monitor, style_config.on_click.clone())
+                    if kind == WidgetKind::Backlight {
+                        Box::new(
+                            BacklightWidget::new(bounds)
+                                .with_style(style)
+                                .with_device(style_config.device.clone())
+                                .with_format(style_config.format.clone())
+                                .with_format_icons(style_config.format_icons.clone())
+                                .with_scroll_step(style_config.scroll_step),
+                        ) as Box<dyn Widget>
+                    } else {
+                        kind.build(bounds, style, monitor, style_config.on_click.clone())
+                    }
                 })
                 .collect()
         };
@@ -1992,6 +2063,59 @@ mod tests {
         let config = Config::from_toml_str("height = 4096\n[font]\nsize = 1.0").unwrap();
         assert_eq!(config.height, 4096);
         assert_eq!(config.font.size, 1.0);
+    }
+
+    #[test]
+    fn backlight_configuration_parses_and_merges_per_monitor() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["backlight"]
+            [widget.backlight]
+            device = "intel_backlight"
+            format = "{icon}  {percent}%"
+            format-icons = ["low", "high"]
+            scroll-step = 1.5
+
+            [[monitor]]
+            name = "eDP-1"
+            [monitor.widget.backlight]
+            scroll-step = 2.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.bar.modules_right, vec![WidgetKind::Backlight]);
+        assert_eq!(
+            config.widget.backlight.device.as_deref(),
+            Some("intel_backlight")
+        );
+        assert_eq!(
+            config.widget.backlight.format_icons.as_deref(),
+            Some(&["low".to_string(), "high".to_string()][..])
+        );
+        let resolved = config.resolve_for_output(Some("eDP-1"));
+        assert_eq!(resolved.widget.backlight.scroll_step, Some(2.0));
+        assert_eq!(
+            resolved.widget.backlight.device.as_deref(),
+            Some("intel_backlight")
+        );
+    }
+
+    #[test]
+    fn invalid_backlight_configuration_is_rejected() {
+        for doc in [
+            "[widget.backlight]\nformat = \"{unknown}\"",
+            "[widget.backlight]\nformat-icons = []",
+            "[widget.backlight]\nscroll-step = 0.0",
+            "[widget.backlight]\ndevice = \"../panel\"",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Invalid { .. }),
+                "{doc}: {error:?}"
+            );
+            assert!(error.to_string().contains("widget.backlight"));
+        }
     }
 
     #[test]
