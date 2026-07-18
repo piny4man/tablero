@@ -31,6 +31,7 @@ pub mod power_profiles;
 pub mod system;
 pub mod title;
 pub mod tray;
+pub mod updates;
 pub mod volume;
 pub mod workspaces;
 
@@ -47,6 +48,7 @@ pub use tray::{
     TrayIcon, TrayItem, TrayMenu, TrayMenuItem, TrayMenuMode, TrayMenuToggle, TrayMenuToggleKind,
     TrayMenuToggleState, TrayState, TrayStatus, TrayWidget,
 };
+pub use updates::{PackageUpdate, PackageUpdates, UpdatesWidget};
 pub use volume::{DeviceKind, Volume, VolumeWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -136,6 +138,8 @@ pub enum Msg {
     Notifications(Option<Notifications>),
     /// The power-profiles-daemon state; `None` means the daemon is unavailable.
     PowerProfiles(Option<PowerProfilesState>),
+    /// Available Arch repository and AUR updates; `None` hides the widget.
+    Updates(Option<PackageUpdates>),
 }
 
 impl Msg {

@@ -55,6 +55,12 @@ RUST_LOG=info cargo run -p tablero
     status bar. Device state follows native udev events with periodic recovery
     polling, and the widget reserves no slot when no screen backlight is present.
   - **System** — CPU and memory load sampled from procfs.
+  - **Updates** — available Arch Linux package updates, checked immediately and
+    every five minutes. **Opt-in** in the built-in config and enabled first in the
+    ARC preset's right zone. Official repository updates come from the safe,
+    isolated database used by `checkupdates`; when `paru` is installed, pending
+    AUR updates from `paru -Qua` are added. The widget hides when the total is
+    zero or the required official check is unavailable.
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
     NetworkManager is unavailable.
@@ -157,7 +163,7 @@ gap = 0
 
 # Modules are placed independently in left, center, and right zones. Valid names:
 # "workspaces", "title", "clock", "battery", "system", "network", "tray",
-# "bluetooth", "volume", "backlight", "notifications", and
+# "bluetooth", "volume", "backlight", "notifications", "updates", and
 # "power-profiles-daemon". Repeats are de-duplicated, keeping first position.
 modules-left = ["workspaces"]
 modules-center = ["title"]
@@ -184,7 +190,7 @@ size = 16.0
 | `bar.gap`      | integer (px)    | `0`                                           | Gap between adjacent modules in a zone.                          |
 | `bar.modules-left` | list of strings | `["workspaces"]`                          | Modules packed against the left edge.                            |
 | `bar.modules-center` | list of strings | `["title"]`                             | Modules centered independently of the edge zones.                |
-| `bar.modules-right` | list of strings | `["clock", "battery", "system", "network", "power-profiles-daemon"]` | Modules packed against the right edge. Also accepts the opt-in modules `"tray"`, `"bluetooth"`, `"volume"`, `"backlight"`, and `"notifications"`. |
+| `bar.modules-right` | list of strings | `["clock", "battery", "system", "network", "power-profiles-daemon"]` | Modules packed against the right edge. Also accepts the opt-in modules `"tray"`, `"bluetooth"`, `"volume"`, `"backlight"`, `"notifications"`, and `"updates"`. |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -228,8 +234,32 @@ Per-widget click handlers live on every `[widget.<name>]` table as
 spawns the file directly (no shell) — typical use is
 `[widget.bluetooth] on-click = "/path/to/blueman-manager"` or
 `[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
-a leading `~` for the user's home, expanded at click time. Today only the
-bluetooth and volume widgets honor the field; other widgets ignore it.
+a leading `~` for the user's home, expanded at click time. Today the bluetooth,
+volume, and updates widgets honor the field; other widgets ignore it.
+
+The Arch package-updates module requires `checkupdates` from the official
+`pacman-contrib` package. `paru` is optional; when available, its AUR count is
+added to the official repository count. No Waybar helper module is required:
+
+```sh
+sudo pacman -S --needed pacman-contrib
+```
+
+```toml
+[bar]
+modules-right = ["updates", "clock"]
+
+[widget.updates]
+format = "{icon} {count}"
+# Optional direct executable or script; no shell or arguments are implied.
+# on-click = "/path/to/update-system"
+```
+
+Only `{count}` and `{icon}` are accepted in `format`. Checks run immediately and
+then every 300 seconds. A missing or failed `paru` command falls back to official
+updates; a missing or failed `checkupdates` command hides the module rather than
+presenting a misleading partial total. Hovering the module lists each package's
+installed and available versions, grouped by official repositories and AUR.
 
 The backlight module has four module-specific fields:
 

@@ -72,9 +72,9 @@ use crate::scale::Scale;
 use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting,
     NetworkWidget, NotificationsWidget, PowerProfilesWidget, StateColors, SystemWidget,
-    TitleWidget, TrayWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
+    TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
     backlight::validate_backlight_format, battery::validate_battery_format,
-    power_profiles::validate_power_profiles_format,
+    power_profiles::validate_power_profiles_format, updates::validate_updates_format,
 };
 
 /// Default bar height in pixels.
@@ -239,6 +239,8 @@ pub enum WidgetKind {
     /// The active power-profiles-daemon profile.
     #[serde(rename = "power-profiles-daemon")]
     PowerProfilesDaemon,
+    /// Available Arch repository and AUR package updates (opt-in).
+    Updates,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -366,7 +368,7 @@ pub struct WidgetStyleConfig {
     /// display-only and clicks yield nothing. The path is taken verbatim and
     /// may use a leading `~` for the user's home, which the executor expands
     /// at click time. Available on every widget kind for forward
-    /// compatibility; today only the bluetooth widget honors it.
+    /// compatibility; today bluetooth, volume, and updates honor it.
     #[serde(rename = "on-click")]
     pub on_click: Option<std::path::PathBuf>,
     /// Widget label format. Supported placeholders depend on the widget.
@@ -549,6 +551,8 @@ pub struct WidgetStyles {
     /// Style and behavior for the power-profiles-daemon widget.
     #[serde(rename = "power-profiles-daemon")]
     pub power_profiles_daemon: WidgetStyleConfig,
+    /// Style and behavior for the Arch package-updates widget.
+    pub updates: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -567,6 +571,7 @@ impl WidgetStyles {
             WidgetKind::Volume => &self.volume,
             WidgetKind::Notifications => &self.notifications,
             WidgetKind::PowerProfilesDaemon => &self.power_profiles_daemon,
+            WidgetKind::Updates => &self.updates,
         }
     }
 
@@ -586,6 +591,7 @@ impl WidgetStyles {
         self.notifications.apply(&mut base.notifications);
         self.power_profiles_daemon
             .apply(&mut base.power_profiles_daemon);
+        self.updates.apply(&mut base.updates);
     }
 }
 
@@ -843,6 +849,7 @@ impl Config {
             "widget.power-profiles-daemon",
             &self.widget.power_profiles_daemon,
         )?;
+        validate_updates_config("widget.updates", &self.widget.updates)?;
 
         for monitor in &self.monitors {
             if monitor.name.trim().is_empty() {
@@ -881,6 +888,10 @@ impl Config {
                 &format!("monitor {who:?} widget.power-profiles-daemon"),
                 &monitor.widget.power_profiles_daemon,
             )?;
+            validate_updates_config(
+                &format!("monitor {who:?} widget.updates"),
+                &monitor.widget.updates,
+            )?;
         }
         Ok(())
     }
@@ -903,6 +914,33 @@ impl Config {
             center,
             right,
         }
+    }
+
+    /// Whether a widget appears in the global layout or any monitor override.
+    pub fn uses_widget(&self, kind: WidgetKind) -> bool {
+        let bar_contains = |bar: &Bar| {
+            bar.modules_left.contains(&kind)
+                || bar.modules_center.contains(&kind)
+                || bar.modules_right.contains(&kind)
+        };
+        bar_contains(&self.bar)
+            || self.monitors.iter().any(|monitor| {
+                monitor
+                    .bar
+                    .modules_left
+                    .as_ref()
+                    .is_some_and(|zone| zone.contains(&kind))
+                    || monitor
+                        .bar
+                        .modules_center
+                        .as_ref()
+                        .is_some_and(|zone| zone.contains(&kind))
+                    || monitor
+                        .bar
+                        .modules_right
+                        .as_ref()
+                        .is_some_and(|zone| zone.contains(&kind))
+            })
     }
 
     /// Resolve the effective config for one output, by connector name.
@@ -1048,6 +1086,13 @@ fn validate_power_profiles_config(field: &str, config: &WidgetStyleConfig) -> Re
     Ok(())
 }
 
+fn validate_updates_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    if let Some(format) = &config.format {
+        validate_updates_format(format).map_err(|error| format!("{field}.format {error}"))?;
+    }
+    Ok(())
+}
+
 impl WidgetKind {
     /// Construct the widget this kind names, occupying `bounds` and carrying its
     /// resolved `style`.
@@ -1103,6 +1148,11 @@ impl WidgetKind {
             WidgetKind::PowerProfilesDaemon => {
                 Box::new(PowerProfilesWidget::new(bounds).with_style(style))
             }
+            WidgetKind::Updates => Box::new(
+                UpdatesWidget::new(bounds)
+                    .with_style(style)
+                    .with_on_click(on_click),
+            ),
         }
     }
 }
@@ -1204,6 +1254,12 @@ impl Config {
                                 )
                                 .with_tooltip(style_config.tooltip)
                                 .with_tooltip_format(style_config.tooltip_format.clone()),
+                        ),
+                        WidgetKind::Updates => Box::new(
+                            UpdatesWidget::new(bounds)
+                                .with_style(style)
+                                .with_format(style_config.format.clone())
+                                .with_on_click(style_config.on_click.clone()),
                         ),
                         _ => kind.build(bounds, style, monitor, style_config.on_click.clone()),
                     }
@@ -1340,6 +1396,7 @@ mod tests {
         assert_eq!(
             parsed.bar.modules_right,
             vec![
+                WidgetKind::Updates,
                 WidgetKind::Bluetooth,
                 WidgetKind::Backlight,
                 WidgetKind::Volume,
@@ -1357,6 +1414,11 @@ mod tests {
             Some(Color::rgb(0x3D, 0x1F, 0x3A))
         );
         assert_eq!(parsed.widget.workspaces.border_width, Some(1));
+        assert_eq!(
+            parsed.widget.updates.format.as_deref(),
+            Some("{icon} {count}")
+        );
+        assert_eq!(parsed.widget.updates.padding, Some(6));
         assert_eq!(
             parsed.widget.battery.format.as_deref(),
             Some("{icon} {percent}%")
@@ -1537,6 +1599,58 @@ mod tests {
             None,
             None,
         );
+    }
+
+    #[test]
+    fn updates_is_an_opt_in_widget_name() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["updates", "clock"]
+
+            [widget.updates]
+            format = "{count} {icon}"
+            on-click = "/usr/local/bin/update-system"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.bar.modules_right,
+            vec![WidgetKind::Updates, WidgetKind::Clock]
+        );
+        assert_eq!(
+            config.widget.updates.format.as_deref(),
+            Some("{count} {icon}")
+        );
+        assert_eq!(
+            config.widget.updates.on_click.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/update-system"))
+        );
+    }
+
+    #[test]
+    fn uses_widget_checks_global_and_monitor_zones() {
+        let global = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["updates"]
+            "#,
+        )
+        .unwrap();
+        assert!(global.uses_widget(WidgetKind::Updates));
+
+        let monitor = Config::from_toml_str(
+            r#"
+            [[monitor]]
+            name = "eDP-1"
+            [monitor.bar]
+            modules-right = ["updates"]
+            "#,
+        )
+        .unwrap();
+        assert!(monitor.uses_widget(WidgetKind::Updates));
+        assert!(!Config::default().uses_widget(WidgetKind::Updates));
     }
 
     #[test]
@@ -2345,6 +2459,15 @@ mod tests {
             .to_string();
         assert!(error.contains("widget.battery.format"), "message: {error}");
         assert!(error.contains("{watts}"), "message: {error}");
+    }
+
+    #[test]
+    fn invalid_updates_format_is_rejected() {
+        let error = Config::from_toml_str("[widget.updates]\nformat = \"{percent}\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("widget.updates.format"), "message: {error}");
+        assert!(error.contains("{percent}"), "message: {error}");
     }
 
     #[test]

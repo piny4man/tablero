@@ -18,6 +18,7 @@ gap = 4
 modules-left = ["workspaces", "title"]
 modules-center = []
 modules-right = [
+  "updates",
   "bluetooth",
   "backlight",
   "volume",
@@ -75,6 +76,18 @@ padding = 6
 background = "#f7080b30"
 foreground = "#ff4a4d"
 border = "#f7080b"
+
+# Hidden when the machine is current. checkupdates supplies official repository
+# updates; when paru is installed its pending AUR updates are added to the count.
+[widget.updates]
+background = "#1c0e1ee8"
+foreground = "#f9cf07"
+border = "#f9cf07"
+border-width = 1
+radius = 2
+padding = 6
+format = "{icon} {count}"
+# on-click = "/path/to/update-system"
 
 [widget.notifications]
 background = "#1c0e1ee8"
