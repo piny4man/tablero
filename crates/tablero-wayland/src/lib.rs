@@ -25,6 +25,7 @@ pub mod power_profiles;
 pub mod producer;
 pub mod sni;
 pub mod sysmon;
+pub mod updates;
 pub mod upower;
 pub mod volume;
 
@@ -67,7 +68,7 @@ use smithay_client_toolkit::{
 };
 use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_minute;
-use tablero_core::config::Config;
+use tablero_core::config::{Config, WidgetKind};
 use tablero_core::render::{Bounds, RenderContext, RenderSettings};
 use tablero_core::scale::Scale;
 use tablero_core::widget::{
@@ -86,6 +87,7 @@ use crate::power_profiles::PowerProfilesProducer;
 use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
 use crate::sysmon::SystemProducer;
+use crate::updates::UpdatesProducer;
 use crate::upower::UPowerProducer;
 use crate::volume::VolumeProducer;
 use wayland_client::{
@@ -1042,32 +1044,40 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// set — the Hyprland workspace source, the UPower battery source, the procfs
 /// system-stats source, the NetworkManager connectivity source, the BlueZ
 /// bluetooth source, the native PipeWire volume source, the
-/// StatusNotifierItem tray host, and the swaync notification source — so the
+/// StatusNotifierItem tray host, swaync notification source, and optional Arch
+/// package-update poller — so the
 /// bar shows live workspaces, battery, CPU/memory load, network state,
 /// Bluetooth adapter state, the active output sink's volume, tray icons, and
 /// the notification indicator alongside the clock. The bluetooth, volume,
 /// tray, and notifications producers run even when their widgets are not in
 /// any zone; the widget only appears when the user adds `"bluetooth"`,
-/// `"volume"`, `"tray"`, or `"notifications"` to a zone. The volume source runs on a dedicated OS thread —
+/// `"volume"`, `"tray"`, or `"notifications"` to a zone. The update poller is
+/// the exception: it starts only when `"updates"` is configured, avoiding
+/// needless subprocess and network work. The volume source runs on a dedicated
+/// OS thread —
 /// PipeWire's main loop is synchronous, unlike the other producers' zbus
 /// backends. The clock itself is still driven by the synchronous tick timer;
 /// see [`run_with_producers`] to supply a custom producer set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    run_with_producers(
-        config,
-        vec![
-            Box::new(HyprlandProducer::new()),
-            Box::new(UPowerProducer::new()),
-            Box::new(BacklightProducer::new()),
-            Box::new(SystemProducer::new()),
-            Box::new(NetworkProducer::new()),
-            Box::new(BluetoothProducer::new()),
-            Box::new(VolumeProducer::new()),
-            Box::new(SniHostProducer::new()),
-            Box::new(NotificationsProducer::new()),
-            Box::new(PowerProfilesProducer::new()),
-        ],
-    )
+    let mut producers: Vec<Box<dyn Producer>> = vec![
+        Box::new(HyprlandProducer::new()),
+        Box::new(UPowerProducer::new()),
+        Box::new(BacklightProducer::new()),
+        Box::new(SystemProducer::new()),
+        Box::new(NetworkProducer::new()),
+        Box::new(BluetoothProducer::new()),
+        Box::new(VolumeProducer::new()),
+        Box::new(SniHostProducer::new()),
+        Box::new(NotificationsProducer::new()),
+        Box::new(PowerProfilesProducer::new()),
+    ];
+    // Unlike DBus subscriptions, checking package repositories performs network
+    // and subprocess work, so keep this producer dormant unless some output uses
+    // the opt-in module.
+    if config.uses_widget(WidgetKind::Updates) {
+        producers.push(Box::new(UpdatesProducer::new()));
+    }
+    run_with_producers(config, producers)
 }
 
 /// Open the bar and run its event loop, additionally driving `producers` on an
