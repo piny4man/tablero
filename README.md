@@ -90,6 +90,11 @@ RUST_LOG=info cargo run -p tablero
     to a zone to enable it. Requires swaync running as the notification
     daemon; while it is not on the bus the widget reserves no slot, and it
     reappears automatically when swaync (re)starts.
+  - **Power profiles** — the active power-profiles-daemon profile, followed
+    natively over the system DBus. Enabled by default after the network module;
+    it hides when the daemon is unavailable. Left-click rotates forward through
+    the advertised profiles, right-click rotates backward, and hovering shows
+    the configured profile and driver tooltip.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -140,21 +145,18 @@ Every value below is the built-in default.
 # displays). The width always spans the output.
 height = 32
 
-# Horizontal gap between adjacent widget columns, in pixels.
-spacing = 0
+[bar]
+# Logical-pixel inset around the full module row and gap between adjacent modules.
+margin = 0
+gap = 0
 
-# Inner padding inset on each widget column, in pixels.
-padding = 0
-
-# Widgets to render, left to right. Valid names: "workspaces", "title",
-# "clock", "battery", "system", "network", "tray", "bluetooth", "volume",
-# "backlight", "notifications". "tray", "bluetooth", "volume", "backlight",
-# and "notifications" are
-# opt-in (not in the default set above) — add them to enable the system tray,
-# the Bluetooth adapter indicator, the output volume, and the swaync
-# notification indicator respectively. Repeats are de-duplicated, keeping
-# first position.
-widgets = ["workspaces", "title", "clock", "battery", "system", "network"]
+# Modules are placed independently in left, center, and right zones. Valid names:
+# "workspaces", "title", "clock", "battery", "system", "network", "tray",
+# "bluetooth", "volume", "backlight", "notifications", and
+# "power-profiles-daemon". Repeats are de-duplicated, keeping first position.
+modules-left = ["workspaces"]
+modules-center = ["title"]
+modules-right = ["clock", "battery", "system", "network", "power-profiles-daemon"]
 
 [theme]
 # Colors are "#rrggbb" hex strings (the leading "#" is optional).
@@ -172,9 +174,12 @@ size = 16.0
 | Key            | Type            | Default                                       | Notes                                                            |
 | -------------- | --------------- | --------------------------------------------- | ---------------------------------------------------------------- |
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
-| `spacing`      | integer (px)    | `0`                                           | Gap between adjacent widget columns.                             |
-| `padding`      | integer (px)    | `0`                                           | Inset applied inside each widget column.                         |
-| `widgets`      | list of strings | `["workspaces", "title", "clock", "battery", "system", "network"]` | Render order, left to right; duplicates keep their first slot. Also accepts `"tray"` (opt-in system tray), `"bluetooth"` (opt-in BlueZ-backed adapter indicator), `"volume"` (opt-in PipeWire-backed output volume), `"backlight"` (opt-in native brightness display/control), and `"notifications"` (opt-in swaync-backed notification indicator). |
+| `bar.background` | hex color (opt.) | unset                                       | Bar fill; inherits `theme.background` when unset.                |
+| `bar.margin`   | integer (px)    | `0`                                           | Inset around the full module row.                                |
+| `bar.gap`      | integer (px)    | `0`                                           | Gap between adjacent modules in a zone.                          |
+| `bar.modules-left` | list of strings | `["workspaces"]`                          | Modules packed against the left edge.                            |
+| `bar.modules-center` | list of strings | `["title"]`                             | Modules centered independently of the edge zones.                |
+| `bar.modules-right` | list of strings | `["clock", "battery", "system", "network", "power-profiles-daemon"]` | Modules packed against the right edge. Also accepts the opt-in modules `"tray"`, `"bluetooth"`, `"volume"`, `"backlight"`, and `"notifications"`. |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -206,6 +211,27 @@ Only `{icon}` and `{percent}` are accepted in `format`. Icons are selected from
 low to high brightness. Scrolling requires an active systemd-logind session;
 display remains available if logind cannot perform writes.
 
+The power-profiles-daemon module is enabled by default and uses the daemon's
+advertised profile order for click rotation:
+
+```toml
+[widget.power-profiles-daemon]
+format = "{icon}"
+tooltip-format = "Power profile: {profile}\nDriver: {driver}"
+tooltip = true
+
+[widget.power-profiles-daemon.format-icons]
+default = ""
+performance = ""
+balanced = ""
+power-saver = ""
+```
+
+Both `format` and `tooltip-format` accept `{icon}`, `{profile}`, `{driver}`,
+`{cpu_driver}`, and `{platform_driver}`. The module talks directly to the
+official system D-Bus API and falls back to its legacy compatible name; it never
+spawns `powerprofilesctl`.
+
 ### Per-monitor overrides
 
 tablero shows one bar per output. By default every output runs on the global
@@ -217,7 +243,9 @@ by its Hyprland connector name (`hyprctl monitors` lists them — `DP-1`,
 [[monitor]]
 name = "DP-1"          # required: the connector to match
 height = 40            # override just this output's height
-widgets = ["workspaces", "clock"]   # and its widget set
+
+[monitor.bar]
+modules-center = ["clock"] # replace just this output's center zone
 
 [monitor.theme]
 accent = "#88c0d0"     # only the accent changes; background/foreground inherit
@@ -244,9 +272,10 @@ unchanged.
 | `monitor` (`[[monitor]]`) | array of tables | One block per output you want to customize; omit entirely for a uniform bar. |
 | `monitor.name`       | string          | **Required.** Hyprland connector name to match (`hyprctl monitors`).  |
 | `monitor.height`     | integer (px)    | Overrides `height` on this output.                                    |
-| `monitor.spacing`    | integer (px)    | Overrides `spacing` on this output.                                   |
-| `monitor.padding`    | integer (px)    | Overrides `padding` on this output.                                   |
-| `monitor.widgets`    | list of strings | Overrides the widget set/order on this output.                        |
+| `monitor.bar.background` | hex color (opt.) | Overrides the bar fill on this output.                           |
+| `monitor.bar.margin` | integer (px)    | Overrides the module-row inset on this output.                        |
+| `monitor.bar.gap`    | integer (px)    | Overrides the inter-module gap on this output.                        |
+| `monitor.bar.modules-*` | list of strings | Replaces the named module zone on this output.                     |
 | `monitor.theme.*`    | hex color       | Per-channel theme override; omitted channels inherit the global theme. |
 | `monitor.font.*`     | family / size   | Per-field font override; omitted fields inherit the global font.      |
 | `monitor.widget.*`  | per-widget table | Per-widget style override (e.g. `[monitor.widget.title] background`); folded per-field onto the global `[widget.<name>]` table. |
@@ -259,7 +288,7 @@ surface placement and input need a live compositor. To verify on Hyprland:
 1. From inside a Hyprland session, run `RUST_LOG=info cargo run -p tablero`.
 2. Confirm a bar appears **pinned to the top** of the screen, spanning its full
    width, showing a dark background with the workspaces, **title**, clock,
-   battery, system, and network widgets laid out left to right.
+   battery, system, network, and power-profile widgets in their configured zones.
 3. Confirm the clock **advances once per second** and that the text changes
    exactly on the second boundary (the timer is second-aligned).
 4. Confirm the **workspace indicator tracks Hyprland** — switching workspaces by

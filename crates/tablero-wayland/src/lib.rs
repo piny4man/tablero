@@ -21,6 +21,7 @@ pub mod hyprland;
 pub mod networkmanager;
 pub mod notifications;
 pub mod outputs;
+pub mod power_profiles;
 pub mod producer;
 pub mod sni;
 pub mod sysmon;
@@ -35,22 +36,31 @@ use calloop::channel::Event as ChannelEvent;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
 use log::{error, info, warn};
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_seat, delegate_shm, delegate_xdg_popup, delegate_xdg_shell,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
-        pointer::{BTN_LEFT, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{
+            BTN_LEFT, BTN_RIGHT, CursorIcon, PointerEvent, PointerEventKind, PointerHandler,
+            ThemeSpec, ThemedPointer,
+        },
     },
     shell::{
         WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
+        },
+        xdg::{
+            XdgPositioner, XdgShell,
+            popup::{Popup, PopupConfigure, PopupHandler},
+            window::{Window, WindowConfigure, WindowHandler},
         },
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
@@ -60,7 +70,7 @@ use tablero_core::clock::millis_until_next_minute;
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::scale::Scale;
-use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, ScrollDirection};
+use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip};
 
 use crate::backlight::BacklightProducer;
 use crate::bluetooth::BluetoothProducer;
@@ -69,15 +79,16 @@ use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
 use crate::notifications::NotificationsProducer;
 use crate::outputs::{OutputId, Outputs};
+use crate::power_profiles::PowerProfilesProducer;
 use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
 use crate::sysmon::SystemProducer;
 use crate::upower::UPowerProducer;
 use crate::volume::VolumeProducer;
 use wayland_client::{
-    Connection, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
 };
 
 /// Layer-shell namespace (also the compositor-visible surface name).
@@ -196,10 +207,12 @@ impl Surface {
     /// Apply a message to the dashboard; redraw only if a widget reported a
     /// visible change. This is the steady-state redraw policy: the loop stays
     /// idle when an update changes nothing on screen.
-    fn handle(&mut self, msg: &Msg, pool: &mut SlotPool) {
-        if self.dashboard.update(msg) {
+    fn handle(&mut self, msg: &Msg, pool: &mut SlotPool) -> bool {
+        let changed = self.dashboard.update(msg);
+        if changed {
             self.draw(pool);
         }
+        changed
     }
 
     /// Adopt a new output buffer scale.
@@ -208,15 +221,16 @@ impl Surface {
     /// text stays crisp at the new density, then repaints (once configured) so
     /// the buffer is reallocated at the new physical size. A no-op when the scale
     /// is unchanged.
-    fn set_scale(&mut self, scale: Scale, pool: &mut SlotPool) {
+    fn set_scale(&mut self, scale: Scale, pool: &mut SlotPool) -> bool {
         if self.scale == scale {
-            return;
+            return false;
         }
         self.scale = scale;
         self.ctx
             .set_settings(self.config.scaled_render_settings(scale));
         info!("output scale changed to {}x", scale.get());
         self.draw(pool);
+        true
     }
 
     /// Resolve a `button` press at surface coordinates `(x, y)` to a
@@ -236,6 +250,15 @@ impl Surface {
             .on_click((x * s) as u32, (y * s) as u32, button)
     }
 
+    fn is_clickable_at(&self, x: f64, y: f64) -> bool {
+        if x < 0.0 || y < 0.0 {
+            return false;
+        }
+        let scale = self.scale.get() as f64;
+        self.dashboard
+            .is_clickable_at((x * scale) as u32, (y * scale) as u32)
+    }
+
     /// Resolve one logical scroll step against the widget under `(x, y)`.
     fn on_scroll(&self, x: f64, y: f64, direction: ScrollDirection) -> Option<Command> {
         if x < 0.0 || y < 0.0 {
@@ -244,6 +267,16 @@ impl Surface {
         let scale = self.scale.get() as f64;
         self.dashboard
             .on_scroll((x * scale) as u32, (y * scale) as u32, direction)
+    }
+
+    /// Resolve tooltip content at surface-local logical coordinates.
+    fn tooltip_at(&self, x: f64, y: f64) -> Option<Tooltip> {
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let scale = self.scale.get() as f64;
+        self.dashboard
+            .tooltip_at((x * scale) as u32, (y * scale) as u32)
     }
 
     /// Adopt the compositor's configure, seeding and drawing the first frame.
@@ -311,6 +344,103 @@ impl Surface {
     }
 }
 
+/// One visible hover tooltip, implemented as an xdg popup parented to a bar.
+struct TooltipSurface {
+    popup: Popup,
+    output_id: OutputId,
+    text: String,
+    width: u32,
+    height: u32,
+    scale: Scale,
+    background: (u8, u8, u8, u8),
+    foreground: (u8, u8, u8, u8),
+    ctx: RenderContext,
+    configured: bool,
+}
+
+impl TooltipSurface {
+    fn owns(&self, popup: &Popup) -> bool {
+        self.popup == *popup
+    }
+
+    fn owns_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.popup.wl_surface() == surface
+    }
+
+    fn draw(&mut self, pool: &mut SlotPool) {
+        if !self.configured {
+            return;
+        }
+        let scale = self.scale.get();
+        let width = self.width * scale;
+        let height = self.height * scale;
+        let stride = width as i32 * 4;
+        let (buffer, canvas) = match pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) {
+            Ok(parts) => parts,
+            Err(error) => {
+                warn!("failed to create tooltip buffer: {error}");
+                return;
+            }
+        };
+
+        self.ctx.resize(width, height);
+        self.ctx.fill_rounded_rect(
+            Bounds::new(0, 0, width, height),
+            self.background,
+            6.0 * scale as f32,
+        );
+        let padding_x = 8 * scale;
+        let padding_y = 6 * scale;
+        let line_height = tooltip_line_height(&self.ctx);
+        for (index, line) in self.text.lines().enumerate() {
+            self.ctx.draw_text(
+                line,
+                Bounds::new(
+                    padding_x,
+                    padding_y + index as u32 * line_height,
+                    width.saturating_sub(2 * padding_x),
+                    line_height,
+                ),
+                self.foreground,
+            );
+        }
+        write_argb8888(self.ctx.pixels(), canvas);
+        self.popup
+            .wl_surface()
+            .set_buffer_scale(self.scale.get() as i32);
+        self.popup
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+        if let Err(error) = buffer.attach_to(self.popup.wl_surface()) {
+            warn!("failed to attach tooltip buffer: {error}");
+            return;
+        }
+        self.popup.wl_surface().commit();
+    }
+}
+
+fn tooltip_line_height(ctx: &RenderContext) -> u32 {
+    (ctx.settings().font_size * 1.25).ceil() as u32
+}
+
+fn tooltip_size(ctx: &mut RenderContext, text: &str) -> (u32, u32) {
+    let scale = ctx.scale_factor();
+    let width = text
+        .lines()
+        .map(|line| ctx.measure_text(line))
+        .max()
+        .unwrap_or(0)
+        + 16 * scale;
+    let lines = text.lines().count().max(1) as u32;
+    let height = lines * tooltip_line_height(ctx) + 12 * scale;
+    (width.max(1), height.max(1))
+}
+
 /// The shared application state and the calloop data type.
 ///
 /// Owns everything common to every output — the Wayland registry, seat, shm and
@@ -331,8 +461,11 @@ struct App {
     compositor: CompositorState,
     /// Retained to create a fresh layer surface per output.
     layer_shell: LayerShell,
+    /// XDG shell global used to create layer-shell-associated tooltip popups.
+    xdg_shell: XdgShell,
     /// The seat's pointer, created once the seat advertises the capability.
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<ThemedPointer>,
+    pointer_cursor: CursorIcon,
     /// Fractional logical vertical scroll steps retained across pointer frames.
     scroll_remainder: f64,
     /// Outbound command channels into the producer runtime, one per command
@@ -344,6 +477,8 @@ struct App {
     /// The per-output bars, keyed by output id. The whole multi-monitor lifecycle
     /// lives here.
     outputs: Outputs<Surface>,
+    /// The currently visible tooltip; at most one pointer hover exists per seat.
+    tooltip: Option<TooltipSurface>,
     exit: bool,
 }
 
@@ -395,9 +530,127 @@ impl App {
     /// changed. The clock timer and every producer reach all bars this way.
     fn handle_all(&mut self, msg: &Msg) {
         let App { pool, outputs, .. } = self;
+        let mut changed = false;
         for surface in outputs.values_mut() {
-            surface.handle(msg, pool);
+            changed |= surface.handle(msg, pool);
         }
+        if changed && matches!(msg, Msg::PowerProfiles(_)) {
+            self.hide_tooltip();
+        }
+    }
+
+    fn hide_tooltip(&mut self) {
+        self.tooltip = None;
+    }
+
+    fn set_pointer_cursor(&mut self, conn: &Connection, icon: CursorIcon, force: bool) {
+        if !force && self.pointer_cursor == icon {
+            return;
+        }
+        let Some(pointer) = &self.pointer else {
+            return;
+        };
+        match pointer.set_cursor(conn, icon) {
+            Ok(()) => self.pointer_cursor = icon,
+            Err(error) => warn!("failed to set pointer cursor: {error}"),
+        }
+    }
+
+    fn update_tooltip(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        x: f64,
+        y: f64,
+        qh: &QueueHandle<App>,
+    ) {
+        let request = self
+            .outputs
+            .values()
+            .find(|bar| bar.owns(surface))
+            .and_then(|bar| {
+                let tooltip = bar.tooltip_at(x, y)?;
+                Some((
+                    bar.output_id,
+                    bar.layer.clone(),
+                    bar.scale,
+                    bar.config.scaled_render_settings(bar.scale),
+                    tooltip,
+                ))
+            });
+        let Some((output_id, parent, scale, mut settings, tooltip)) = request else {
+            self.hide_tooltip();
+            return;
+        };
+        if self
+            .tooltip
+            .as_ref()
+            .is_some_and(|shown| shown.output_id == output_id && shown.text == tooltip.text)
+        {
+            return;
+        }
+
+        let background = settings.background;
+        let foreground = settings.foreground;
+        settings.background = (0, 0, 0, 0);
+        let mut ctx = RenderContext::with_settings(1, 1, settings);
+        let (physical_width, physical_height) = tooltip_size(&mut ctx, &tooltip.text);
+        let divisor = scale.get();
+        let width = physical_width.div_ceil(divisor);
+        let height = physical_height.div_ceil(divisor);
+        let anchor = Bounds::new(
+            tooltip.bounds.x / divisor,
+            tooltip.bounds.y / divisor,
+            tooltip.bounds.width.div_ceil(divisor),
+            tooltip.bounds.height.div_ceil(divisor),
+        );
+
+        let positioner = match XdgPositioner::new(&self.xdg_shell) {
+            Ok(positioner) => positioner,
+            Err(error) => {
+                warn!("failed to create tooltip positioner: {error}");
+                return;
+            }
+        };
+        positioner.set_size(width as i32, height as i32);
+        positioner.set_anchor_rect(
+            anchor.x as i32,
+            anchor.y as i32,
+            anchor.width.max(1) as i32,
+            anchor.height.max(1) as i32,
+        );
+        positioner.set_anchor(xdg_positioner::Anchor::Bottom);
+        positioner.set_gravity(xdg_positioner::Gravity::Bottom);
+        positioner.set_constraint_adjustment(
+            xdg_positioner::ConstraintAdjustment::SlideX
+                | xdg_positioner::ConstraintAdjustment::FlipY,
+        );
+
+        let popup_surface = self.compositor.create_surface(qh);
+        let popup = match Popup::from_surface(None, &positioner, qh, popup_surface, &self.xdg_shell)
+        {
+            Ok(popup) => popup,
+            Err(error) => {
+                warn!("failed to create tooltip popup: {error}");
+                return;
+            }
+        };
+        parent.get_popup(popup.xdg_popup());
+        let input_region = self.compositor.wl_compositor().create_region(qh, ());
+        popup.wl_surface().set_input_region(Some(&input_region));
+        input_region.destroy();
+        popup.wl_surface().commit();
+        self.tooltip = Some(TooltipSurface {
+            popup,
+            output_id,
+            text: tooltip.text,
+            width,
+            height,
+            scale,
+            background,
+            foreground,
+            ctx,
+            configured: false,
+        });
     }
 }
 
@@ -440,6 +693,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             Box::new(VolumeProducer::new()),
             Box::new(SniHostProducer::new()),
             Box::new(NotificationsProducer::new()),
+            Box::new(PowerProfilesProducer::new()),
         ],
     )
 }
@@ -469,6 +723,7 @@ pub fn run_with_producers(
 
     let compositor = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
+    let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
     // Size the shared pool for one full-width bar at the default height; it grows
@@ -483,10 +738,13 @@ pub fn run_with_producers(
         pool,
         compositor,
         layer_shell,
+        xdg_shell,
         pointer: None,
+        pointer_cursor: CursorIcon::Default,
         scroll_remainder: 0.0,
         commands: Vec::new(),
         outputs: Outputs::new(config),
+        tooltip: None,
         exit: false,
     };
 
@@ -547,7 +805,12 @@ pub fn run_with_producers(
             "backlight-commands",
             backlight::run_commands(backlight_rx, backlight_updates),
         );
-        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx, backlight_tx];
+        let (power_tx, power_rx) = command_channel();
+        bridge.spawn_task(
+            "power-profiles-commands",
+            power_profiles::run_commands(power_rx),
+        );
+        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx, backlight_tx, power_tx];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
@@ -575,9 +838,22 @@ impl CompositorHandler for App {
     ) {
         // The compositor reports a surface's preferred integer buffer scale.
         // Route it to the owning bar so each output renders at its own density.
-        let App { pool, outputs, .. } = self;
-        if let Some(bar) = outputs.values_mut().find(|bar| bar.owns(surface)) {
-            bar.set_scale(Scale::new(new_factor), pool);
+        let App {
+            pool,
+            outputs,
+            tooltip,
+            ..
+        } = self;
+        let scale = Scale::new(new_factor);
+        let changed_output = outputs
+            .values_mut()
+            .find(|bar| bar.owns(surface))
+            .and_then(|bar| bar.set_scale(scale, pool).then_some(bar.output_id));
+        if tooltip.as_ref().is_some_and(|shown| {
+            (shown.owns_surface(surface) && shown.scale != scale)
+                || changed_output == Some(shown.output_id)
+        }) {
+            *tooltip = None;
         }
     }
 
@@ -689,6 +965,47 @@ impl LayerShellHandler for App {
     }
 }
 
+impl PopupHandler for App {
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        popup: &Popup,
+        _config: PopupConfigure,
+    ) {
+        if let Some(tooltip) = self.tooltip.as_mut().filter(|tooltip| tooltip.owns(popup)) {
+            tooltip.configured = true;
+            tooltip.draw(&mut self.pool);
+        }
+    }
+
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
+        if self
+            .tooltip
+            .as_ref()
+            .is_some_and(|tooltip| tooltip.owns(popup))
+        {
+            self.hide_tooltip();
+        }
+    }
+}
+
+// XdgShell's dispatch helper also covers toplevel objects. Tablero creates only
+// popups, so these callbacks are unreachable but satisfy the shared dispatcher.
+impl WindowHandler for App {
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {}
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _window: &Window,
+        _configure: WindowConfigure,
+        _serial: u32,
+    ) {
+    }
+}
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -712,7 +1029,14 @@ impl SeatHandler for App {
         // Bind the pointer once, when the seat first advertises one. The bar is
         // pointer-only; keyboard and touch capabilities are ignored.
         if capability == Capability::Pointer && self.pointer.is_none() {
-            match self.seat_state.get_pointer(qh, &seat) {
+            let cursor_surface = self.compositor.create_surface(qh);
+            match self.seat_state.get_pointer_with_theme(
+                qh,
+                &seat,
+                self.shm.wl_shm(),
+                cursor_surface,
+                ThemeSpec::default(),
+            ) {
                 Ok(pointer) => self.pointer = Some(pointer),
                 Err(e) => error!("failed to create pointer: {e}"),
             }
@@ -728,6 +1052,7 @@ impl SeatHandler for App {
     ) {
         if capability == Capability::Pointer {
             self.pointer = None;
+            self.pointer_cursor = CursorIcon::Default;
         }
     }
 
@@ -738,13 +1063,40 @@ impl SeatHandler for App {
 impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
-        _conn: &Connection,
+        conn: &Connection,
         _qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
-            if let PointerEventKind::Press { button, .. } = event.kind {
+            if matches!(
+                event.kind,
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
+            ) {
+                let (x, y) = event.position;
+                let clickable = self
+                    .outputs
+                    .values()
+                    .find(|bar| bar.owns(&event.surface))
+                    .is_some_and(|bar| bar.is_clickable_at(x, y));
+                if self.outputs.values().any(|bar| bar.owns(&event.surface)) {
+                    self.update_tooltip(&event.surface, x, y, _qh);
+                    self.set_pointer_cursor(
+                        conn,
+                        if clickable {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        },
+                        matches!(event.kind, PointerEventKind::Enter { .. }),
+                    );
+                }
+            } else if matches!(event.kind, PointerEventKind::Leave { .. }) {
+                if self.outputs.values().any(|bar| bar.owns(&event.surface)) {
+                    self.hide_tooltip();
+                    self.pointer_cursor = CursorIcon::Default;
+                }
+            } else if let PointerEventKind::Press { button, .. } = event.kind {
                 // Normalize the kernel input code to the typed button the
                 // widgets branch on; other buttons (middle, side, scroll
                 // clicks) are ignored here so widgets never see them.
@@ -788,6 +1140,18 @@ impl PointerHandler for App {
                 }
             }
         }
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_region::WlRegion,
+        _event: wl_region::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -873,6 +1237,8 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
+delegate_xdg_shell!(App);
+delegate_xdg_popup!(App);
 delegate_seat!(App);
 delegate_pointer!(App);
 delegate_registry!(App);
