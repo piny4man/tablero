@@ -2,9 +2,9 @@
 //!
 //! [`TrayState`] is the typed, normalized snapshot a producer feeds in through
 //! [`Msg::Tray`](super::Msg::Tray): the set of tray items currently registered,
-//! each already reduced to what the bar draws — a routing key, a title, a status,
-//! and an optional rasterized [`TrayIcon`]. [`TrayWidget`] renders them left to
-//! right and turns a click into a [`Command::ActivateTrayItem`](super::Command::ActivateTrayItem).
+//! each already reduced to what the bar draws and how it responds to menu versus
+//! activation clicks. [`TrayWidget`] renders them left to right and turns pointer
+//! input into typed tray commands.
 //!
 //! Everything here is pure and defensive: icon bytes that do not describe a valid
 //! image are dropped to "no icon" rather than trusted, a duplicate item key is
@@ -32,6 +32,78 @@ pub enum TrayStatus {
     Active,
     /// The item is requesting user attention.
     NeedsAttention,
+}
+
+/// How an SNI item's exported menu participates in pointer interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrayMenuMode {
+    /// The item exports no usable menu. Right-click still requests SNI
+    /// `ContextMenu` as a protocol fallback.
+    #[default]
+    None,
+    /// Left-click activates the item; right-click opens its menu.
+    Secondary,
+    /// Both left- and right-click open the menu.
+    Primary,
+}
+
+/// One normalized `com.canonical.dbusmenu` tree ready for presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayMenu {
+    /// The owning tray item's watcher registration address.
+    pub key: String,
+    /// DBusMenu layout revision used to reject stale updates.
+    pub revision: u32,
+    /// Visible root-level entries.
+    pub items: Vec<TrayMenuItem>,
+}
+
+/// One normalized DBusMenu entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayMenuItem {
+    /// Protocol item id used for events.
+    pub id: i32,
+    /// Display label.
+    pub label: String,
+    /// Whether activation is allowed.
+    pub enabled: bool,
+    /// Whether the entry should be presented.
+    pub visible: bool,
+    /// Whether this entry is a visual separator rather than an action.
+    pub separator: bool,
+    /// Optional checkbox/radio state.
+    pub toggle: Option<TrayMenuToggle>,
+    /// Nested submenu entries.
+    pub children: Vec<TrayMenuItem>,
+}
+
+/// A menu item's normalized toggle indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayMenuToggle {
+    /// Checkbox versus mutually-exclusive radio indicator.
+    pub kind: TrayMenuToggleKind,
+    /// Current protocol state.
+    pub state: TrayMenuToggleState,
+}
+
+/// DBusMenu toggle presentation type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenuToggleKind {
+    /// Independent checkmark.
+    Checkmark,
+    /// Radio-group selection.
+    Radio,
+}
+
+/// DBusMenu toggle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenuToggleState {
+    /// Not selected.
+    Off,
+    /// Selected.
+    On,
+    /// Mixed or unspecified state.
+    Indeterminate,
 }
 
 impl TrayStatus {
@@ -148,8 +220,7 @@ impl std::error::Error for IconError {}
 /// A single normalized tray item: what the bar needs to draw and act on it.
 ///
 /// The `key` is the item's routing identity — the address a producer registered
-/// it under — and doubles as the de-duplication key and the payload of
-/// [`Command::ActivateTrayItem`](super::Command::ActivateTrayItem). The `title`
+/// it under — and doubles as the de-duplication key and tray-command payload. The `title`
 /// is a human-readable fallback drawn when the item ships no usable icon. Both
 /// strings are trimmed at construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +229,7 @@ pub struct TrayItem {
     title: String,
     status: TrayStatus,
     icon: Option<TrayIcon>,
+    menu_mode: TrayMenuMode,
 }
 
 impl TrayItem {
@@ -174,7 +246,19 @@ impl TrayItem {
             title: title.into().trim().to_string(),
             status,
             icon,
+            menu_mode: TrayMenuMode::None,
         }
+    }
+
+    /// Set how this item responds when it exports a menu.
+    pub fn with_menu(mut self, mode: TrayMenuMode) -> Self {
+        self.menu_mode = mode;
+        self
+    }
+
+    /// The item's normalized menu interaction behavior.
+    pub fn menu_mode(&self) -> TrayMenuMode {
+        self.menu_mode
     }
 
     /// The item's routing identity (the address it registered under).
@@ -393,14 +477,19 @@ impl Widget for TrayWidget {
     }
 
     fn on_click(&self, px: u32, py: u32, button: super::ClickButton) -> Option<Command> {
-        // Only the primary button activates an item (SNI `Activate`).
-        if button != super::ClickButton::Left {
-            return None;
-        }
         self.item_cells()
             .into_iter()
             .find(|(_, cell)| cell.contains(px, py))
-            .map(|(item, _)| Command::ActivateTrayItem(item.key().to_string()))
+            .map(|(item, _)| {
+                let key = item.key().to_string();
+                let (x, y) = (px as i32, py as i32);
+                if button == super::ClickButton::Right || item.menu_mode() == TrayMenuMode::Primary
+                {
+                    Command::OpenTrayMenu { key, x, y }
+                } else {
+                    Command::ActivateTrayItem { key, x, y }
+                }
+            })
     }
 }
 
@@ -575,14 +664,73 @@ mod tests {
         // :1.2 -> [32,64).
         assert_eq!(
             widget.on_click(10, 16, ClickButton::Left),
-            Some(Command::ActivateTrayItem(":1.1".to_string()))
+            Some(Command::ActivateTrayItem {
+                key: ":1.1".to_string(),
+                x: 10,
+                y: 16,
+            })
         );
         assert_eq!(
             widget.on_click(40, 16, ClickButton::Left),
-            Some(Command::ActivateTrayItem(":1.2".to_string()))
+            Some(Command::ActivateTrayItem {
+                key: ":1.2".to_string(),
+                x: 40,
+                y: 16,
+            })
         );
         // Past the last cell is empty space.
         assert_eq!(widget.on_click(100, 16, ClickButton::Left), None);
+    }
+
+    #[test]
+    fn primary_menu_item_opens_its_menu_on_left_click() {
+        let menu_item = item(":1.1", "app").with_menu(TrayMenuMode::Primary);
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32));
+        widget.update(&Msg::Tray(TrayState::new([menu_item])));
+
+        assert_eq!(
+            widget.on_click(12, 18, ClickButton::Left),
+            Some(Command::OpenTrayMenu {
+                key: ":1.1".to_string(),
+                x: 12,
+                y: 18,
+            })
+        );
+    }
+
+    #[test]
+    fn secondary_menu_item_activates_on_left_and_opens_on_right() {
+        let menu_item = item(":1.1", "app").with_menu(TrayMenuMode::Secondary);
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32));
+        widget.update(&Msg::Tray(TrayState::new([menu_item])));
+
+        assert!(matches!(
+            widget.on_click(12, 18, ClickButton::Left),
+            Some(Command::ActivateTrayItem { .. })
+        ));
+        assert_eq!(
+            widget.on_click(12, 18, ClickButton::Right),
+            Some(Command::OpenTrayMenu {
+                key: ":1.1".to_string(),
+                x: 12,
+                y: 18,
+            })
+        );
+    }
+
+    #[test]
+    fn right_click_requests_context_menu_fallback_even_without_exported_menu() {
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32));
+        widget.update(&Msg::Tray(TrayState::new([item(":1.1", "app")])));
+
+        assert_eq!(
+            widget.on_click(12, 18, ClickButton::Right),
+            Some(Command::OpenTrayMenu {
+                key: ":1.1".to_string(),
+                x: 12,
+                y: 18,
+            })
+        );
     }
 
     #[test]
@@ -599,7 +747,11 @@ mod tests {
         for x in [0, 16, 31] {
             assert_eq!(
                 widget.on_click(x, 16, ClickButton::Left),
-                Some(Command::ActivateTrayItem(":1.1".to_string()))
+                Some(Command::ActivateTrayItem {
+                    key: ":1.1".to_string(),
+                    x: x as i32,
+                    y: 16,
+                })
             );
         }
     }

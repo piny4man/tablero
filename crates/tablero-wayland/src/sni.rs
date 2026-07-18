@@ -4,9 +4,9 @@
 //! StatusNotifierItem spec: each item registers itself with a
 //! *StatusNotifierWatcher*, and *hosts* (panels, bars) watch the watcher to learn
 //! which items exist and read their properties. This module is the host: it
-//! emits typed [`Msg::Tray`] snapshots through the [producer
-//! bridge](crate::producer) and executes [`Command::ActivateTrayItem`] back over
-//! DBus, so the rendering code never talks to the bus directly.
+//! emits typed tray snapshots and menu layouts through the [producer
+//! bridge](crate::producer), then executes tray commands back over DBus, so the
+//! rendering code never talks to the bus directly.
 //!
 //! Under a bare compositor such as Hyprland there is usually **no** watcher
 //! running, so the producer hosts one itself: it serves the
@@ -20,7 +20,7 @@
 //! into a [`TrayItem`] — lives in pure functions the unit tests drive directly.
 //! The live DBus plumbing around them is kept deliberately thin.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,9 +28,13 @@ use futures_util::stream::{StreamExt, select_all};
 use log::warn;
 use zbus::fdo::RequestNameReply;
 use zbus::object_server::SignalEmitter;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{Connection, interface, proxy};
 
-use tablero_core::widget::{Command, Msg, TrayIcon, TrayItem, TrayState, TrayStatus};
+use tablero_core::widget::{
+    Command, Msg, TrayIcon, TrayItem, TrayMenu, TrayMenuItem, TrayMenuMode, TrayMenuToggle,
+    TrayMenuToggleKind, TrayMenuToggleState, TrayState, TrayStatus,
+};
 
 use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
@@ -44,6 +48,63 @@ const DEFAULT_ITEM_PATH: &str = "/StatusNotifierItem";
 
 /// A single raw `IconPixmap` entry: `(width, height, ARGB32 bytes)`.
 type RawPixmap = (i32, i32, Vec<u8>);
+/// Recursive DBusMenu layout node `(id, properties, variant children)`.
+type RawMenuLayout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+/// Normalize one recursive DBusMenu layout node.
+pub fn parse_menu_layout(value: OwnedValue) -> Option<TrayMenuItem> {
+    let (id, properties, children): RawMenuLayout = value.try_into().ok()?;
+    parse_raw_menu_layout((id, properties, children))
+}
+
+fn parse_raw_menu_layout((id, properties, children): RawMenuLayout) -> Option<TrayMenuItem> {
+    let string_property = |name: &str| {
+        properties
+            .get(name)
+            .and_then(|value| <&str>::try_from(value).ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let bool_property = |name: &str, default: bool| {
+        properties
+            .get(name)
+            .and_then(|value| bool::try_from(value).ok())
+            .unwrap_or(default)
+    };
+
+    let toggle = match string_property("toggle-type").as_str() {
+        "checkmark" => Some(TrayMenuToggle {
+            kind: TrayMenuToggleKind::Checkmark,
+            state: toggle_state(&properties),
+        }),
+        "radio" => Some(TrayMenuToggle {
+            kind: TrayMenuToggleKind::Radio,
+            state: toggle_state(&properties),
+        }),
+        _ => None,
+    };
+    Some(TrayMenuItem {
+        id,
+        label: string_property("label"),
+        enabled: bool_property("enabled", true),
+        visible: bool_property("visible", true),
+        separator: string_property("type") == "separator",
+        toggle,
+        children: children.into_iter().filter_map(parse_menu_layout).collect(),
+    })
+}
+
+fn toggle_state(properties: &HashMap<String, OwnedValue>) -> TrayMenuToggleState {
+    match properties
+        .get("toggle-state")
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(-1)
+    {
+        0 => TrayMenuToggleState::Off,
+        1 => TrayMenuToggleState::On,
+        _ => TrayMenuToggleState::Indeterminate,
+    }
+}
 
 /// Split a watcher registration address into its `(bus_name, object_path)`.
 ///
@@ -109,7 +170,7 @@ pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 /// Fold raw StatusNotifierItem properties into a normalized [`TrayItem`].
 ///
 /// The `key` is the item's watcher address — its stable identity and the payload
-/// an [`ActivateTrayItem`](Command::ActivateTrayItem) carries back. The display
+/// tray commands carry back. The display
 /// title falls back to the item `id` when `title` is blank, so an item without a
 /// human title still shows a meaningful initial. `icon` is the already-resolved
 /// icon (pixmap or themed PNG), passed in so this stays pure and unit-testable;
@@ -123,6 +184,23 @@ pub fn tray_item_from_props(
 ) -> TrayItem {
     let display = if title.trim().is_empty() { id } else { title };
     TrayItem::new(key, display, TrayStatus::from_sni(status), icon)
+}
+
+/// Normalize optional SNI menu properties into click behavior.
+pub fn menu_mode(menu_path: Option<&str>, item_is_menu: Option<bool>) -> TrayMenuMode {
+    let has_menu = menu_path.is_some_and(|path| {
+        let path = path.trim();
+        !path.is_empty() && path != "/" && path != "/NO_DBUSMENU"
+    });
+    if !has_menu {
+        TrayMenuMode::None
+    } else if item_is_menu.unwrap_or(true) {
+        // AppIndicator implementations frequently omit ItemIsMenu despite being
+        // menu-only; defaulting to Primary matches established tray hosts.
+        TrayMenuMode::Primary
+    } else {
+        TrayMenuMode::Secondary
+    }
 }
 
 /// Resolve an item's icon: prefer an embedded pixmap, else a themed PNG.
@@ -194,9 +272,12 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
     let icon_name = item.icon_name().await.unwrap_or_default();
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
     let pixmaps = item.icon_pixmap().await.unwrap_or_default();
+    let menu = item.menu().await.ok();
+    let item_is_menu = item.item_is_menu().await.ok();
 
     let icon = resolve_icon(&icon_name, &pixmaps, &theme_path).await;
-    Some(tray_item_from_props(key, &id, &title, &status, icon))
+    let mode = menu_mode(menu.as_deref().map(|path| path.as_str()), item_is_menu);
+    Some(tray_item_from_props(key, &id, &title, &status, icon).with_menu(mode))
 }
 
 /// Build the current tray snapshot by reading every registered item.
@@ -356,8 +437,19 @@ trait StatusNotifierItem {
     #[zbus(property)]
     fn icon_pixmap(&self) -> zbus::Result<Vec<RawPixmap>>;
 
+    /// Object path implementing `com.canonical.dbusmenu`.
+    #[zbus(property)]
+    fn menu(&self) -> zbus::Result<OwnedObjectPath>;
+
+    /// Whether primary activation should open [`menu`](Self::menu).
+    #[zbus(property)]
+    fn item_is_menu(&self) -> zbus::Result<bool>;
+
     /// Primary activation (a left click), at screen coordinates `(x, y)`.
     fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+
+    /// Ask the item to show its own context menu.
+    fn context_menu(&self, x: i32, y: i32) -> zbus::Result<()>;
 
     /// The icon changed.
     #[zbus(signal)]
@@ -374,6 +466,36 @@ trait StatusNotifierItem {
     /// The attention icon changed.
     #[zbus(signal)]
     fn new_attention_icon(&self) -> zbus::Result<()>;
+}
+
+/// The subset of `com.canonical.dbusmenu` needed to present and activate menus.
+#[proxy(interface = "com.canonical.dbusmenu")]
+trait DBusMenu {
+    /// Fetch one recursive menu layout and its revision.
+    fn get_layout(
+        &self,
+        parent_id: i32,
+        recursion_depth: i32,
+        property_names: &[&str],
+    ) -> zbus::Result<(u32, RawMenuLayout)>;
+
+    /// Give the exporter a chance to refresh an entry before it is shown.
+    fn about_to_show(&self, id: i32) -> zbus::Result<bool>;
+
+    /// Deliver a user interaction to a menu entry.
+    fn event(&self, id: i32, event_id: &str, data: OwnedValue, timestamp: u32) -> zbus::Result<()>;
+
+    /// The menu layout revision changed.
+    #[zbus(signal)]
+    fn layout_updated(&self, revision: u32, parent: i32) -> zbus::Result<()>;
+
+    /// Properties changed without replacing the full layout.
+    #[zbus(signal)]
+    fn items_properties_updated(
+        &self,
+        updated: Vec<(i32, HashMap<String, OwnedValue>)>,
+        removed: Vec<(i32, Vec<String>)>,
+    ) -> zbus::Result<()>;
 }
 
 /// A [`Producer`] that streams system-tray changes into the render loop.
@@ -536,42 +658,212 @@ async fn item_change_stream(
     Some(merged.boxed())
 }
 
-/// Drain `commands` from the render loop and execute each tray activation.
+/// Drain tray commands from the render loop and execute SNI/DBusMenu calls.
 ///
 /// Runs on the producer bridge as the executor end of the
 /// [command channel](crate::command), alongside the Hyprland executor. Commands
-/// this source does not handle (anything but
-/// [`ActivateTrayItem`](Command::ActivateTrayItem)) are ignored, mirroring the
-/// Hyprland executor. A failed activation is logged and skipped — one bad item
-/// never ends the stream. Returns `Ok(())` when the render loop drops its sender.
-pub async fn run_commands(mut commands: CommandReceiver) -> ProducerResult {
+/// This executor handles item activation, menu opening, and menu-entry events;
+/// unrelated commands are ignored, mirroring the Hyprland executor. A failed
+/// call is logged and skipped, so one bad item never ends the stream. Returns
+/// `Ok(())` when the render loop drops its sender.
+pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> ProducerResult {
     let conn = Connection::session().await?;
+    let mut monitored_menus = HashSet::new();
     while let Some(command) = commands.recv().await {
-        let Command::ActivateTrayItem(key) = &command else {
-            continue;
-        };
-        if let Err(e) = activate(&conn, key).await {
-            warn!("sni: activating {key:?} failed: {e}");
+        match command {
+            Command::ActivateTrayItem { key, x, y } => {
+                if let Err(e) = activate(&conn, &key, x, y).await {
+                    warn!("sni: activating {key:?} failed: {e}");
+                }
+            }
+            Command::OpenTrayMenu { key, x, y } => {
+                if let Err(e) = open_menu(&conn, &updates, &key, x, y).await {
+                    warn!("sni: opening menu for {key:?} failed: {e}");
+                } else if monitored_menus.insert(key.clone()) {
+                    let monitor_conn = conn.clone();
+                    let monitor_updates = updates.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            monitor_menu(monitor_conn, monitor_updates, key.clone()).await
+                        {
+                            warn!("sni: monitoring menu for {key:?} failed: {error}");
+                        }
+                    });
+                }
+            }
+            Command::ActivateTrayMenuItem { key, id } => {
+                if let Err(e) = activate_menu_item(&conn, &key, id).await {
+                    warn!("sni: activating menu item {id} for {key:?} failed: {e}");
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
 }
 
-/// Send a primary `Activate(0, 0)` to the item registered under `key`.
-async fn activate(conn: &Connection, key: &str) -> zbus::Result<()> {
+async fn item_proxy<'a>(
+    conn: &'a Connection,
+    key: &str,
+) -> zbus::Result<StatusNotifierItemProxy<'a>> {
     let (name, path) = parse_item_address(key)
         .ok_or_else(|| zbus::Error::Failure(format!("bad address {key}")))?;
-    let item = StatusNotifierItemProxy::builder(conn)
+    StatusNotifierItemProxy::builder(conn)
         .destination(name)?
         .path(path)?
         .build()
-        .await?;
-    item.activate(0, 0).await
+        .await
+}
+
+async fn menu_proxy<'a>(
+    conn: &'a Connection,
+    key: &str,
+) -> zbus::Result<Option<DBusMenuProxy<'a>>> {
+    let (name, _) = parse_item_address(key)
+        .ok_or_else(|| zbus::Error::Failure(format!("bad address {key}")))?;
+    let Ok(path) = item_proxy(conn, key).await?.menu().await else {
+        return Ok(None);
+    };
+    if menu_mode(Some(path.as_str()), Some(false)) == TrayMenuMode::None {
+        return Ok(None);
+    }
+    Ok(Some(
+        DBusMenuProxy::builder(conn)
+            .destination(name)?
+            .path(path)?
+            .build()
+            .await?,
+    ))
+}
+
+async fn open_menu(
+    conn: &Connection,
+    updates: &MsgSender,
+    key: &str,
+    x: i32,
+    y: i32,
+) -> zbus::Result<()> {
+    let Some(menu) = menu_proxy(conn, key).await? else {
+        return context_menu_fallback(conn, updates, key, x, y).await;
+    };
+
+    // A false return only means the exporter did not change the entry.
+    let _ = menu.about_to_show(0).await;
+    if send_menu_layout(&menu, updates, key).await.is_err() {
+        context_menu_fallback(conn, updates, key, x, y).await
+    } else {
+        Ok(())
+    }
+}
+
+async fn context_menu_fallback(
+    conn: &Connection,
+    updates: &MsgSender,
+    key: &str,
+    x: i32,
+    y: i32,
+) -> zbus::Result<()> {
+    let result = item_proxy(conn, key).await?.context_menu(x, y).await;
+    let _ = updates.send(Msg::TrayMenuUnavailable(key.to_string()));
+    result
+}
+
+async fn send_menu_layout(
+    menu: &DBusMenuProxy<'_>,
+    updates: &MsgSender,
+    key: &str,
+) -> zbus::Result<()> {
+    const PROPERTIES: [&str; 7] = [
+        "type",
+        "label",
+        "enabled",
+        "visible",
+        "toggle-type",
+        "toggle-state",
+        "children-display",
+    ];
+    let (mut revision, raw_root) = menu.get_layout(0, -1, &PROPERTIES).await?;
+    let mut root = parse_raw_menu_layout(raw_root)
+        .ok_or_else(|| zbus::Error::Failure("invalid DBusMenu root layout".into()))?;
+    let mut submenu_ids = Vec::new();
+    collect_submenu_ids(&root.children, &mut submenu_ids);
+    let mut changed = false;
+    for id in submenu_ids {
+        changed |= menu.about_to_show(id).await.unwrap_or(false);
+    }
+    if changed {
+        let refreshed = menu.get_layout(0, -1, &PROPERTIES).await?;
+        revision = refreshed.0;
+        root = parse_raw_menu_layout(refreshed.1)
+            .ok_or_else(|| zbus::Error::Failure("invalid refreshed DBusMenu layout".into()))?;
+    }
+    updates
+        .send(Msg::TrayMenu(TrayMenu {
+            key: key.to_string(),
+            revision,
+            items: root.children,
+        }))
+        .map_err(|_| zbus::Error::Failure("render loop closed".into()))
+}
+
+fn collect_submenu_ids(items: &[TrayMenuItem], ids: &mut Vec<i32>) {
+    for item in items {
+        if !item.children.is_empty() {
+            ids.push(item.id);
+            collect_submenu_ids(&item.children, ids);
+        }
+    }
+}
+
+async fn monitor_menu(conn: Connection, updates: MsgSender, key: String) -> zbus::Result<()> {
+    let Some(menu) = menu_proxy(&conn, &key).await? else {
+        return Ok(());
+    };
+    let mut changes = select_all([
+        menu.receive_layout_updated().await?.map(|_| ()).boxed(),
+        menu.receive_items_properties_updated()
+            .await?
+            .map(|_| ())
+            .boxed(),
+    ]);
+    while changes.next().await.is_some() {
+        // Re-fetching the normalized tree handles both structural and property
+        // signals with one consistent path and rejects malformed partial deltas.
+        let _ = menu.about_to_show(0).await;
+        send_menu_layout(&menu, &updates, &key).await?;
+    }
+    Ok(())
+}
+
+async fn activate_menu_item(conn: &Connection, key: &str, id: i32) -> zbus::Result<()> {
+    let Some(menu) = menu_proxy(conn, key).await? else {
+        return Ok(());
+    };
+    menu.event(id, "clicked", OwnedValue::from(0i32), 0).await
+}
+
+/// Send a primary `Activate(x, y)` to the item registered under `key`.
+async fn activate(conn: &Connection, key: &str, x: i32, y: i32) -> zbus::Result<()> {
+    item_proxy(conn, key).await?.activate(x, y).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    fn property(value: impl Into<Value<'static>>) -> OwnedValue {
+        OwnedValue::try_from(value.into()).expect("owned DBus value")
+    }
+
+    fn raw_layout(
+        id: i32,
+        properties: HashMap<String, OwnedValue>,
+        children: Vec<OwnedValue>,
+    ) -> OwnedValue {
+        property((id, properties, children))
+    }
 
     #[test]
     fn owning_the_watcher_name_is_usable() {
@@ -687,6 +979,76 @@ mod tests {
         assert_eq!(item.title(), "Discord — 3 unread");
         // An unknown status string normalizes to Passive rather than failing.
         assert_eq!(item.status(), TrayStatus::Passive);
+    }
+
+    #[test]
+    fn menu_mode_defaults_missing_item_is_menu_to_primary() {
+        assert_eq!(menu_mode(Some("/MenuBar"), None), TrayMenuMode::Primary);
+        assert_eq!(
+            menu_mode(Some("/MenuBar"), Some(false)),
+            TrayMenuMode::Secondary
+        );
+        assert_eq!(
+            menu_mode(Some("/MenuBar"), Some(true)),
+            TrayMenuMode::Primary
+        );
+    }
+
+    #[test]
+    fn absent_or_sentinel_menu_paths_have_no_exported_menu() {
+        assert_eq!(menu_mode(None, Some(true)), TrayMenuMode::None);
+        assert_eq!(menu_mode(Some("/"), Some(true)), TrayMenuMode::None);
+        assert_eq!(
+            menu_mode(Some("/NO_DBUSMENU"), Some(true)),
+            TrayMenuMode::None
+        );
+    }
+
+    #[test]
+    fn dbusmenu_layout_normalizes_nested_toggles_separators_and_visibility() {
+        let child = raw_layout(
+            2,
+            HashMap::from([
+                ("label".into(), property("Nested")),
+                ("enabled".into(), property(false)),
+                ("toggle-type".into(), property("checkmark")),
+                ("toggle-state".into(), property(1i32)),
+            ]),
+            vec![],
+        );
+        let separator = raw_layout(
+            3,
+            HashMap::from([("type".into(), property("separator"))]),
+            vec![],
+        );
+        let hidden = raw_layout(
+            4,
+            HashMap::from([
+                ("label".into(), property("Hidden")),
+                ("visible".into(), property(false)),
+            ]),
+            vec![],
+        );
+        let root = raw_layout(
+            0,
+            HashMap::from([("label".into(), property("root"))]),
+            vec![child, separator, hidden],
+        );
+
+        let parsed = parse_menu_layout(root).expect("valid recursive layout");
+        assert_eq!(parsed.id, 0);
+        assert_eq!(parsed.children.len(), 3);
+        assert_eq!(parsed.children[0].label, "Nested");
+        assert!(!parsed.children[0].enabled);
+        assert_eq!(
+            parsed.children[0].toggle,
+            Some(TrayMenuToggle {
+                kind: TrayMenuToggleKind::Checkmark,
+                state: TrayMenuToggleState::On,
+            })
+        );
+        assert!(parsed.children[1].separator);
+        assert!(!parsed.children[2].visible);
     }
 
     #[test]

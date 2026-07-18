@@ -60,10 +60,13 @@ RUST_LOG=info cargo run -p tablero
     NetworkManager is unavailable.
   - **Tray** — StatusNotifierItem (SNI) system-tray icons from background apps,
     over DBus. **Opt-in**: not in the default set; add `"tray"` to `widgets` to
-    enable it. **Click an icon to activate** its application. Under a compositor
-    with no native `StatusNotifierWatcher` (e.g. Hyprland) the bar hosts one
-    itself. Icons come from an embedded pixmap or a themed PNG; an item with
-    neither falls back to its initial letter.
+    enable it. Left-click activates conventional items and opens menu-only
+    AppIndicators; right-click opens the item's native DBusMenu, including nested,
+    disabled, separator, checkbox, and radio entries. Items without an exported
+    menu receive the SNI `ContextMenu` fallback. Under a compositor with no native
+    `StatusNotifierWatcher` (e.g. Hyprland) the bar hosts one itself. Icons come
+    from an embedded pixmap or a themed PNG; an item with neither falls back to
+    its initial letter.
   - **Bluetooth** — the local adapter state (powered on/off) and connected-
     device count, read from BlueZ over DBus. Shows `on`, `off`, `N connected`,
     or `unavailable` when no adapter is present (desktops without Bluetooth
@@ -343,8 +346,12 @@ surface placement and input need a live compositor. To verify on Hyprland:
     - Each app's icon **appears** in the bar shortly after launch and
       **disappears** when the app quits — the host re-enumerates on every
       watcher registration/unregistration.
-    - **Clicking an icon activates** the app (raises/toggles its window) — the
-      click maps to the item's DBus `Activate` call.
+    - Left-clicking a conventional item **activates** the app through DBus
+      `Activate`; a menu-only AppIndicator opens its menu instead.
+    - Right-click opens the exported DBusMenu. Confirm nested entries,
+      separators, disabled actions, checkboxes, and radio items render correctly,
+      and selecting an enabled leaf performs its action. An item with no exported
+      menu should receive its own SNI `ContextMenu` call instead.
     - An app that ships only an `IconName` (no pixmap) still renders, resolved
       against the icon theme; an app with neither shows its **initial letter**
       rather than vanishing or crashing.
@@ -361,6 +368,9 @@ surface placement and input need a live compositor. To verify on Hyprland:
       per-item path like `/org/ayatana/NotificationItem/foo`). The host splits
       at the first `/`; a bare path with no bus name is unaddressable and
       skipped.
+    - **`ItemIsMenu` is often omitted.** When a valid `Menu` path exists and the
+      property is absent, tablero treats the item as menu-only for AppIndicator
+      compatibility. An explicit `false` preserves left-click activation.
     - **Pixmap bytes are ARGB32, network byte order**, *not* the RGBA the
       renderer wants — each pixel is reordered and alpha-premultiplied on
       decode. Items often ship several sizes; the largest by area is chosen.

@@ -110,8 +110,8 @@ pub fn expand_tilde(path: &std::path::Path) -> PathBuf {
 ///
 /// Each [`Command::RunProgram`] is spawned directly via
 /// `tokio::process::Command` — no shell, no argument expansion beyond the
-/// leading-`~` home expansion in [`expand_tilde`]. Other command variants
-/// (`SwitchWorkspace`, `ActivateTrayItem`) are silently ignored: those have
+/// leading-`~` home expansion in [`expand_tilde`]. Other command variants are
+/// silently ignored: those have
 /// their own executors, and every [`CommandSender`] is fanned out to every
 /// executor, so the routing is by `match` arm here. A spawn failure
 /// (missing file, non-executable, …) is logged at warn level and does not
@@ -197,16 +197,20 @@ mod tests {
 
     #[test]
     fn run_commands_ignores_non_run_program_commands() {
-        // The executor must filter: SwitchWorkspace and ActivateTrayItem
-        // have their own executors; this one only acts on RunProgram.
+        // Commands with dedicated executors are filtered; this one only acts on
+        // RunProgram.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (tx, rx) = command_channel();
         tx.send(Command::SwitchWorkspace(1)).unwrap();
-        tx.send(Command::ActivateTrayItem("foo".to_string()))
-            .unwrap();
+        tx.send(Command::ActivateTrayItem {
+            key: "foo".to_string(),
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
         drop(tx);
         rt.block_on(run_commands(rx)).unwrap();
         // No assertion needed: if `run_commands` panicked or returned an
