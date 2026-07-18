@@ -25,7 +25,7 @@ margin = 0
 gap    = 0
 # Each zone is a list of widget names, in display order. Valid names:
 # "workspaces", "clock", "battery", "system", "network", "title", "tray",
-# "bluetooth", "volume", "notifications". A widget named in two zones is
+# "bluetooth", "volume", "backlight", "notifications". A widget named in two zones is
 # built once, keeping its first mention. "tray" shows StatusNotifierItem
 # system-tray icons and is opt-in — add it to a zone to enable it, e.g.
 # modules-right = ["tray", "battery", "system", "network"]. "title" shows
@@ -42,6 +42,9 @@ gap    = 0
 # small dot while notifications are pending, slashed and dimmed under
 # Do-Not-Disturb; left-click toggles the swaync panel, right-click toggles
 # DND. While swaync is not running the widget reserves no slot.
+# "backlight" follows native Linux screen-backlight events and is opt-in. Scroll
+# up/down over it to adjust brightness through systemd-logind; without a device
+# it reserves no slot.
 modules-left   = ["workspaces"]
 modules-center = ["title"]
 modules-right  = ["clock", "battery", "system", "network"]
@@ -118,6 +121,17 @@ size = 16.0
 # on-click = "~/.config/hypr/scripts/bluetooth.sh"
 # [widget.volume]
 # on-click = "/usr/bin/pavucontrol"
+#
+# The backlight module supports the Waybar-style {icon} and {percent}
+# placeholders. `device` is optional; when absent or not found, the screen
+# backlight with the largest brightness range is selected automatically.
+# [bar]
+# modules-right = ["backlight", "battery", "network"]
+# [widget.backlight]
+# device = "intel_backlight"
+# format = "{icon}  {percent}%"
+# format-icons = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+# scroll-step = 1
 
 # Per-monitor overrides. tablero shows one bar per connected output; by default
 # every output uses the global settings above. Add a [[monitor]] block to tweak a
@@ -147,6 +161,8 @@ size = 16.0
 # on-click = "/per-monitor/bluetooth-launcher.sh"  # different launcher per output
 # [monitor.widget.volume]
 # on-click = "/per-monitor/pavucontrol"             # different volume manager per output
+# [monitor.widget.backlight]
+# device = "amdgpu_bl1"                             # select another panel on this output
 #
 # [[monitor]]
 # name = "eDP-1"                # the laptop panel: just a shorter bar, nothing else

@@ -16,6 +16,8 @@ serde_json = "1"
 zbus = { version = "5.16.0", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 pipewire = "0.9"
+udev = "0.9.3"
+mio = { version = "1", features = ["os-poll", "os-ext"] }
 
 [dev-dependencies]
 tempfile = "3"

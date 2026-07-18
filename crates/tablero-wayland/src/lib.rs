@@ -14,6 +14,7 @@
 //! `set_buffer_scale` maps it back, so the bar stays crisp on HiDPI displays.
 //! The logical→physical conversion lives entirely in [`tablero_core::scale`].
 
+pub mod backlight;
 pub mod bluetooth;
 pub mod command;
 pub mod hyprland;
@@ -59,8 +60,9 @@ use tablero_core::clock::millis_until_next_minute;
 use tablero_core::config::Config;
 use tablero_core::render::{Bounds, RenderContext};
 use tablero_core::scale::Scale;
-use tablero_core::widget::{ClickButton, Command, Dashboard, Msg};
+use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, ScrollDirection};
 
+use crate::backlight::BacklightProducer;
 use crate::bluetooth::BluetoothProducer;
 use crate::command::{CommandSender, command_channel};
 use crate::hyprland::HyprlandProducer;
@@ -234,6 +236,16 @@ impl Surface {
             .on_click((x * s) as u32, (y * s) as u32, button)
     }
 
+    /// Resolve one logical scroll step against the widget under `(x, y)`.
+    fn on_scroll(&self, x: f64, y: f64, direction: ScrollDirection) -> Option<Command> {
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let scale = self.scale.get() as f64;
+        self.dashboard
+            .on_scroll((x * scale) as u32, (y * scale) as u32, direction)
+    }
+
     /// Adopt the compositor's configure, seeding and drawing the first frame.
     fn configure(&mut self, configure: LayerSurfaceConfigure, pool: &mut SlotPool) {
         // A zero dimension means "you decide"; keep our current value.
@@ -321,6 +333,8 @@ struct App {
     layer_shell: LayerShell,
     /// The seat's pointer, created once the seat advertises the capability.
     pointer: Option<wl_pointer::WlPointer>,
+    /// Fractional logical vertical scroll steps retained across pointer frames.
+    scroll_remainder: f64,
     /// Outbound command channels into the producer runtime, one per command
     /// executor (Hyprland workspace switching, SNI tray activation). A click's
     /// command is fanned out to every executor; each ignores the commands it does
@@ -419,6 +433,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         vec![
             Box::new(HyprlandProducer::new()),
             Box::new(UPowerProducer::new()),
+            Box::new(BacklightProducer::new()),
             Box::new(SystemProducer::new()),
             Box::new(NetworkProducer::new()),
             Box::new(BluetoothProducer::new()),
@@ -469,6 +484,7 @@ pub fn run_with_producers(
         compositor,
         layer_shell,
         pointer: None,
+        scroll_remainder: 0.0,
         commands: Vec::new(),
         outputs: Outputs::new(config),
         exit: false,
@@ -525,7 +541,13 @@ pub fn run_with_producers(
             "notifications-commands",
             notifications::run_commands(notif_rx),
         );
-        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx];
+        let (backlight_tx, backlight_rx) = command_channel();
+        let backlight_updates = bridge.sender();
+        bridge.spawn_task(
+            "backlight-commands",
+            backlight::run_commands(backlight_rx, backlight_updates),
+        );
+        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx, backlight_tx];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
@@ -747,8 +769,96 @@ impl PointerHandler for App {
                         }
                     }
                 }
+            } else if let PointerEventKind::Axis { vertical, .. } = event.kind {
+                let directions = scroll_directions(vertical, &mut self.scroll_remainder);
+                for direction in directions {
+                    let (x, y) = event.position;
+                    let command = self
+                        .outputs
+                        .values()
+                        .find(|bar| bar.owns(&event.surface))
+                        .and_then(|bar| bar.on_scroll(x, y, direction));
+                    if let Some(command) = command {
+                        for sender in &self.commands {
+                            if sender.send(command.clone()).is_err() {
+                                warn!("command channel closed; dropping scroll command");
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+/// Normalize wheel, high-resolution wheel, and touchpad motion into logical steps.
+fn scroll_directions(
+    vertical: smithay_client_toolkit::seat::pointer::AxisScroll,
+    remainder: &mut f64,
+) -> Vec<ScrollDirection> {
+    let delta = if vertical.value120 != 0 {
+        vertical.value120 as f64 / 120.0
+    } else if vertical.discrete != 0 {
+        vertical.discrete as f64
+    } else {
+        // Continuous devices report pixels; ten pixels is one deliberate step.
+        vertical.absolute / 10.0
+    };
+    *remainder += delta;
+    let mut directions = Vec::new();
+    while *remainder >= 1.0 {
+        directions.push(ScrollDirection::Decrease);
+        *remainder -= 1.0;
+    }
+    while *remainder <= -1.0 {
+        directions.push(ScrollDirection::Increase);
+        *remainder += 1.0;
+    }
+    directions
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use smithay_client_toolkit::seat::pointer::AxisScroll;
+
+    #[test]
+    fn wheel_steps_map_up_to_increase_and_down_to_decrease() {
+        let mut remainder = 0.0;
+        assert_eq!(
+            scroll_directions(
+                AxisScroll {
+                    value120: -120,
+                    ..AxisScroll::default()
+                },
+                &mut remainder,
+            ),
+            vec![ScrollDirection::Increase]
+        );
+        assert_eq!(
+            scroll_directions(
+                AxisScroll {
+                    value120: 120,
+                    ..AxisScroll::default()
+                },
+                &mut remainder,
+            ),
+            vec![ScrollDirection::Decrease]
+        );
+    }
+
+    #[test]
+    fn smooth_motion_accumulates_before_emitting_a_step() {
+        let mut remainder = 0.0;
+        let half = AxisScroll {
+            absolute: -5.0,
+            ..AxisScroll::default()
+        };
+        assert!(scroll_directions(half, &mut remainder).is_empty());
+        assert_eq!(
+            scroll_directions(half, &mut remainder),
+            vec![ScrollDirection::Increase]
+        );
     }
 }
 
