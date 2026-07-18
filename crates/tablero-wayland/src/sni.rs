@@ -24,9 +24,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::{Either, select};
 use futures_util::stream::{StreamExt, select_all};
 use log::warn;
-use zbus::fdo::RequestNameReply;
+use zbus::fdo::{DBusProxy, RequestNameReply};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{Connection, interface, proxy};
@@ -251,10 +252,10 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
 
 /// The host's view of a single registered item, read fresh from its proxy.
 ///
-/// Reading degrades gracefully: a property the item does not expose falls back to
-/// its empty default rather than failing the whole snapshot, so a partially
-/// broken item still appears (with whatever it did provide) instead of crashing
-/// the bar or vanishing the rest of the tray.
+/// `Id` is mandatory and doubles as a liveness check: once the item's bus owner
+/// exits, the failed call drops the stale watcher registration instead of
+/// rendering it as an unknown `?` icon. Optional presentation properties still
+/// degrade to empty defaults so a partially implemented live item remains usable.
 async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
     let (name, path) = parse_item_address(key)?;
     let item = StatusNotifierItemProxy::builder(conn)
@@ -266,7 +267,7 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
         .await
         .ok()?;
 
-    let id = item.id().await.unwrap_or_default();
+    let id = item.id().await.ok()?;
     let title = item.title().await.unwrap_or_default();
     let status = item.status().await.unwrap_or_default();
     let icon_name = item.icon_name().await.unwrap_or_default();
@@ -319,15 +320,24 @@ impl Watcher {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
+        let Some(owner) = header.sender().map(ToString::to_string) else {
+            return;
+        };
         // A bare object path carries no bus name; the real address is the
         // caller's unique name plus that path.
         let address = if service.starts_with('/') {
-            match header.sender() {
-                Some(sender) => format!("{sender}{service}"),
-                None => return,
-            }
+            format!("{owner}{service}")
         } else {
             service.to_string()
+        };
+        // Install the match rule before acknowledging registration so an app
+        // that exits immediately cannot leave a stale address behind.
+        let owner_lost = match DBusProxy::new(emitter.connection()).await {
+            Ok(dbus) => dbus
+                .receive_name_owner_changed_with_args(&[(0, owner.as_str()), (2, "")])
+                .await
+                .ok(),
+            Err(_) => None,
         };
 
         let inserted = self
@@ -338,6 +348,22 @@ impl Watcher {
         if inserted && let Err(e) = Self::status_notifier_item_registered(&emitter, &address).await
         {
             warn!("failed to emit StatusNotifierItemRegistered for {address}: {e}");
+        }
+        if inserted && let Some(mut owner_lost) = owner_lost {
+            let emitter = emitter.to_owned();
+            let items = Arc::clone(&self.items);
+            tokio::spawn(async move {
+                if owner_lost.next().await.is_none() {
+                    return;
+                }
+                let removed = remove_registered_item(&items, &address);
+                if removed
+                    && let Err(error) =
+                        Self::status_notifier_item_unregistered(&emitter, &address).await
+                {
+                    warn!("failed to emit StatusNotifierItemUnregistered for {address}: {error}");
+                }
+            });
         }
     }
 
@@ -380,6 +406,13 @@ impl Watcher {
         emitter: &SignalEmitter<'_>,
         service: &str,
     ) -> zbus::Result<()>;
+}
+
+fn remove_registered_item(items: &Mutex<HashSet<String>>, address: &str) -> bool {
+    items
+        .lock()
+        .map(|mut items| items.remove(address))
+        .unwrap_or(false)
 }
 
 /// The subset of `org.kde.StatusNotifierWatcher` the host consumes. zbus
@@ -578,13 +611,45 @@ async fn run(tx: MsgSender) -> ProducerResult {
     ensure_watcher(&conn).await?;
 
     let watcher = StatusNotifierWatcherProxy::new(&conn).await?;
-    let host_name = format!("org.kde.StatusNotifierHost-{}", std::process::id());
+    let host_name = format!("org.kde.StatusNotifierHost-{}-0", std::process::id());
+    // External watchers such as Waybar validate that a host owns the service
+    // name it registers. Without claiming it, initial enumeration can work but
+    // subsequent Registered/Unregistered lifecycle delivery is unreliable.
+    conn.request_name(host_name.as_str()).await?;
     // Best-effort: a watcher that rejects host registration still lets us read
     // items, so a failure here is logged, not fatal.
     if let Err(e) = watcher.register_status_notifier_host(&host_name).await {
         warn!("sni: registering host failed: {e}");
     }
 
+    // Keep lifecycle subscriptions alive across snapshot rebuilds. Recreating
+    // them after every read leaves a window where a newly opened app can
+    // register with the watcher without waking this host.
+    let mut lifecycle = select_all(vec![
+        watcher
+            .receive_status_notifier_item_registered()
+            .await?
+            .map(|_| ())
+            .boxed(),
+        watcher
+            .receive_status_notifier_item_unregistered()
+            .await?
+            .map(|_| ())
+            .boxed(),
+        watcher
+            .receive_registered_status_notifier_items_changed()
+            .await
+            .map(|_| ())
+            .boxed(),
+    ]);
+    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while lifecycle.next().await.is_some() {
+            if lifecycle_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
     loop {
         let addresses = watcher
             .registered_status_notifier_items()
@@ -601,18 +666,7 @@ async fn run(tx: MsgSender) -> ProducerResult {
         // mutating an icon/title/status — then loop to re-read the whole tray.
         // Rebuilding the stream set each iteration is what keeps a dynamic item
         // set correct as items come and go.
-        let mut streams = vec![
-            watcher
-                .receive_status_notifier_item_registered()
-                .await?
-                .map(|_| ())
-                .boxed(),
-            watcher
-                .receive_status_notifier_item_unregistered()
-                .await?
-                .map(|_| ())
-                .boxed(),
-        ];
+        let mut streams = Vec::new();
         for address in &addresses {
             if let Some(item) = item_change_stream(&conn, address).await {
                 streams.push(item);
@@ -620,14 +674,24 @@ async fn run(tx: MsgSender) -> ProducerResult {
         }
 
         let mut changes = select_all(streams);
-        if changes.next().await.is_none() {
+        if changes.is_empty() {
+            if lifecycle_rx.recv().await.is_none() {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let lifecycle_change = lifecycle_rx.recv();
+        let item_change = changes.next();
+        futures_util::pin_mut!(lifecycle_change, item_change);
+        if let Either::Left((None, _)) = select(lifecycle_change, item_change).await {
             return Ok(());
         }
     }
 }
 
-/// A merged "this item changed" stream for one item: icon, title, status, or
-/// attention-icon updates collapsed to `()` ticks.
+/// A merged "this item changed" stream for one item: icon, title, status,
+/// attention-icon, or bus-owner updates collapsed to `()` ticks.
 ///
 /// Returns `None` if the item proxy cannot be built (it is gone or unreadable),
 /// in which case its absence simply means no per-item wakeups — the next
@@ -638,13 +702,20 @@ async fn item_change_stream(
 ) -> Option<futures_util::stream::BoxStream<'static, ()>> {
     let (name, path) = parse_item_address(address)?;
     let item = StatusNotifierItemProxy::builder(conn)
-        .destination(name)
+        .destination(name.clone())
         .ok()?
         .path(path)
         .ok()?
         .build()
         .await
         .ok()?;
+    let dbus = DBusProxy::new(conn).await.ok()?;
+    let owner_changes = dbus
+        .receive_name_owner_changed_with_args(&[(0, name.as_str())])
+        .await
+        .ok()?
+        .map(|_| ())
+        .boxed();
     let merged = select_all([
         item.receive_new_icon().await.ok()?.map(|_| ()).boxed(),
         item.receive_new_title().await.ok()?.map(|_| ()).boxed(),
@@ -654,6 +725,7 @@ async fn item_change_stream(
             .ok()?
             .map(|_| ())
             .boxed(),
+        owner_changes,
     ]);
     Some(merged.boxed())
 }
@@ -877,6 +949,15 @@ mod tests {
         // producer must treat it as "defer to the external watcher", not crash.
         assert!(interpret_watcher_name(Err(zbus::Error::NameTaken)).is_ok());
         assert!(interpret_watcher_name(Ok(RequestNameReply::Exists)).is_ok());
+    }
+
+    #[test]
+    fn owner_loss_allows_the_same_item_address_to_register_again() {
+        let address = "org.example.Tray/StatusNotifierItem";
+        let items = Mutex::new(HashSet::from([address.to_string()]));
+
+        assert!(remove_registered_item(&items, address));
+        assert!(items.lock().unwrap().insert(address.to_string()));
     }
 
     #[test]
