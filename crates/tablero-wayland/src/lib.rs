@@ -68,9 +68,12 @@ use smithay_client_toolkit::{
 use tablero_core::blit::write_argb8888;
 use tablero_core::clock::millis_until_next_minute;
 use tablero_core::config::Config;
-use tablero_core::render::{Bounds, RenderContext};
+use tablero_core::render::{Bounds, RenderContext, RenderSettings};
 use tablero_core::scale::Scale;
-use tablero_core::widget::{ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip};
+use tablero_core::widget::{
+    ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
+    TrayMenuToggleKind, TrayMenuToggleState,
+};
 
 use crate::backlight::BacklightProducer;
 use crate::bluetooth::BluetoothProducer;
@@ -109,6 +112,7 @@ struct Surface {
     /// The output this surface is pinned to, so a `closed` event can find and
     /// drop just this bar.
     output_id: OutputId,
+    output: wl_output::WlOutput,
     layer: LayerSurface,
     /// Surface dimensions in *logical* pixels (as the compositor reports them in
     /// `configure`). The shared-memory buffer is `scale`× larger; see
@@ -178,6 +182,7 @@ impl Surface {
 
         Self {
             output_id,
+            output: output.clone(),
             layer,
             width: INITIAL_WIDTH,
             height,
@@ -358,6 +363,236 @@ struct TooltipSurface {
     configured: bool,
 }
 
+const MENU_ROW_HEIGHT: u32 = 28;
+const MENU_SEPARATOR_HEIGHT: u32 = 8;
+const POPUP_RADIUS: f32 = 6.0;
+const POPUP_PADDING_X: u32 = 10;
+const POPUP_PADDING_Y: u32 = 5;
+const POPUP_FALLBACK_BACKGROUND: (u8, u8, u8, u8) = (0x20, 0x22, 0x27, 0xF8);
+
+#[derive(Clone)]
+struct MenuRow {
+    id: i32,
+    depth: u32,
+    label: String,
+    enabled: bool,
+    separator: bool,
+    toggle: Option<(TrayMenuToggleKind, TrayMenuToggleState)>,
+    has_children: bool,
+}
+
+impl MenuRow {
+    fn height(&self) -> u32 {
+        if self.separator {
+            MENU_SEPARATOR_HEIGHT
+        } else {
+            MENU_ROW_HEIGHT
+        }
+    }
+
+    fn activatable(&self) -> bool {
+        self.enabled && !self.separator && !self.has_children
+    }
+}
+
+fn flatten_menu(items: &[TrayMenuItem], depth: u32, rows: &mut Vec<MenuRow>) {
+    for item in items.iter().filter(|item| item.visible) {
+        rows.push(MenuRow {
+            id: item.id,
+            depth,
+            label: item.label.clone(),
+            enabled: item.enabled,
+            separator: item.separator,
+            toggle: item.toggle.map(|toggle| (toggle.kind, toggle.state)),
+            has_children: !item.children.iter().all(|child| !child.visible),
+        });
+        flatten_menu(&item.children, depth + 1, rows);
+    }
+}
+
+struct PendingTrayMenu {
+    key: String,
+    parent: LayerSurface,
+    output_id: OutputId,
+    anchor: (i32, i32),
+    scale: Scale,
+    settings: RenderSettings,
+    serial: u32,
+    seat: Option<wl_seat::WlSeat>,
+}
+
+/// One interactive tray menu, rendered as an XDG popup parented to its bar.
+struct TrayMenuSurface {
+    popup: Popup,
+    output_id: OutputId,
+    key: String,
+    revision: u32,
+    rows: Vec<MenuRow>,
+    width: u32,
+    height: u32,
+    scale: Scale,
+    background: (u8, u8, u8, u8),
+    foreground: (u8, u8, u8, u8),
+    accent: (u8, u8, u8, u8),
+    ctx: RenderContext,
+    configured: bool,
+}
+
+impl TrayMenuSurface {
+    fn owns(&self, popup: &Popup) -> bool {
+        self.popup == *popup
+    }
+
+    fn owns_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.popup.wl_surface() == surface
+    }
+
+    fn row_at(&self, y: f64) -> Option<&MenuRow> {
+        if y < 0.0 {
+            return None;
+        }
+        let mut top = 0u32;
+        for row in &self.rows {
+            let bottom = top + row.height();
+            if (y as u32) < bottom {
+                return Some(row);
+            }
+            top = bottom;
+        }
+        None
+    }
+
+    fn command_at(&self, y: f64) -> Option<Command> {
+        let row = self.row_at(y)?;
+        row.activatable().then(|| Command::ActivateTrayMenuItem {
+            key: self.key.clone(),
+            id: row.id,
+        })
+    }
+
+    fn update(&mut self, menu: &TrayMenu, pool: &mut SlotPool) -> bool {
+        if menu.revision < self.revision {
+            return true;
+        }
+        let mut rows = Vec::new();
+        flatten_menu(&menu.items, 0, &mut rows);
+        let height: u32 = rows.iter().map(MenuRow::height).sum();
+        if height != self.height {
+            // A structural resize requires a new popup position/configure. Close
+            // this one rather than drawing against stale compositor geometry;
+            // reopening immediately fetches the new revision.
+            return false;
+        }
+        self.revision = menu.revision;
+        self.rows = rows;
+        self.draw(pool);
+        true
+    }
+
+    fn draw(&mut self, pool: &mut SlotPool) {
+        if !self.configured {
+            return;
+        }
+        let scale = self.scale.get();
+        let width = self.width * scale;
+        let height = self.height * scale;
+        let stride = width as i32 * 4;
+        let (buffer, canvas) = match pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) {
+            Ok(parts) => parts,
+            Err(error) => {
+                warn!("failed to create tray menu buffer: {error}");
+                return;
+            }
+        };
+
+        self.ctx.resize(width, height);
+        self.ctx.fill_rounded_rect(
+            Bounds::new(0, 0, width, height),
+            self.background,
+            POPUP_RADIUS * scale as f32,
+        );
+        let mut top = 0u32;
+        for row in &self.rows {
+            let row_height = row.height() * scale;
+            if row.separator {
+                self.ctx.fill_rounded_rect(
+                    Bounds::new(
+                        POPUP_PADDING_X * scale,
+                        top + row_height / 2,
+                        width - 2 * POPUP_PADDING_X * scale,
+                        scale,
+                    ),
+                    dim_color(self.foreground),
+                    0.0,
+                );
+                top += row_height;
+                continue;
+            }
+            let prefix = match row.toggle {
+                Some((TrayMenuToggleKind::Checkmark, TrayMenuToggleState::On)) => "[x] ",
+                Some((TrayMenuToggleKind::Checkmark, _)) => "[ ] ",
+                Some((TrayMenuToggleKind::Radio, TrayMenuToggleState::On)) => "(o) ",
+                Some((TrayMenuToggleKind::Radio, _)) => "( ) ",
+                None => "",
+            };
+            let suffix = if row.has_children { "  >" } else { "" };
+            let label = format!("{prefix}{}{suffix}", row.label);
+            let indent = (POPUP_PADDING_X + row.depth * 16) * scale;
+            self.ctx.draw_text(
+                &label,
+                Bounds::new(
+                    indent,
+                    top,
+                    width.saturating_sub(indent + POPUP_PADDING_X * scale),
+                    row_height,
+                ),
+                if row.enabled {
+                    if row
+                        .toggle
+                        .is_some_and(|(_, state)| state == TrayMenuToggleState::On)
+                    {
+                        self.accent
+                    } else {
+                        self.foreground
+                    }
+                } else {
+                    dim_color(self.foreground)
+                },
+            );
+            top += row_height;
+        }
+        write_argb8888(self.ctx.pixels(), canvas);
+        self.popup
+            .wl_surface()
+            .set_buffer_scale(self.scale.get() as i32);
+        self.popup
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+        if let Err(error) = buffer.attach_to(self.popup.wl_surface()) {
+            warn!("failed to attach tray menu buffer: {error}");
+            return;
+        }
+        self.popup.wl_surface().commit();
+    }
+}
+
+fn dim_color((r, g, b, a): (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+    (r / 2, g / 2, b / 2, a)
+}
+
+fn popup_background((r, g, b, a): (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+    if a < 0xC0 {
+        POPUP_FALLBACK_BACKGROUND
+    } else {
+        (r, g, b, a.max(0xF0))
+    }
+}
+
 impl TooltipSurface {
     fn owns(&self, popup: &Popup) -> bool {
         self.popup == *popup
@@ -392,10 +627,10 @@ impl TooltipSurface {
         self.ctx.fill_rounded_rect(
             Bounds::new(0, 0, width, height),
             self.background,
-            6.0 * scale as f32,
+            POPUP_RADIUS * scale as f32,
         );
-        let padding_x = 8 * scale;
-        let padding_y = 6 * scale;
+        let padding_x = POPUP_PADDING_X * scale;
+        let padding_y = POPUP_PADDING_Y * scale;
         let line_height = tooltip_line_height(&self.ctx);
         for (index, line) in self.text.lines().enumerate() {
             self.ctx.draw_text(
@@ -425,7 +660,7 @@ impl TooltipSurface {
 }
 
 fn tooltip_line_height(ctx: &RenderContext) -> u32 {
-    (ctx.settings().font_size * 1.25).ceil() as u32
+    (ctx.settings().font_size * 1.15).ceil() as u32
 }
 
 fn tooltip_size(ctx: &mut RenderContext, text: &str) -> (u32, u32) {
@@ -435,9 +670,9 @@ fn tooltip_size(ctx: &mut RenderContext, text: &str) -> (u32, u32) {
         .map(|line| ctx.measure_text(line))
         .max()
         .unwrap_or(0)
-        + 16 * scale;
+        + 2 * POPUP_PADDING_X * scale;
     let lines = text.lines().count().max(1) as u32;
-    let height = lines * tooltip_line_height(ctx) + 12 * scale;
+    let height = lines * tooltip_line_height(ctx) + 2 * POPUP_PADDING_Y * scale;
     (width.max(1), height.max(1))
 }
 
@@ -465,6 +700,7 @@ struct App {
     xdg_shell: XdgShell,
     /// The seat's pointer, created once the seat advertises the capability.
     pointer: Option<ThemedPointer>,
+    pointer_seat: Option<wl_seat::WlSeat>,
     pointer_cursor: CursorIcon,
     /// Fractional logical vertical scroll steps retained across pointer frames.
     scroll_remainder: f64,
@@ -479,6 +715,8 @@ struct App {
     outputs: Outputs<Surface>,
     /// The currently visible tooltip; at most one pointer hover exists per seat.
     tooltip: Option<TooltipSurface>,
+    pending_tray_menu: Option<PendingTrayMenu>,
+    tray_menu: Option<TrayMenuSurface>,
     exit: bool,
 }
 
@@ -521,6 +759,13 @@ impl App {
     /// state behind.
     fn remove_output(&mut self, output: &wl_output::WlOutput) {
         let id = output_key(output);
+        if self
+            .tray_menu
+            .as_ref()
+            .is_some_and(|menu| menu.output_id == id)
+        {
+            self.hide_tray_menu();
+        }
         if self.outputs.remove(id).is_some() {
             info!("output {id} removed; {} bar(s) live", self.outputs.len());
         }
@@ -539,8 +784,39 @@ impl App {
         }
     }
 
+    fn handle_message(&mut self, msg: &Msg, qh: &QueueHandle<App>) {
+        if let Msg::TrayMenu(menu) = msg {
+            if let Some(shown) = self
+                .tray_menu
+                .as_mut()
+                .filter(|shown| shown.key == menu.key)
+            {
+                if !shown.update(menu, &mut self.pool) {
+                    self.tray_menu = None;
+                }
+            } else {
+                self.show_tray_menu(menu, qh);
+            }
+        } else if let Msg::TrayMenuUnavailable(key) = msg {
+            if self
+                .pending_tray_menu
+                .as_ref()
+                .is_some_and(|pending| pending.key == *key)
+            {
+                self.pending_tray_menu = None;
+            }
+        } else {
+            self.handle_all(msg);
+        }
+    }
+
     fn hide_tooltip(&mut self) {
         self.tooltip = None;
+    }
+
+    fn hide_tray_menu(&mut self) {
+        self.pending_tray_menu = None;
+        self.tray_menu = None;
     }
 
     fn set_pointer_cursor(&mut self, conn: &Connection, icon: CursorIcon, force: bool) {
@@ -589,7 +865,7 @@ impl App {
             return;
         }
 
-        let background = settings.background;
+        let background = popup_background(settings.background);
         let foreground = settings.foreground;
         settings.background = (0, 0, 0, 0);
         let mut ctx = RenderContext::with_settings(1, 1, settings);
@@ -620,10 +896,7 @@ impl App {
         );
         positioner.set_anchor(xdg_positioner::Anchor::Bottom);
         positioner.set_gravity(xdg_positioner::Gravity::Bottom);
-        positioner.set_constraint_adjustment(
-            xdg_positioner::ConstraintAdjustment::SlideX
-                | xdg_positioner::ConstraintAdjustment::FlipY,
-        );
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideX);
 
         let popup_surface = self.compositor.create_surface(qh);
         let popup = match Popup::from_surface(None, &positioner, qh, popup_surface, &self.xdg_shell)
@@ -652,6 +925,91 @@ impl App {
             configured: false,
         });
     }
+
+    fn show_tray_menu(&mut self, menu: &TrayMenu, qh: &QueueHandle<App>) {
+        let Some(pending) = self
+            .pending_tray_menu
+            .take()
+            .filter(|pending| pending.key == menu.key)
+        else {
+            return;
+        };
+        let mut rows = Vec::new();
+        flatten_menu(&menu.items, 0, &mut rows);
+        if rows.is_empty() {
+            return;
+        }
+
+        let mut settings = pending.settings;
+        let background = popup_background(settings.background);
+        let foreground = settings.foreground;
+        let accent = settings.accent;
+        settings.background = (0, 0, 0, 0);
+        let mut ctx = RenderContext::with_settings(1, 1, settings);
+        let scale = pending.scale.get();
+        let physical_width = rows
+            .iter()
+            .filter(|row| !row.separator)
+            .map(|row| {
+                let indicators = if row.toggle.is_some() { 4 } else { 0 };
+                let submenu = if row.has_children { 3 } else { 0 };
+                let text = format!(
+                    "{}{}{}",
+                    " ".repeat(indicators),
+                    row.label,
+                    " ".repeat(submenu)
+                );
+                ctx.measure_text(&text) + (32 + row.depth * 16) * scale
+            })
+            .max()
+            .unwrap_or(1);
+        let width = physical_width.div_ceil(scale).clamp(120, 420);
+        let height: u32 = rows.iter().map(MenuRow::height).sum();
+
+        let positioner = match XdgPositioner::new(&self.xdg_shell) {
+            Ok(positioner) => positioner,
+            Err(error) => {
+                warn!("failed to create tray menu positioner: {error}");
+                return;
+            }
+        };
+        positioner.set_size(width as i32, height as i32);
+        positioner.set_anchor_rect(pending.anchor.0, pending.anchor.1, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::BottomLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::SlideX);
+
+        let popup_surface = self.compositor.create_surface(qh);
+        let popup = match Popup::from_surface(None, &positioner, qh, popup_surface, &self.xdg_shell)
+        {
+            Ok(popup) => popup,
+            Err(error) => {
+                warn!("failed to create tray menu popup: {error}");
+                return;
+            }
+        };
+        pending.parent.get_popup(popup.xdg_popup());
+        if let Some(seat) = &pending.seat {
+            popup.xdg_popup().grab(seat, pending.serial);
+        }
+        popup.wl_surface().commit();
+        self.tooltip = None;
+        self.tray_menu = Some(TrayMenuSurface {
+            popup,
+            output_id: pending.output_id,
+            key: menu.key.clone(),
+            revision: menu.revision,
+            rows,
+            width,
+            height,
+            scale: pending.scale,
+            background,
+            foreground,
+            accent,
+            ctx,
+            configured: false,
+        });
+    }
 }
 
 /// The stable per-output key: the `wl_output`'s protocol object id.
@@ -661,6 +1019,20 @@ impl App {
 /// and unique per output for its lifetime — exactly the key the registry needs.
 fn output_key(output: &wl_output::WlOutput) -> OutputId {
     output.id().protocol_id()
+}
+
+fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (f64, f64)) {
+    let screen = (
+        origin.0.saturating_add(local.0 as i32),
+        origin.1.saturating_add(local.1 as i32),
+    );
+    match command {
+        Command::ActivateTrayItem { x, y, .. } | Command::OpenTrayMenu { x, y, .. } => {
+            *x = screen.0;
+            *y = screen.1;
+        }
+        _ => {}
+    }
 }
 
 /// Open the bar and run its event loop until the compositor closes the surface.
@@ -740,11 +1112,14 @@ pub fn run_with_producers(
         layer_shell,
         xdg_shell,
         pointer: None,
+        pointer_seat: None,
         pointer_cursor: CursorIcon::Default,
         scroll_remainder: 0.0,
         commands: Vec::new(),
         outputs: Outputs::new(config),
         tooltip: None,
+        pending_tray_menu: None,
+        tray_menu: None,
         exit: false,
     };
 
@@ -770,11 +1145,12 @@ pub fn run_with_producers(
         None
     } else {
         let (bridge, channel) = ProducerBridge::new()?;
-        handle.insert_source(channel, |event, _, app| {
+        let message_qh = qh.clone();
+        handle.insert_source(channel, move |event, _, app| {
             // Producer messages cross the channel into the same synchronous
             // app-state update path the clock timer uses, fanned out to every bar.
             if let ChannelEvent::Msg(msg) = event {
-                app.handle_all(&msg);
+                app.handle_message(&msg, &message_qh);
             }
         })?;
         let count = producers.len();
@@ -791,7 +1167,8 @@ pub fn run_with_producers(
         let (hypr_tx, hypr_rx) = command_channel();
         bridge.spawn_task("hyprland-commands", hyprland::run_commands(hypr_rx));
         let (sni_tx, sni_rx) = command_channel();
-        bridge.spawn_task("sni-commands", sni::run_commands(sni_rx));
+        let sni_updates = bridge.sender();
+        bridge.spawn_task("sni-commands", sni::run_commands(sni_rx, sni_updates));
         let (run_tx, run_rx) = command_channel();
         bridge.spawn_task("run-commands", command::run_commands(run_rx));
         let (notif_tx, notif_rx) = command_channel();
@@ -842,6 +1219,7 @@ impl CompositorHandler for App {
             pool,
             outputs,
             tooltip,
+            tray_menu,
             ..
         } = self;
         let scale = Scale::new(new_factor);
@@ -854,6 +1232,12 @@ impl CompositorHandler for App {
                 || changed_output == Some(shown.output_id)
         }) {
             *tooltip = None;
+        }
+        if tray_menu.as_ref().is_some_and(|shown| {
+            (shown.owns_surface(surface) && shown.scale != scale)
+                || changed_output == Some(shown.output_id)
+        }) {
+            *tray_menu = None;
         }
     }
 
@@ -976,6 +1360,9 @@ impl PopupHandler for App {
         if let Some(tooltip) = self.tooltip.as_mut().filter(|tooltip| tooltip.owns(popup)) {
             tooltip.configured = true;
             tooltip.draw(&mut self.pool);
+        } else if let Some(menu) = self.tray_menu.as_mut().filter(|menu| menu.owns(popup)) {
+            menu.configured = true;
+            menu.draw(&mut self.pool);
         }
     }
 
@@ -986,6 +1373,8 @@ impl PopupHandler for App {
             .is_some_and(|tooltip| tooltip.owns(popup))
         {
             self.hide_tooltip();
+        } else if self.tray_menu.as_ref().is_some_and(|menu| menu.owns(popup)) {
+            self.hide_tray_menu();
         }
     }
 }
@@ -1037,7 +1426,10 @@ impl SeatHandler for App {
                 cursor_surface,
                 ThemeSpec::default(),
             ) {
-                Ok(pointer) => self.pointer = Some(pointer),
+                Ok(pointer) => {
+                    self.pointer = Some(pointer);
+                    self.pointer_seat = Some(seat);
+                }
                 Err(e) => error!("failed to create pointer: {e}"),
             }
         }
@@ -1052,6 +1444,7 @@ impl SeatHandler for App {
     ) {
         if capability == Capability::Pointer {
             self.pointer = None;
+            self.pointer_seat = None;
             self.pointer_cursor = CursorIcon::Default;
         }
     }
@@ -1074,6 +1467,22 @@ impl PointerHandler for App {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
             ) {
                 let (x, y) = event.position;
+                if let Some(menu) = self
+                    .tray_menu
+                    .as_ref()
+                    .filter(|menu| menu.owns_surface(&event.surface))
+                {
+                    self.set_pointer_cursor(
+                        conn,
+                        if menu.row_at(y).is_some_and(MenuRow::activatable) {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        },
+                        matches!(event.kind, PointerEventKind::Enter { .. }),
+                    );
+                    continue;
+                }
                 let clickable = self
                     .outputs
                     .values()
@@ -1095,8 +1504,14 @@ impl PointerHandler for App {
                 if self.outputs.values().any(|bar| bar.owns(&event.surface)) {
                     self.hide_tooltip();
                     self.pointer_cursor = CursorIcon::Default;
+                } else if self
+                    .tray_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.owns_surface(&event.surface))
+                {
+                    self.pointer_cursor = CursorIcon::Default;
                 }
-            } else if let PointerEventKind::Press { button, .. } = event.kind {
+            } else if let PointerEventKind::Press { button, serial, .. } = event.kind {
                 // Normalize the kernel input code to the typed button the
                 // widgets branch on; other buttons (middle, side, scroll
                 // clicks) are ignored here so widgets never see them.
@@ -1106,15 +1521,65 @@ impl PointerHandler for App {
                     _ => continue,
                 };
                 let (x, y) = event.position;
+                if self
+                    .tray_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.owns_surface(&event.surface))
+                {
+                    if click == ClickButton::Left {
+                        let command = self.tray_menu.as_ref().and_then(|menu| menu.command_at(y));
+                        if let Some(command) = command {
+                            self.hide_tray_menu();
+                            for sender in &self.commands {
+                                if sender.send(command.clone()).is_err() {
+                                    warn!("command channel closed; dropping menu command");
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Resolve the click against the surface it landed on, then fan the
                 // resulting command out to the executors. The immutable lookup ends
                 // before `self.commands` is borrowed, so the two never conflict.
-                let command = self
+                let interaction = self
                     .outputs
                     .values()
                     .find(|bar| bar.owns(&event.surface))
-                    .and_then(|bar| bar.on_click(x, y, click));
-                if let Some(command) = command {
+                    .and_then(|bar| {
+                        Some((
+                            bar.on_click(x, y, click)?,
+                            bar.layer.clone(),
+                            bar.output.clone(),
+                            bar.output_id,
+                            bar.scale,
+                            bar.height,
+                            bar.config.scaled_render_settings(bar.scale),
+                        ))
+                    });
+                if let Some((mut command, parent, output, output_id, scale, bar_height, settings)) =
+                    interaction
+                {
+                    let origin = self
+                        .output_state
+                        .info(&output)
+                        .map(|info| info.logical_position.unwrap_or(info.location))
+                        .unwrap_or((0, 0));
+                    set_tray_command_position(&mut command, origin, (x, y));
+                    if let Command::OpenTrayMenu { key, .. } = &command {
+                        self.hide_tray_menu();
+                        self.hide_tooltip();
+                        self.pending_tray_menu = Some(PendingTrayMenu {
+                            key: key.clone(),
+                            parent,
+                            output_id,
+                            anchor: (x as i32, bar_height as i32),
+                            scale,
+                            settings,
+                            serial,
+                            seat: self.pointer_seat.clone(),
+                        });
+                    }
                     for sender in &self.commands {
                         if sender.send(command.clone()).is_err() {
                             warn!("command channel closed; dropping click command");
@@ -1222,6 +1687,76 @@ mod scroll_tests {
         assert_eq!(
             scroll_directions(half, &mut remainder),
             vec![ScrollDirection::Increase]
+        );
+    }
+
+    #[test]
+    fn tray_coordinates_include_the_output_logical_origin() {
+        let mut command = Command::OpenTrayMenu {
+            key: ":1.7/Menu".into(),
+            x: 0,
+            y: 0,
+        };
+        set_tray_command_position(&mut command, (1920, -40), (24.8, 18.9));
+        assert_eq!(
+            command,
+            Command::OpenTrayMenu {
+                key: ":1.7/Menu".into(),
+                x: 1944,
+                y: -22,
+            }
+        );
+    }
+
+    #[test]
+    fn tray_menu_flattens_visible_nested_entries_and_preserves_depth() {
+        let leaf = TrayMenuItem {
+            id: 2,
+            label: "Child".into(),
+            enabled: true,
+            visible: true,
+            separator: false,
+            toggle: None,
+            children: vec![],
+        };
+        let parent = TrayMenuItem {
+            id: 1,
+            label: "Parent".into(),
+            enabled: true,
+            visible: true,
+            separator: false,
+            toggle: None,
+            children: vec![leaf],
+        };
+        let hidden = TrayMenuItem {
+            id: 3,
+            label: "Hidden".into(),
+            enabled: true,
+            visible: false,
+            separator: false,
+            toggle: None,
+            children: vec![],
+        };
+        let mut rows = Vec::new();
+        flatten_menu(&[parent, hidden], 0, &mut rows);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].id, rows[0].depth), (1, 0));
+        assert!(rows[0].has_children);
+        assert!(!rows[0].activatable());
+        assert_eq!((rows[1].id, rows[1].depth), (2, 1));
+        assert!(rows[1].activatable());
+    }
+
+    #[test]
+    fn transparent_bar_background_uses_an_opaque_popup_surface() {
+        assert_eq!(
+            popup_background((0x18, 0x18, 0x18, 0x00)),
+            POPUP_FALLBACK_BACKGROUND
+        );
+        assert_eq!(
+            popup_background((0x30, 0x32, 0x38, 0xD0)),
+            (0x30, 0x32, 0x38, 0xF0)
         );
     }
 }

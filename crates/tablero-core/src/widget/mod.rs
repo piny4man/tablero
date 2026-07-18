@@ -43,7 +43,10 @@ pub use notifications::{Notifications, NotificationsWidget};
 pub use power_profiles::{PowerProfile, PowerProfilesState, PowerProfilesWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
-pub use tray::{TrayIcon, TrayItem, TrayState, TrayStatus, TrayWidget};
+pub use tray::{
+    TrayIcon, TrayItem, TrayMenu, TrayMenuItem, TrayMenuMode, TrayMenuToggle, TrayMenuToggleKind,
+    TrayMenuToggleState, TrayState, TrayStatus, TrayWidget,
+};
 pub use volume::{DeviceKind, Volume, VolumeWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -95,6 +98,11 @@ pub enum Msg {
     /// The set of registered StatusNotifierItem tray items changed; carries the
     /// normalized snapshot of what the tray should now show.
     Tray(TrayState),
+    /// A DBusMenu layout fetched for a tray interaction and ready to present.
+    TrayMenu(TrayMenu),
+    /// A tray menu request fell back to the item's own `ContextMenu`, so any
+    /// pending native popup state can be released.
+    TrayMenuUnavailable(String),
     /// The active window on a specific Hyprland monitor changed.
     ///
     /// Each output's bar carries its own `TitleWidget` bound to a specific
@@ -152,8 +160,32 @@ pub enum Command {
     /// Switch the compositor to the workspace with this id.
     SwitchWorkspace(i32),
     /// Activate the tray item registered under this address (an SNI
-    /// `Activate` request — primary click).
-    ActivateTrayItem(String),
+    /// `Activate` request), at the click's screen coordinates.
+    ActivateTrayItem {
+        /// The item's watcher registration address.
+        key: String,
+        /// Horizontal screen coordinate.
+        x: i32,
+        /// Vertical screen coordinate.
+        y: i32,
+    },
+    /// Open an item's exported DBusMenu, falling back to SNI `ContextMenu` when
+    /// it does not export one.
+    OpenTrayMenu {
+        /// The item's watcher registration address.
+        key: String,
+        /// Horizontal screen coordinate.
+        x: i32,
+        /// Vertical screen coordinate.
+        y: i32,
+    },
+    /// Activate one entry from an open tray DBusMenu.
+    ActivateTrayMenuItem {
+        /// The owning tray item's watcher registration address.
+        key: String,
+        /// DBusMenu item id.
+        id: i32,
+    },
     /// Spawn the executable at this path as a child process directly (no
     /// shell), used to wire a per-widget `on-click` action (e.g. a Bluetooth
     /// manager launcher). The host executor resolves a leading `~` to the

@@ -189,11 +189,19 @@ fn clicking_a_tray_item_activates_it_by_address() {
     // [0,32) and :1.2 owns [32,64).
     assert_eq!(
         dashboard.on_click(16, 16, ClickButton::Left),
-        Some(Command::ActivateTrayItem(":1.1".to_string()))
+        Some(Command::ActivateTrayItem {
+            key: ":1.1".to_string(),
+            x: 16,
+            y: 16,
+        })
     );
     assert_eq!(
         dashboard.on_click(48, 16, ClickButton::Left),
-        Some(Command::ActivateTrayItem(":1.2".to_string()))
+        Some(Command::ActivateTrayItem {
+            key: ":1.2".to_string(),
+            x: 48,
+            y: 16,
+        })
     );
     // Empty space past the items activates nothing.
     assert_eq!(dashboard.on_click(200, 16, ClickButton::Left), None);
