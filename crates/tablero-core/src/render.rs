@@ -1,6 +1,7 @@
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use tiny_skia::{
-    FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, PixmapRef, Rect, Transform,
+    FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapPaint, PixmapRef, Rect,
+    Stroke, Transform,
 };
 
 /// Opaque dark background color (R, G, B, A).
@@ -79,6 +80,34 @@ impl Bounds {
     pub fn contains(&self, px: u32, py: u32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
+}
+
+fn rounded_rect_path(bounds: Bounds, radius: f32, inset: f32) -> Option<Path> {
+    let x = bounds.x as f32 + inset;
+    let y = bounds.y as f32 + inset;
+    let w = bounds.width as f32 - 2.0 * inset;
+    let h = bounds.height as f32 - 2.0 * inset;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+
+    let radius = radius.clamp(0.0, (w / 2.0).min(h / 2.0));
+    if radius <= 0.0 {
+        return Some(PathBuilder::from_rect(Rect::from_xywh(x, y, w, h)?));
+    }
+
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + radius, y);
+    pb.line_to(x + w - radius, y);
+    pb.quad_to(x + w, y, x + w, y + radius);
+    pb.line_to(x + w, y + h - radius);
+    pb.quad_to(x + w, y + h, x + w - radius, y + h);
+    pb.line_to(x + radius, y + h);
+    pb.quad_to(x, y + h, x, y + h - radius);
+    pb.line_to(x, y + radius);
+    pb.quad_to(x, y, x + radius, y);
+    pb.close();
+    pb.finish()
 }
 
 /// A reusable software-render target shared across widgets within one frame.
@@ -193,28 +222,8 @@ impl RenderContext {
             return;
         }
 
-        let (x, y) = (bounds.x as f32, bounds.y as f32);
-        let (w, h) = (bounds.width as f32, bounds.height as f32);
-        let radius = radius.clamp(0.0, (w / 2.0).min(h / 2.0));
-
-        let path = if radius <= 0.0 {
-            PathBuilder::from_rect(Rect::from_xywh(x, y, w, h).expect("validated non-zero rect"))
-        } else {
-            // Walk the outline clockwise, rounding each corner with a quadratic
-            // curve whose control point is the would-be sharp corner.
-            let mut pb = PathBuilder::new();
-            pb.move_to(x + radius, y);
-            pb.line_to(x + w - radius, y);
-            pb.quad_to(x + w, y, x + w, y + radius);
-            pb.line_to(x + w, y + h - radius);
-            pb.quad_to(x + w, y + h, x + w - radius, y + h);
-            pb.line_to(x + radius, y + h);
-            pb.quad_to(x, y + h, x, y + h - radius);
-            pb.line_to(x, y + radius);
-            pb.quad_to(x, y, x + radius, y);
-            pb.close();
-            pb.finish().expect("rounded-rect path is well-formed")
-        };
+        let path =
+            rounded_rect_path(bounds, radius, 0.0).expect("validated non-zero rounded rectangle");
 
         let mut paint = Paint::default();
         paint.set_color_rgba8(r, g, b, a);
@@ -225,6 +234,40 @@ impl RenderContext {
             Transform::identity(),
             None,
         );
+    }
+
+    /// Stroke a rounded rectangle inside `bounds` with `color` and `width`.
+    ///
+    /// The stroke is inset by half its width so it stays inside the widget's
+    /// layout slot. `radius` and `width` are physical pixels; callers scale
+    /// logical widget geometry before invoking this primitive.
+    pub fn stroke_rounded_rect(
+        &mut self,
+        bounds: Bounds,
+        color: (u8, u8, u8, u8),
+        radius: f32,
+        width: f32,
+    ) {
+        let (r, g, b, a) = color;
+        if bounds.width == 0 || bounds.height == 0 || a == 0 || width <= 0.0 {
+            return;
+        }
+
+        let max_width = bounds.width.min(bounds.height) as f32;
+        let width = width.min(max_width);
+        let inset = width / 2.0;
+        let Some(path) = rounded_rect_path(bounds, (radius - inset).max(0.0), inset) else {
+            return;
+        };
+
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(r, g, b, a);
+        let stroke = Stroke {
+            width,
+            ..Stroke::default()
+        };
+        self.pixmap
+            .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 
     /// Shape and draw `text` in `color` within `bounds`.
@@ -337,7 +380,10 @@ impl RenderContext {
         // Center the scaled image within the slot.
         let tx = bounds.x as f32 + (bounds.width as f32 - draw_w) / 2.0;
         let ty = bounds.y as f32 + (bounds.height as f32 - draw_h) / 2.0;
-        let transform = Transform::from_scale(scale, scale).post_translate(tx, ty);
+        // Use an explicit matrix so translation remains in destination pixels.
+        // Composing `post_translate` onto a scale also scales the translation,
+        // which lets tray icons escape an inset content box.
+        let transform = Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
 
         let paint = PixmapPaint {
             quality: FilterQuality::Bilinear,
@@ -442,6 +488,33 @@ mod tests {
     }
 
     #[test]
+    fn stroke_rounded_rect_paints_an_inset_border_and_scales_width() {
+        let mut ctx = RenderContext::new(24, 24);
+        ctx.fill_background();
+        ctx.fill_rounded_rect(Bounds::new(2, 2, 20, 20), (0x20, 0x40, 0x20, 0xFF), 2.0);
+        ctx.stroke_rounded_rect(
+            Bounds::new(2, 2, 20, 20),
+            (0xE0, 0xA0, 0x20, 0xFF),
+            2.0,
+            2.0,
+        );
+
+        let px = ctx.pixels();
+        let border = (12 * 24 + 2) * 4;
+        let center = (12 * 24 + 12) * 4;
+        assert!(
+            px[border] > 0xB0 && px[border + 1] > 0x70 && px[border + 2] < 0x50,
+            "border pixel not amber: {:?}",
+            &px[border..border + 4]
+        );
+        assert!(
+            px[center] < 0x40 && px[center + 1] > 0x30 && px[center + 2] < 0x40,
+            "center fill was overwritten: {:?}",
+            &px[center..center + 4]
+        );
+    }
+
+    #[test]
     fn measure_text_grows_with_content_and_is_zero_for_empty() {
         let mut ctx = RenderContext::new(200, 32);
         assert_eq!(ctx.measure_text(""), 0, "empty text has zero width");
@@ -506,17 +579,17 @@ mod tests {
         let icon: Vec<u8> = red.iter().cycle().take(2 * 2 * 4).copied().collect();
         let mut ctx = RenderContext::new(64, 32);
         ctx.fill_background();
-        ctx.draw_icon(&icon, 2, 2, Bounds::new(0, 0, 32, 32));
+        ctx.draw_icon(&icon, 2, 2, Bounds::new(6, 6, 20, 20));
         let px = ctx.pixels();
-        // The icon scales to the 32x32 slot, so its center pixel must be red.
+        // The icon scales and translates into the requested slot.
         let center = (16 * 64 + 16) * 4;
         assert!(
             px[center] > 0xC0 && px[center + 1] < 0x30 && px[center + 2] < 0x30,
             "icon center not red: {:?}",
             &px[center..center + 4]
         );
-        // The far-right slot is untouched: still dark background.
-        let corner = (16 * 64 + 60) * 4;
+        // Pixels immediately outside the offset slot stay untouched.
+        let corner = (16 * 64 + 2) * 4;
         assert!(
             px[corner] < 0x30 && px[corner + 1] < 0x30 && px[corner + 2] < 0x30,
             "outside-icon area not background"

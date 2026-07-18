@@ -438,7 +438,8 @@ impl Widget for TrayWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        let radius = (self.style.radius * ctx.scale_factor()) as f32;
+        let scale = ctx.scale_factor();
+        let radius = (self.style.radius * scale) as f32;
         for (item, cell) in self.item_cells() {
             let needs_attention = item.status() == TrayStatus::NeedsAttention;
             // A pill sits behind the cell when the item needs attention (the
@@ -452,18 +453,39 @@ impl Widget for TrayWidget {
             if let Some(bg) = pill {
                 ctx.fill_rounded_rect(cell, bg, radius);
             }
-            // A usable icon is blitted into its cell; an item without one falls
-            // back to its centered initial so it stays visible and clickable.
+            // Keep icon artwork clear of the cell edge. The full cell remains the
+            // background, outline, and hit target; padding only affects content.
+            let requested_inset = self.style.padding * scale;
+            let max_inset = cell.width.min(cell.height).saturating_sub(1) / 2;
+            let inset = requested_inset.min(max_inset);
+            let content = Bounds::new(
+                cell.x + inset,
+                cell.y + inset,
+                cell.width - 2 * inset,
+                cell.height - 2 * inset,
+            );
+            // A usable icon is blitted into the padded content area; an item
+            // without one falls back to its centered initial.
             match item.icon() {
-                Some(icon) => ctx.draw_icon(icon.rgba(), icon.width(), icon.height(), cell),
+                Some(icon) => ctx.draw_icon(icon.rgba(), icon.width(), icon.height(), content),
                 None => {
                     let color = if needs_attention {
                         self.style.attention.foreground
                     } else {
                         self.style.foreground
                     };
-                    draw_centered(ctx, &item.fallback_label(), cell, color);
+                    draw_centered(ctx, &item.fallback_label(), content, color);
                 }
+            }
+            // Paint the outline last so an opaque full-cell tray icon cannot
+            // cover the equipment-cell edge.
+            if let Some(border) = self.style.border {
+                ctx.stroke_rounded_rect(
+                    cell,
+                    border,
+                    radius,
+                    (self.style.border_width * scale) as f32,
+                );
             }
         }
     }
@@ -773,6 +795,39 @@ mod tests {
         let px = ctx.pixels();
         let center = (16 * 64 + 16) * 4;
         assert!(px[center + 2] > 0x80, "icon cell not blue");
+    }
+
+    #[test]
+    fn configured_padding_insets_icons_without_shrinking_the_cell() {
+        let png = solid_png(8, 8, [0, 0, 255, 255]);
+        let icon = TrayIcon::from_png_bytes(&png).unwrap();
+        let tray_item = TrayItem::new(":1.1", "blue", TrayStatus::Active, Some(icon));
+        let style = WidgetStyle {
+            background: Some((0x20, 0x40, 0x20, 0xFF)),
+            padding: 6,
+            radius: 0,
+            ..WidgetStyle::default()
+        };
+        let mut widget = TrayWidget::new(Bounds::new(0, 0, 32, 32)).with_style(style);
+        widget.update(&Msg::Tray(TrayState::new([tray_item])));
+
+        let mut ctx = RenderContext::new(32, 32);
+        ctx.fill_background();
+        widget.draw(&mut ctx);
+
+        let px = ctx.pixels();
+        let padded_edge = (16 * 32 + 2) * 4;
+        let center = (16 * 32 + 16) * 4;
+        assert_eq!(&px[padded_edge..padded_edge + 4], &[0x20, 0x40, 0x20, 0xFF]);
+        assert!(px[center + 2] > 0x80, "padded icon center not blue");
+        assert_eq!(
+            widget.on_click(2, 16, ClickButton::Left),
+            Some(Command::ActivateTrayItem {
+                key: ":1.1".to_string(),
+                x: 2,
+                y: 16,
+            })
+        );
     }
 
     #[test]

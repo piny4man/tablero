@@ -41,6 +41,8 @@
 //! # widget flat (no pill). For example, a translucent rounded clock pill:
 //! [widget.clock]
 //! background = "#2e3440cc"
+//! border     = "#59604d"
+//! border-width = 1
 //! radius     = 10
 //!
 //! # Per-monitor overrides: a [[monitor]] block restyles or re-lays-out one
@@ -71,7 +73,8 @@ use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting,
     NetworkWidget, NotificationsWidget, PowerProfilesWidget, StateColors, SystemWidget,
     TitleWidget, TrayWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
-    backlight::validate_backlight_format, power_profiles::validate_power_profiles_format,
+    backlight::validate_backlight_format, battery::validate_battery_format,
+    power_profiles::validate_power_profiles_format,
 };
 
 /// Default bar height in pixels.
@@ -288,11 +291,11 @@ impl Default for Bar {
     }
 }
 
-/// Optional colors for one widget *state* (the warn or attention pill).
+/// Optional colors for one widget state (warn, attention, or charging).
 ///
-/// Each channel is optional and inherits the built-in alert colors when unset,
-/// so a `[widget.battery.warn]` table that sets only `foreground` keeps the
-/// default red pill behind it.
+/// Each channel is optional and inherits that state's resolved defaults when
+/// unset, so a `[widget.battery.warn]` table that sets only `foreground` keeps
+/// the default red pill behind it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StateColorConfig {
@@ -300,6 +303,8 @@ pub struct StateColorConfig {
     pub background: Option<Color>,
     /// Text/glyph color for this state, if overridden.
     pub foreground: Option<Color>,
+    /// Border color for this state, if overridden.
+    pub border: Option<Color>,
 }
 
 impl StateColorConfig {
@@ -311,6 +316,9 @@ impl StateColorConfig {
         }
         if self.foreground.is_some() {
             base.foreground = self.foreground;
+        }
+        if self.border.is_some() {
+            base.border = self.border;
         }
     }
 }
@@ -329,6 +337,11 @@ pub struct WidgetStyleConfig {
     pub foreground: Option<Color>,
     /// Emphasis color (e.g. the active workspace); inherits the theme accent.
     pub accent: Option<Color>,
+    /// Optional border around the widget pill or cell.
+    pub border: Option<Color>,
+    /// Border width in logical pixels; defaults to one when a border is set.
+    #[serde(rename = "border-width")]
+    pub border_width: Option<u32>,
     /// Pill corner radius in logical pixels.
     pub radius: Option<u32>,
     /// Inset between a pill edge and its text, in logical pixels.
@@ -343,6 +356,8 @@ pub struct WidgetStyleConfig {
     pub warn: StateColorConfig,
     /// Colors for the attention state (e.g. a tray item needing attention).
     pub attention: StateColorConfig,
+    /// Colors used while a battery is charging.
+    pub charging: StateColorConfig,
     /// Executable path run when the widget is clicked.
     ///
     /// When `Some`, a click inside the widget's bounds emits a
@@ -354,7 +369,7 @@ pub struct WidgetStyleConfig {
     /// compatibility; today only the bluetooth widget honors it.
     #[serde(rename = "on-click")]
     pub on_click: Option<std::path::PathBuf>,
-    /// Backlight label format. Supports `{icon}` and `{percent}`.
+    /// Widget label format. Supported placeholders depend on the widget.
     pub format: Option<String>,
     /// Widget-specific icon configuration: a backlight ramp or named profile map.
     #[serde(rename = "format-icons")]
@@ -406,22 +421,35 @@ impl WidgetStyleConfig {
     /// the widgets read as "draw no pill".
     fn resolve(&self, theme: &Theme) -> WidgetStyle {
         let defaults = WidgetStyle::default();
+        let background = self.background.map(Color::to_rgba);
+        let foreground = self
+            .foreground
+            .map(Color::to_rgba)
+            .unwrap_or_else(|| theme.foreground.to_rgba());
+        let border = self.border.map(Color::to_rgba);
         WidgetStyle {
-            background: self.background.map(Color::to_rgba),
-            foreground: self
-                .foreground
-                .map(Color::to_rgba)
-                .unwrap_or_else(|| theme.foreground.to_rgba()),
+            background,
+            foreground,
             accent: self
                 .accent
                 .map(Color::to_rgba)
                 .unwrap_or_else(|| theme.accent.to_rgba()),
+            border,
+            border_width: self.border_width.unwrap_or(defaults.border_width),
             radius: self.radius.unwrap_or(defaults.radius),
             padding: self.padding.unwrap_or(defaults.padding),
             icon: resolve_icon(self.icon.as_deref()),
             warn_threshold: self.warn_threshold.unwrap_or(defaults.warn_threshold),
             warn: resolve_state(self.warn, defaults.warn),
             attention: resolve_state(self.attention, defaults.attention),
+            charging: resolve_state(
+                self.charging,
+                StateColors {
+                    background,
+                    foreground,
+                    border,
+                },
+            ),
         }
     }
 
@@ -443,6 +471,12 @@ impl WidgetStyleConfig {
         }
         if self.accent.is_some() {
             base.accent = self.accent;
+        }
+        if self.border.is_some() {
+            base.border = self.border;
+        }
+        if self.border_width.is_some() {
+            base.border_width = self.border_width;
         }
         if self.radius.is_some() {
             base.radius = self.radius;
@@ -479,6 +513,7 @@ impl WidgetStyleConfig {
         }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
+        self.charging.apply(&mut base.charging);
     }
 }
 
@@ -564,8 +599,8 @@ fn resolve_icon(icon: Option<&str>) -> IconSetting {
     }
 }
 
-/// Fold an optional [`StateColorConfig`] onto the built-in `default` alert
-/// colors, taking each set channel and inheriting the rest.
+/// Fold a [`StateColorConfig`] onto resolved defaults, taking each set channel
+/// and inheriting the rest.
 fn resolve_state(config: StateColorConfig, default: StateColors) -> StateColors {
     StateColors {
         background: match config.background {
@@ -576,6 +611,7 @@ fn resolve_state(config: StateColorConfig, default: StateColors) -> StateColors 
             .foreground
             .map(Color::to_rgba)
             .unwrap_or(default.foreground),
+        border: config.border.map(Color::to_rgba).or(default.border),
     }
 }
 
@@ -801,6 +837,7 @@ impl Config {
         validate_font_size("font.size", self.font.size)?;
         validate_range("bar.margin", self.bar.margin, 0, MAX_GAP)?;
         validate_range("bar.gap", self.bar.gap, 0, MAX_GAP)?;
+        validate_battery_config("widget.battery", &self.widget.battery)?;
         validate_backlight_config("widget.backlight", &self.widget.backlight)?;
         validate_power_profiles_config(
             "widget.power-profiles-daemon",
@@ -835,6 +872,10 @@ impl Config {
             validate_backlight_config(
                 &format!("monitor {who:?} widget.backlight"),
                 &monitor.widget.backlight,
+            )?;
+            validate_battery_config(
+                &format!("monitor {who:?} widget.battery"),
+                &monitor.widget.battery,
             )?;
             validate_power_profiles_config(
                 &format!("monitor {who:?} widget.power-profiles-daemon"),
@@ -970,6 +1011,13 @@ fn validate_backlight_config(field: &str, config: &WidgetStyleConfig) -> Result<
         return Err(format!(
             "{field}.device must be a non-empty sysfs device name, got {device:?}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_battery_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    if let Some(format) = &config.format {
+        validate_battery_format(format).map_err(|error| format!("{field}.format {error}"))?;
     }
     Ok(())
 }
@@ -1124,6 +1172,11 @@ impl Config {
                     let style_config = self.widget.get(kind);
                     let style = style_config.resolve(&self.theme);
                     match kind {
+                        WidgetKind::Battery => Box::new(
+                            BatteryWidget::new(bounds)
+                                .with_style(style)
+                                .with_format(style_config.format.clone()),
+                        ) as Box<dyn Widget>,
                         WidgetKind::Backlight => Box::new(
                             BacklightWidget::new(bounds)
                                 .with_style(style)
@@ -1266,15 +1319,56 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_example_config_parses_to_the_defaults() {
-        // The example file documents the defaults: its uncommented body must stay
-        // a valid document that resolves to exactly Config::default(). This is the
-        // guard that keeps the shipped example from silently drifting out of sync
-        // with the schema — as it had when the old flat `widgets`/`spacing` keys
-        // were replaced by [bar] zones.
+    fn the_shipped_example_config_parses_as_the_themed_desktop_loadout() {
+        // The shipped file is deliberately opinionated, but must remain valid and
+        // retain the defining layout and palette of the documented preset.
         let example = include_str!("../../../config.example.toml");
         let parsed = Config::from_toml_str(example).expect("example config parses");
-        assert_eq!(parsed, Config::default());
+        assert_eq!(parsed.height, 38);
+        assert_eq!(parsed.theme.background, Color::rgb(0x14, 0x09, 0x17));
+        assert_eq!(parsed.theme.foreground, Color::rgb(0xEA, 0xE2, 0xCF));
+        assert_eq!(parsed.theme.accent, Color::rgb(0x7D, 0xEC, 0xFF));
+        assert_eq!(
+            parsed.bar.background,
+            Some(Color::rgba(0x00, 0x00, 0x00, 0x00))
+        );
+        assert_eq!(
+            parsed.bar.modules_left,
+            vec![WidgetKind::Workspaces, WidgetKind::Title]
+        );
+        assert!(parsed.bar.modules_center.is_empty());
+        assert_eq!(
+            parsed.bar.modules_right,
+            vec![
+                WidgetKind::Bluetooth,
+                WidgetKind::Backlight,
+                WidgetKind::Volume,
+                WidgetKind::System,
+                WidgetKind::Network,
+                WidgetKind::Tray,
+                WidgetKind::Notifications,
+                WidgetKind::Battery,
+                WidgetKind::PowerProfilesDaemon,
+                WidgetKind::Clock,
+            ]
+        );
+        assert_eq!(
+            parsed.widget.workspaces.border,
+            Some(Color::rgb(0x3D, 0x1F, 0x3A))
+        );
+        assert_eq!(parsed.widget.workspaces.border_width, Some(1));
+        assert_eq!(
+            parsed.widget.battery.format.as_deref(),
+            Some("{icon} {percent}%")
+        );
+        assert_eq!(
+            parsed.widget.battery.charging.foreground,
+            Some(Color::rgb(0x5F, 0xF5, 0xA0))
+        );
+        assert_eq!(
+            parsed.widget.battery.charging.border,
+            Some(Color::rgb(0x2D, 0xF1, 0x85))
+        );
     }
 
     #[test]
@@ -1329,6 +1423,8 @@ mod tests {
 
             [widget.clock]
             background = "#222222"
+            border = "#445566"
+            border-width = 2
             radius = 10
             icon = "none"
             "##,
@@ -1356,6 +1452,11 @@ mod tests {
             Some(Color::rgb(0x22, 0x22, 0x22))
         );
         assert_eq!(config.widget.clock.radius, Some(10));
+        assert_eq!(
+            config.widget.clock.border,
+            Some(Color::rgb(0x44, 0x55, 0x66))
+        );
+        assert_eq!(config.widget.clock.border_width, Some(2));
         assert_eq!(config.widget.clock.icon.as_deref(), Some("none"));
     }
 
@@ -1980,12 +2081,14 @@ mod tests {
             r##"
             [widget.battery]
             foreground = "#eeeeee"
+            border = "#445566"
             radius = 6
 
             [[monitor]]
             name = "DP-1"
             [monitor.widget.battery]
             background = "#bf616aff"
+            border-width = 2
             "##,
         )
         .unwrap();
@@ -2000,6 +2103,8 @@ mod tests {
         // ...while the global fields the monitor left unset are preserved, not
         // reset to the bare default.
         assert_eq!(battery.foreground, Some(Color::rgb(0xEE, 0xEE, 0xEE)));
+        assert_eq!(battery.border, Some(Color::rgb(0x44, 0x55, 0x66)));
+        assert_eq!(battery.border_width, Some(2));
         assert_eq!(battery.radius, Some(6));
         // A widget the monitor never mentioned is untouched by the merge.
         assert_eq!(resolved.widget.clock, WidgetStyleConfig::default());
@@ -2231,6 +2336,15 @@ mod tests {
             );
             assert!(error.to_string().contains("widget.backlight"));
         }
+    }
+
+    #[test]
+    fn invalid_battery_format_is_rejected() {
+        let error = Config::from_toml_str("[widget.battery]\nformat = \"{watts}\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("widget.battery.format"), "message: {error}");
+        assert!(error.contains("{watts}"), "message: {error}");
     }
 
     #[test]

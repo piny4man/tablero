@@ -328,6 +328,14 @@ impl Widget for WorkspaceWidget {
                 None if is_active => (format!("[{id}]"), self.style.accent),
                 None => (id.to_string(), self.style.foreground),
             };
+            if let Some(border) = self.style.border {
+                ctx.stroke_rounded_rect(
+                    cell,
+                    border,
+                    radius,
+                    (self.style.border_width * ctx.scale_factor()) as f32,
+                );
+            }
             draw_centered(ctx, &text, cell, color);
         }
     }

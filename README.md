@@ -131,8 +131,10 @@ Invalid configuration is a **hard error**, never a silent fallback: an unknown
 key, an unknown widget name, or a malformed color stops startup with a clear
 message naming the file.
 
-A ready-to-copy, fully-commented template lives at
-[`config.example.toml`](config.example.toml):
+An opinionated, ready-to-copy ARC Raiders-inspired desktop preset lives at
+[`config.example.toml`](config.example.toml). It demonstrates the full styling
+surface and is intentionally different from the built-in defaults documented
+below:
 
 ```sh
 mkdir -p ~/.config/tablero
@@ -188,6 +190,38 @@ size = 16.0
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
 | `font.family`  | string (opt.)   | unset → system font                           | Font family name.                                                |
 | `font.size`    | float (px)      | `16.0`                                         | Text size.                                                       |
+
+Per-widget tables support equipment-like fills and outlines without changing
+the global theme:
+
+```toml
+[widget.clock]
+background = "#292b1d"
+foreground = "#f0d77b"
+border = "#766b36"
+border-width = 1
+radius = 2
+padding = 10
+```
+
+`background`, `foreground`, `accent`, and `border` accept the same six- or
+eight-digit hex colors as the theme. `border-width`, `radius`, and `padding` are
+logical pixels and scale with the output. A border is optional; when `border` is
+set and `border-width` is omitted, the width defaults to one logical pixel.
+
+The battery also supports `format` placeholders: `{icon}`, `{percent}`, and
+`{state}`. State-specific colors can override the fill, text, and border while
+charging without changing the normal or low-battery appearance:
+
+```toml
+[widget.battery]
+format = "{icon} {percent}%"
+
+[widget.battery.charging]
+background = "#2df18520"
+foreground = "#5ff5a0"
+border = "#2df185"
+```
 
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget

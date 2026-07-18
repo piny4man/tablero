@@ -59,6 +59,8 @@ const ALERT_FOREGROUND: (u8, u8, u8, u8) = (0xFF, 0xFF, 0xFF, 0xFF);
 const DEFAULT_RADIUS: u32 = 8;
 /// Default inset between a pill edge and its text, in logical pixels.
 const DEFAULT_PADDING: u32 = 8;
+/// Default widget border width, in logical pixels (scaled at render time).
+const DEFAULT_BORDER_WIDTH: u32 = 1;
 /// Default percent below which a discharging battery shows its warn colors.
 const DEFAULT_WARN_THRESHOLD: u32 = 20;
 
@@ -259,7 +261,7 @@ pub enum IconSetting {
     Custom(String),
 }
 
-/// A resolved pair of pill colors for one widget state (normal, warn, attention).
+/// Resolved pill colors for one widget state (normal, warn, attention, charging).
 ///
 /// `background` is `None` when that state draws no pill — the text floats
 /// directly on the bar.
@@ -269,14 +271,18 @@ pub struct StateColors {
     pub background: Option<(u8, u8, u8, u8)>,
     /// Text/glyph color.
     pub foreground: (u8, u8, u8, u8),
+    /// Optional state-specific border color.
+    pub border: Option<(u8, u8, u8, u8)>,
 }
 
 /// The fully-resolved visual style for one widget.
 ///
 /// Built from a `[widget.<name>]` config table folded onto the theme (see
 /// `config::WidgetStyleConfig::resolve`): colors and geometry are concrete, and
-/// the alert states ([`warn`](WidgetStyle::warn) / [`attention`](WidgetStyle::attention))
-/// carry the colors a widget swaps to when its state crosses a threshold. A
+/// the state styles ([`warn`](WidgetStyle::warn),
+/// [`attention`](WidgetStyle::attention), and
+/// [`charging`](WidgetStyle::charging)) carry colors a widget swaps to as its
+/// state changes. A
 /// `None` [`background`](WidgetStyle::background) means the normal state draws no
 /// pill, which is what keeps the default bar visually flat.
 #[derive(Debug, Clone, PartialEq)]
@@ -287,6 +293,10 @@ pub struct WidgetStyle {
     pub foreground: (u8, u8, u8, u8),
     /// Emphasis color (e.g. the active workspace pill).
     pub accent: (u8, u8, u8, u8),
+    /// Optional border around the widget pill or cell.
+    pub border: Option<(u8, u8, u8, u8)>,
+    /// Border width in logical pixels.
+    pub border_width: u32,
     /// Pill corner radius, logical pixels.
     pub radius: u32,
     /// Inset between a pill edge and its text, logical pixels.
@@ -299,6 +309,8 @@ pub struct WidgetStyle {
     pub warn: StateColors,
     /// Colors for an attention state (e.g. a tray item needing attention).
     pub attention: StateColors,
+    /// Colors for a battery while it is charging.
+    pub charging: StateColors,
 }
 
 impl Default for WidgetStyle {
@@ -307,6 +319,8 @@ impl Default for WidgetStyle {
             background: None,
             foreground: FG,
             accent: FG,
+            border: None,
+            border_width: DEFAULT_BORDER_WIDTH,
             radius: DEFAULT_RADIUS,
             padding: DEFAULT_PADDING,
             icon: IconSetting::Default,
@@ -314,10 +328,17 @@ impl Default for WidgetStyle {
             warn: StateColors {
                 background: Some(ALERT_BACKGROUND),
                 foreground: ALERT_FOREGROUND,
+                border: None,
             },
             attention: StateColors {
                 background: Some(ALERT_BACKGROUND),
                 foreground: ALERT_FOREGROUND,
+                border: None,
+            },
+            charging: StateColors {
+                background: None,
+                foreground: FG,
+                border: None,
             },
         }
     }
@@ -341,6 +362,7 @@ impl WidgetStyle {
         StateColors {
             background: self.background,
             foreground: self.foreground,
+            border: self.border,
         }
     }
 }
@@ -385,6 +407,14 @@ pub(crate) fn draw_text_pill(
     let scale = ctx.scale_factor();
     if let Some(bg) = colors.background {
         ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
+    }
+    if let Some(border) = colors.border.or(style.border) {
+        ctx.stroke_rounded_rect(
+            bounds,
+            border,
+            (style.radius * scale) as f32,
+            (style.border_width * scale) as f32,
+        );
     }
     let pad = style.padding * scale;
     let inner = Bounds::new(
