@@ -126,7 +126,7 @@ fn common_network_states_render_expected_labels() {
         vec![
             "disconnected".to_string(),
             "wired".to_string(),
-            "wifi home-net".to_string(),
+            "home-net".to_string(),
             "unknown".to_string(),
         ]
     );
@@ -135,12 +135,12 @@ fn common_network_states_render_expected_labels() {
 }
 
 #[test]
-fn wireless_without_ssid_renders_bare_wifi() {
+fn wireless_without_ssid_renders_with_its_glyph_only() {
     // Connected to Wi-Fi but the SSID could not be read (no associated AP yet):
-    // the widget shows the bare "wifi" label, never an empty "wifi ".
+    // the text label stays empty so the widget renders only its Wi-Fi glyph.
     let (labels, redraws) = drive(vec![(70, Some("802-11-wireless"), None)]);
 
-    assert_eq!(labels, vec!["wifi".to_string()]);
+    assert_eq!(labels, vec![String::new()]);
     assert_eq!(redraws, 1);
 }
 
@@ -153,10 +153,7 @@ fn unchanged_connectivity_does_not_repaint() {
         (70, Some("802-11-wireless"), Some("  home-net  ")),
     ]);
 
-    assert_eq!(
-        labels,
-        vec!["wifi home-net".to_string(), "wifi home-net".to_string()]
-    );
+    assert_eq!(labels, vec!["home-net".to_string(), "home-net".to_string()]);
     assert_eq!(redraws, 1, "an identical snapshot must not repaint");
 }
 

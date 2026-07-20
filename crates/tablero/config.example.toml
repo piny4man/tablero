@@ -185,7 +185,8 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
-format = "{icon} {profile}"
+# Keep the bar compact; profile and driver details live in the tooltip.
+format = "{icon}"
 tooltip = true
 tooltip-format = "POWER MODE: {profile}\nDRIVER: {driver}"
 
