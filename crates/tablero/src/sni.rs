@@ -23,9 +23,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::future::{Either, select};
-use futures_util::stream::{StreamExt, select_all};
+use futures_util::stream::{BoxStream, SelectAll, StreamExt, pending, select_all};
 use log::warn;
 use zbus::fdo::{DBusProxy, RequestNameReply};
 use zbus::object_server::SignalEmitter;
@@ -287,14 +288,46 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
 /// into a normalized [`TrayState`] (which de-duplicates and sorts), so a
 /// re-enumeration that finds the same set produces an equal snapshot and no
 /// repaint.
-async fn read_state(conn: &Connection, addresses: &[String]) -> TrayState {
-    let mut items = Vec::new();
+async fn reconcile_state(
+    conn: &Connection,
+    addresses: &[String],
+    items: &mut HashMap<String, TrayItem>,
+) -> (TrayState, bool) {
+    let mut readings = Vec::with_capacity(addresses.len());
     for address in addresses {
-        if let Some(item) = read_item(conn, address).await {
-            items.push(item);
+        let item = read_item(conn, address).await;
+        if item.is_none() {
+            warn!("sni: reading registered item {address:?} failed; retaining cached state");
+        }
+        readings.push((address.clone(), item));
+    }
+    let needs_retry = reconcile_items(items, addresses, readings);
+    (TrayState::new(items.values().cloned()), needs_retry)
+}
+
+/// Merge fresh item reads into the last known-good snapshot.
+///
+/// Watcher membership is authoritative for removal. A failed property read for
+/// an address that is still registered retains its cached item and requests a
+/// retry, preventing one transient DBus error from clearing the whole tray.
+fn reconcile_items(
+    items: &mut HashMap<String, TrayItem>,
+    addresses: &[String],
+    readings: Vec<(String, Option<TrayItem>)>,
+) -> bool {
+    let registered: HashSet<&str> = addresses.iter().map(String::as_str).collect();
+    items.retain(|address, _| registered.contains(address.as_str()));
+
+    let mut needs_retry = false;
+    for (address, reading) in readings {
+        match reading {
+            Some(item) => {
+                items.insert(address, item);
+            }
+            None => needs_retry = true,
         }
     }
-    TrayState::new(items)
+    needs_retry
 }
 
 /// A minimal in-process StatusNotifierWatcher.
@@ -602,11 +635,15 @@ fn interpret_watcher_name(reply: zbus::Result<RequestNameReply>) -> zbus::Result
 ///
 /// Re-enumeration is deliberately whole-snapshot: any change rebuilds the full
 /// [`TrayState`], which is cheap relative to the change rate and keeps dynamic
-/// item sets correct without bespoke per-item bookkeeping. Returns `Ok(())` once
-/// the render loop drops its receiver or the watcher's signal streams end. A
-/// failed session-bus connection propagates as an error the bridge logs and
-/// isolates — the bar keeps running, the tray simply stays empty.
+/// item set correct without bespoke per-item bookkeeping. A low-cost periodic
+/// membership check recovers missed or closed signal streams without repeatedly
+/// decoding unchanged icon pixmaps. Returns `Ok(())` once the render loop drops
+/// its receiver. An initial session-bus connection failure propagates as an
+/// error the bridge logs and isolates.
 async fn run(tx: MsgSender) -> ProducerResult {
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
     let conn = Connection::session().await?;
     ensure_watcher(&conn).await?;
 
@@ -625,7 +662,88 @@ async fn run(tx: MsgSender) -> ProducerResult {
     // Keep lifecycle subscriptions alive across snapshot rebuilds. Recreating
     // them after every read leaves a window where a newly opened app can
     // register with the watcher without waking this host.
-    let mut lifecycle = select_all(vec![
+    let mut lifecycle = lifecycle_stream(&watcher).await?;
+    let mut lifecycle_closed = false;
+    let mut items = HashMap::new();
+    let mut addresses = loop {
+        match watcher.registered_status_notifier_items().await {
+            Ok(addresses) => break normalize_addresses(addresses),
+            Err(error) => {
+                warn!("sni: reading registered items failed: {error}; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
+    let (state, mut needs_retry) = reconcile_state(&conn, &addresses, &mut items).await;
+    if tx.send(Msg::Tray(state)).is_err() {
+        return Ok(());
+    }
+    let mut changes = item_change_streams(&conn, &addresses).await;
+
+    loop {
+        let delay = if needs_retry {
+            RETRY_DELAY
+        } else {
+            RECONCILE_INTERVAL
+        };
+        let wake = wait_for_sni_change(&mut lifecycle, &mut changes, delay).await;
+        let mut rebuild_changes = matches!(wake, SniWake::Item(None));
+
+        if matches!(wake, SniWake::Lifecycle(None)) {
+            warn!("sni: watcher lifecycle stream closed; falling back to reconciliation polling");
+            lifecycle = pending().boxed();
+            lifecycle_closed = true;
+        }
+
+        if matches!(wake, SniWake::Poll) && lifecycle_closed {
+            match lifecycle_stream(&watcher).await {
+                Ok(stream) => {
+                    lifecycle = stream;
+                    lifecycle_closed = false;
+                }
+                Err(error) => warn!("sni: restoring watcher lifecycle stream failed: {error}"),
+            }
+        }
+
+        let current_addresses = match watcher.registered_status_notifier_items().await {
+            Ok(addresses) => normalize_addresses(addresses),
+            Err(error) => {
+                warn!("sni: reading registered items failed: {error}; preserving tray state");
+                needs_retry = true;
+                continue;
+            }
+        };
+        let addresses_changed = current_addresses != addresses;
+
+        // A healthy poll only checks membership. Item properties are read again
+        // when a signal fires, membership changes, or an earlier read failed.
+        if matches!(wake, SniWake::Poll) && !addresses_changed && !needs_retry && !rebuild_changes {
+            continue;
+        }
+
+        addresses = current_addresses;
+        let (state, retry) = reconcile_state(&conn, &addresses, &mut items).await;
+        needs_retry = retry;
+        if tx.send(Msg::Tray(state)).is_err() {
+            return Ok(());
+        }
+        rebuild_changes |= addresses_changed;
+        if rebuild_changes {
+            changes = item_change_streams(&conn, &addresses).await;
+        }
+    }
+}
+
+fn normalize_addresses(mut addresses: Vec<String>) -> Vec<String> {
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+async fn lifecycle_stream<'a>(
+    watcher: &'a StatusNotifierWatcherProxy<'_>,
+) -> zbus::Result<BoxStream<'a, ()>> {
+    Ok(select_all(vec![
         watcher
             .receive_status_notifier_item_registered()
             .await?
@@ -641,52 +759,54 @@ async fn run(tx: MsgSender) -> ProducerResult {
             .await
             .map(|_| ())
             .boxed(),
-    ]);
-    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while lifecycle.next().await.is_some() {
-            if lifecycle_tx.send(()).is_err() {
-                return;
-            }
-        }
-    });
-    loop {
-        let addresses = watcher
-            .registered_status_notifier_items()
-            .await
-            .unwrap_or_default();
-        if tx
-            .send(Msg::Tray(read_state(&conn, &addresses).await))
-            .is_err()
-        {
-            return Ok(());
-        }
+    ])
+    .boxed())
+}
 
-        // Wait for any change — an item appearing/disappearing, or any item
-        // mutating an icon/title/status — then loop to re-read the whole tray.
-        // Rebuilding the stream set each iteration is what keeps a dynamic item
-        // set correct as items come and go.
-        let mut streams = Vec::new();
-        for address in &addresses {
-            if let Some(item) = item_change_stream(&conn, address).await {
-                streams.push(item);
-            }
+async fn item_change_streams(
+    conn: &Connection,
+    addresses: &[String],
+) -> SelectAll<BoxStream<'static, ()>> {
+    let mut streams = Vec::new();
+    for address in addresses {
+        if let Some(item) = item_change_stream(conn, address).await {
+            streams.push(item);
         }
+    }
+    select_all(streams)
+}
 
-        let mut changes = select_all(streams);
-        if changes.is_empty() {
-            if lifecycle_rx.recv().await.is_none() {
-                return Ok(());
-            }
-            continue;
-        }
+enum SniWake {
+    Lifecycle(Option<()>),
+    Item(Option<()>),
+    Poll,
+}
 
-        let lifecycle_change = lifecycle_rx.recv();
-        let item_change = changes.next();
-        futures_util::pin_mut!(lifecycle_change, item_change);
-        if let Either::Left((None, _)) = select(lifecycle_change, item_change).await {
-            return Ok(());
-        }
+async fn wait_for_sni_change(
+    lifecycle: &mut BoxStream<'_, ()>,
+    changes: &mut SelectAll<BoxStream<'static, ()>>,
+    delay: Duration,
+) -> SniWake {
+    if changes.is_empty() {
+        let lifecycle_change = lifecycle.next();
+        let poll = tokio::time::sleep(delay);
+        futures_util::pin_mut!(lifecycle_change, poll);
+        return match select(lifecycle_change, poll).await {
+            Either::Left((change, _)) => SniWake::Lifecycle(change),
+            Either::Right(_) => SniWake::Poll,
+        };
+    }
+
+    let lifecycle_change = lifecycle.next();
+    let item_change = changes.next();
+    futures_util::pin_mut!(lifecycle_change, item_change);
+    let change = select(lifecycle_change, item_change);
+    let poll = tokio::time::sleep(delay);
+    futures_util::pin_mut!(change, poll);
+    match select(change, poll).await {
+        Either::Left((Either::Left((change, _)), _)) => SniWake::Lifecycle(change),
+        Either::Left((Either::Right((change, _)), _)) => SniWake::Item(change),
+        Either::Right(_) => SniWake::Poll,
     }
 }
 
@@ -958,6 +1078,105 @@ mod tests {
 
         assert!(remove_registered_item(&items, address));
         assert!(items.lock().unwrap().insert(address.to_string()));
+    }
+
+    #[test]
+    fn transient_item_read_failure_preserves_the_cached_item() {
+        let first = tray_item_from_props(":1.1", "first", "First", "Active", None);
+        let second = tray_item_from_props(":1.2", "second", "Second", "Active", None);
+        let updated_second =
+            tray_item_from_props(":1.2", "second", "Second updated", "Active", None);
+        let mut items = HashMap::from([
+            (first.key().to_string(), first.clone()),
+            (second.key().to_string(), second),
+        ]);
+
+        let needs_retry = reconcile_items(
+            &mut items,
+            &[":1.1".to_string(), ":1.2".to_string()],
+            vec![
+                (":1.1".to_string(), None),
+                (":1.2".to_string(), Some(updated_second.clone())),
+            ],
+        );
+
+        assert!(needs_retry);
+        assert_eq!(items.get(":1.1"), Some(&first));
+        assert_eq!(items.get(":1.2"), Some(&updated_second));
+    }
+
+    #[test]
+    fn watcher_membership_removes_items_even_when_no_read_succeeds() {
+        let removed = tray_item_from_props(":1.1", "first", "First", "Active", None);
+        let remaining = tray_item_from_props(":1.2", "second", "Second", "Active", None);
+        let mut items = HashMap::from([
+            (removed.key().to_string(), removed),
+            (remaining.key().to_string(), remaining.clone()),
+        ]);
+
+        let needs_retry = reconcile_items(
+            &mut items,
+            &[":1.2".to_string()],
+            vec![(":1.2".to_string(), None)],
+        );
+
+        assert!(needs_retry);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items.get(":1.2"), Some(&remaining));
+    }
+
+    #[test]
+    fn unreadable_new_item_is_retried_without_clearing_the_tray() {
+        let existing = tray_item_from_props(":1.1", "first", "First", "Active", None);
+        let mut items = HashMap::from([(existing.key().to_string(), existing.clone())]);
+
+        let needs_retry = reconcile_items(
+            &mut items,
+            &[":1.1".to_string(), ":1.2".to_string()],
+            vec![
+                (":1.1".to_string(), Some(existing.clone())),
+                (":1.2".to_string(), None),
+            ],
+        );
+
+        assert!(needs_retry);
+        assert_eq!(
+            items,
+            HashMap::from([(existing.key().to_string(), existing)])
+        );
+    }
+
+    #[test]
+    fn closed_lifecycle_stream_is_reported_for_recovery() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut lifecycle = futures_util::stream::empty().boxed();
+                let mut changes = select_all(Vec::<BoxStream<'static, ()>>::new());
+
+                let wake =
+                    wait_for_sni_change(&mut lifecycle, &mut changes, Duration::from_secs(1)).await;
+
+                assert!(matches!(wake, SniWake::Lifecycle(None)));
+            });
+    }
+
+    #[test]
+    fn reconciliation_poll_wakes_without_item_streams() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut lifecycle = pending().boxed();
+                let mut changes = select_all(Vec::<BoxStream<'static, ()>>::new());
+
+                let wake = wait_for_sni_change(&mut lifecycle, &mut changes, Duration::ZERO).await;
+
+                assert!(matches!(wake, SniWake::Poll));
+            });
     }
 
     #[test]
