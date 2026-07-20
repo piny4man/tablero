@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -52,3 +54,15 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+      - name: Verify crates.io package
+        run: |
+          cargo package --locked
+          package_manifest=(target/package/tablero-*/Cargo.toml)
+          CARGO_TARGET_DIR="$RUNNER_TEMP/tablero-package-target" \
+            cargo test --locked --all-targets --manifest-path "${package_manifest[0]}"
