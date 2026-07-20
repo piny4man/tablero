@@ -2,8 +2,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use tablero_core::config::Config;
-use tablero_wayland::run;
+use tablero::config::Config;
+use tablero::run;
 
 fn main() -> ExitCode {
     env_logger::init();

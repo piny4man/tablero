@@ -1335,31 +1335,13 @@ dependencies = [
 name = "tablero"
 version = "0.1.0"
 dependencies = [
- "env_logger",
- "tablero-core",
- "tablero-wayland",
-]
-
-[[package]]
-name = "tablero-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cosmic-text",
- "image",
- "serde",
- "tempfile",
- "tiny-skia",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "tablero-wayland"
-version = "0.1.0"
-dependencies = [
  "calloop",
  "calloop-wayland-source",
+ "chrono",
+ "cosmic-text",
+ "env_logger",
  "futures-util",
+ "image",
  "log",
  "mio",
  "nix",
@@ -1367,9 +1349,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smithay-client-toolkit",
- "tablero-core",
  "tempfile",
+ "tiny-skia",
  "tokio",
+ "toml 0.8.23",
  "udev",
  "wayland-client",
  "zbus",

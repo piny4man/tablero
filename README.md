@@ -3,13 +3,39 @@
 A fast, owned Hyprland status bar — a Waybar replacement built on
 `wlr-layer-shell` with software (CPU) rendering through shared memory.
 
-## Workspace layout
+## Install
 
-| Crate              | Responsibility                                                                  |
-| ------------------ | ------------------------------------------------------------------------------- |
-| `tablero`          | Binary entry point; loads the config and wires it into the Wayland event loop.  |
-| `tablero-core`     | Compositor-independent logic: config, widgets/messages, text render, blit.      |
-| `tablero-wayland`  | `wlr-layer-shell` surface, async producers, shared-memory buffers, `calloop`.   |
+tablero requires a Wayland compositor with `wlr-layer-shell` support. It is
+developed for Hyprland and builds against PipeWire, libudev, and xkbcommon.
+
+On Debian or Ubuntu, install the native build dependencies first:
+
+```sh
+sudo apt-get install libpipewire-0.3-dev libudev-dev libxkbcommon-dev pkg-config
+```
+
+On Arch Linux:
+
+```sh
+sudo pacman -S --needed pipewire libxkbcommon pkgconf rust
+```
+
+Then install the latest release from crates.io with the current stable Rust
+toolchain:
+
+```sh
+cargo install tablero --locked
+```
+
+Run `tablero` from inside a Hyprland session. Set `RUST_LOG=info` to see startup
+and lifecycle logging.
+
+## Project layout
+
+tablero is one publishable package with a library and binary target. The library
+keeps the implementation split into compositor-independent config, rendering,
+and widget modules plus the Wayland surface and producer integrations. The
+binary loads the user's config and starts the Wayland event loop.
 
 ## Build & run
 
@@ -138,13 +164,15 @@ key, an unknown widget name, or a malformed color stops startup with a clear
 message naming the file.
 
 An opinionated, ready-to-copy ARC Raiders-inspired desktop preset lives at
-[`config.example.toml`](config.example.toml). It demonstrates the full styling
-surface and is intentionally different from the built-in defaults documented
-below:
+[`config.example.toml`](https://github.com/piny4man/tablero/blob/main/crates/tablero/config.example.toml).
+It demonstrates the full styling surface and is intentionally different from
+the built-in defaults documented below:
 
 ```sh
 mkdir -p ~/.config/tablero
-cp config.example.toml ~/.config/tablero/config.toml
+curl --fail --location \
+  https://raw.githubusercontent.com/piny4man/tablero/main/crates/tablero/config.example.toml \
+  --output ~/.config/tablero/config.toml
 ```
 
 ### Reference
@@ -523,3 +551,7 @@ surface placement and input need a live compositor. To verify on Hyprland:
        tablero itself never triggers that activation: its presence probe is
        sent with the `NO_AUTO_START` flag, so it observes the daemon rather
        than restarting one the user stopped.
+
+## License
+
+tablero is licensed under the [GNU General Public License v3.0](LICENSE).

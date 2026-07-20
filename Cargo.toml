@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "crates/tablero",
-    "crates/tablero-core",
-    "crates/tablero-wayland",
 ]
 resolver = "2"
 
