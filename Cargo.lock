@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "tablero"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
