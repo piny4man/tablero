@@ -292,15 +292,15 @@ mod tests {
         let network = network_from_nm(70, Some("802-11-wireless"), Some("home-net"));
         assert_eq!(network.state(), NetworkState::Wireless);
         assert_eq!(network.ssid(), Some("home-net"));
-        assert_eq!(network.label(), "wifi home-net");
+        assert_eq!(network.label(), "home-net");
     }
 
     #[test]
-    fn connected_wireless_without_ssid_shows_bare_wifi() {
+    fn connected_wireless_without_ssid_has_no_text_label() {
         let network = network_from_nm(70, Some("802-11-wireless"), None);
         assert_eq!(network.state(), NetworkState::Wireless);
         assert_eq!(network.ssid(), None);
-        assert_eq!(network.label(), "wifi");
+        assert_eq!(network.label(), "");
     }
 
     #[test]

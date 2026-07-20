@@ -1102,10 +1102,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 /// fanned out to every output's dashboard via the app's message handler exactly like
 /// the clock timer. With an empty `producers` list no runtime is started at all.
 ///
-/// No surface is created up front: the bar opens one layer surface per output as
-/// the compositor advertises them through [`OutputHandler::new_output`], and
-/// tears each down on `output_destroyed`, so plugging or unplugging a monitor
-/// adds or removes its bar without restarting the loop.
+/// During setup, one Wayland roundtrip discovers the initial outputs and opens
+/// their layer surfaces before producers start. Later outputs still arrive
+/// through [`OutputHandler::new_output`], and `output_destroyed` tears each down,
+/// so plugging or unplugging a monitor adds or removes its bar without restarting
+/// the loop.
 pub fn run_with_producers(
     config: Config,
     producers: Vec<Box<dyn Producer>>,
@@ -1113,7 +1114,7 @@ pub fn run_with_producers(
     let height = config.height;
 
     let conn = Connection::connect_to_env()?;
-    let (globals, event_queue) = registry_queue_init::<App>(&conn)?;
+    let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh)?;
@@ -1145,6 +1146,11 @@ pub fn run_with_producers(
         tray_menu: None,
         exit: false,
     };
+
+    // Finish initial output discovery before producers can emit snapshots. If a
+    // producer starts first, its one-shot initial state is dispatched while
+    // `outputs` is empty and is lost until that source changes again.
+    event_queue.roundtrip(&mut app)?;
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let handle = event_loop.handle();

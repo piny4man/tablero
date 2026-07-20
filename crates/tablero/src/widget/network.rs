@@ -1,7 +1,7 @@
 //! The network widget and its normalized connectivity model.
 //!
 //! [`Network`] is the typed, normalized snapshot a producer feeds in through
-//! [`Msg::Network`]; [`NetworkWidget`] renders it,
+//! [`Msg::Network`]; [`NetworkWidget`] renders it compactly,
 //! repainting only when the visible connection state or SSID actually changes.
 //!
 //! Unavailable connectivity (or an unreachable network daemon) is carried as
@@ -11,7 +11,7 @@
 
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+use super::{Msg, Tooltip, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
 
 /// Default network glyphs (Font Awesome, via Nerd Font), chosen by connection
 /// state: a wifi arc, a wired sitemap, a cross when disconnected, and a question
@@ -24,7 +24,7 @@ const UNKNOWN_GLYPH: &str = "\u{f128}"; // nf-fa-question
 /// The kind of network connection in use, normalized from a raw daemon reading.
 ///
 /// The many low-level NetworkManager states collapse into these four so the bar
-/// shows a single unambiguous word: the user only needs to know whether they are
+/// can choose one unambiguous glyph: the user only needs to know whether they are
 /// off the network, on a wired link, on Wi-Fi, or in an indeterminate state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkState {
@@ -97,14 +97,17 @@ impl Network {
         self.ssid.as_deref()
     }
 
-    /// The display label, e.g. `"wifi home-net"`, `"wired"`, or `"disconnected"`.
+    /// The compact display label, e.g. `"home-net"`, `"wired"`, or
+    /// `"disconnected"`.
     ///
-    /// A wireless link with a known SSID shows `"wifi <ssid>"`; without one it
-    /// shows the bare state label. Keeping this a pure function makes the
-    /// rendered text deterministic and unit-testable without painting pixels.
+    /// The Wi-Fi glyph already communicates the connection type, so a wireless
+    /// link shows only its SSID. Without one, the glyph stands alone. Keeping
+    /// this a pure function makes the rendered text deterministic and
+    /// unit-testable without painting pixels.
     pub fn label(&self) -> String {
         match (self.state, self.ssid.as_deref()) {
-            (NetworkState::Wireless, Some(ssid)) => format!("wifi {ssid}"),
+            (NetworkState::Wireless, Some(ssid)) => ssid.to_string(),
+            (NetworkState::Wireless, None) => String::new(),
             _ => self.state.label().to_string(),
         }
     }
@@ -173,6 +176,26 @@ impl NetworkWidget {
             None => String::new(),
         }
     }
+
+    /// Connection details kept off the bar's compact label.
+    pub fn tooltip_text(&self) -> Option<String> {
+        self.state.as_ref().map(|network| match network.state() {
+            NetworkState::Wireless => match network.ssid() {
+                Some(ssid) => format!("Connection: Wi-Fi\nSSID: {ssid}"),
+                None => "Connection: Wi-Fi".to_string(),
+            },
+            NetworkState::Wired => "Connection: Wired".to_string(),
+            NetworkState::Disconnected => "Status: Disconnected".to_string(),
+            NetworkState::Unknown => "Status: Unknown".to_string(),
+        })
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        px >= self.bounds.x
+            && px < self.bounds.x + self.bounds.width
+            && py >= self.bounds.y
+            && py < self.bounds.y + self.bounds.height
+    }
 }
 
 impl Widget for NetworkWidget {
@@ -211,6 +234,16 @@ impl Widget for NetworkWidget {
 
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
+    }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_text()?,
+            bounds: self.bounds,
+        })
     }
 }
 
@@ -269,13 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn label_shows_ssid_on_wifi_and_the_bare_state_otherwise() {
+    fn label_shows_only_the_ssid_on_wifi_and_the_state_otherwise() {
         assert_eq!(
             Network::new(NetworkState::Wireless, Some("home-net")).label(),
-            "wifi home-net"
+            "home-net"
         );
-        // Wireless with no usable SSID falls back to the bare "wifi" label.
-        assert_eq!(Network::new(NetworkState::Wireless, None).label(), "wifi");
+        // With no usable SSID, the state glyph stands alone.
+        assert_eq!(Network::new(NetworkState::Wireless, None).label(), "");
         assert_eq!(Network::new(NetworkState::Wired, None).label(), "wired");
         assert_eq!(
             Network::new(NetworkState::Disconnected, None).label(),
@@ -289,7 +322,7 @@ mod tests {
         let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
         assert_eq!(widget.label(), "");
         assert!(widget.update(&network(NetworkState::Wireless, Some("home-net"))));
-        assert_eq!(widget.label(), "wifi home-net");
+        assert_eq!(widget.label(), "home-net");
     }
 
     #[test]
@@ -299,7 +332,7 @@ mod tests {
         // The same normalized snapshot again (untrimmed name normalizes equal):
         // nothing to repaint.
         assert!(!widget.update(&network(NetworkState::Wireless, Some("  home-net  "))));
-        assert_eq!(widget.label(), "wifi home-net");
+        assert_eq!(widget.label(), "home-net");
     }
 
     #[test]
@@ -307,7 +340,7 @@ mod tests {
         let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(widget.update(&network(NetworkState::Wireless, Some("home-net"))));
         assert!(widget.update(&network(NetworkState::Wireless, Some("cafe-net"))));
-        assert_eq!(widget.label(), "wifi cafe-net");
+        assert_eq!(widget.label(), "cafe-net");
     }
 
     #[test]
@@ -358,10 +391,9 @@ mod tests {
         assert_eq!(widget.display_text(), "");
         // Each connection state picks its own glyph ahead of the label.
         widget.update(&network(NetworkState::Wireless, Some("home-net")));
-        assert_eq!(
-            widget.display_text(),
-            format!("{WIRELESS_GLYPH} wifi home-net")
-        );
+        assert_eq!(widget.display_text(), format!("{WIRELESS_GLYPH} home-net"));
+        widget.update(&network(NetworkState::Wireless, None));
+        assert_eq!(widget.display_text(), WIRELESS_GLYPH);
         widget.update(&network(NetworkState::Wired, None));
         assert_eq!(widget.display_text(), format!("{WIRED_GLYPH} wired"));
         widget.update(&network(NetworkState::Disconnected, None));
@@ -378,5 +410,18 @@ mod tests {
         assert_eq!(widget.measure(&mut ctx, 32), 0);
         widget.update(&network(NetworkState::Wired, None));
         assert!(widget.measure(&mut ctx, 32) > 0);
+    }
+
+    #[test]
+    fn tooltip_keeps_connection_details_off_the_compact_label() {
+        let mut widget = NetworkWidget::new(Bounds::new(10, 0, 100, 32));
+        widget.update(&network(NetworkState::Wireless, Some("home-net")));
+
+        assert_eq!(widget.label(), "home-net");
+        assert_eq!(
+            widget.tooltip_at(20, 16).map(|tooltip| tooltip.text),
+            Some("Connection: Wi-Fi\nSSID: home-net".to_string())
+        );
+        assert_eq!(widget.tooltip_at(200, 16), None);
     }
 }
