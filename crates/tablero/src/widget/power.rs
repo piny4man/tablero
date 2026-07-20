@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, Widget, WidgetStyle, draw_icon_pill, glyph_label, measure_text_pill,
 };
 
 const POWER_GLYPH: &str = "\u{f011}";
@@ -65,7 +65,7 @@ impl Widget for PowerWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
+        draw_icon_pill(
             ctx,
             &self.style,
             self.bounds,

@@ -438,6 +438,33 @@ pub(crate) fn draw_text_pill(
     ctx.draw_text(text, inner, colors.foreground);
 }
 
+/// Paint a pill whose content is a standalone icon, centering the glyph's
+/// visible ink rather than its font line box.
+pub(crate) fn draw_icon_pill(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    icon: &str,
+    colors: StateColors,
+) {
+    if icon.is_empty() || bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    let scale = ctx.scale_factor();
+    if let Some(bg) = colors.background {
+        ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
+    }
+    if let Some(border) = colors.border.or(style.border) {
+        ctx.stroke_rounded_rect(
+            bounds,
+            border,
+            (style.radius * scale) as f32,
+            (style.border_width * scale) as f32,
+        );
+    }
+    ctx.draw_text_centered(icon, bounds, colors.foreground);
+}
+
 /// Draw `text` horizontally centered within `bounds` (vertical centering is
 /// [`RenderContext::draw_text`]'s own), clamped so it never spills past the
 /// slot's right edge. The per-item widgets (workspaces, tray) use this to set a

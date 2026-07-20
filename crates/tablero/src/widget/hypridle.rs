@@ -3,7 +3,7 @@
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, StateColors, Tooltip, Widget, WidgetStyle, draw_text_pill,
+    ClickButton, Command, Msg, StateColors, Tooltip, Widget, WidgetStyle, draw_icon_pill,
     glyph_label, measure_text_pill,
 };
 
@@ -89,7 +89,7 @@ impl Widget for HypridleWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
+        draw_icon_pill(
             ctx,
             &self.style,
             self.bounds,
