@@ -315,6 +315,80 @@ impl RenderContext {
         });
     }
 
+    /// Shape and draw `text` with its visible ink centered within `bounds`.
+    ///
+    /// Intended for standalone icon glyphs whose font bearings can make the
+    /// normal line-box alignment look off-center. Labels should keep using
+    /// [`draw_text`](Self::draw_text) so their shared baseline remains stable.
+    pub fn draw_text_centered(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8, u8)) {
+        if text.is_empty() || bounds.width == 0 || bounds.height == 0 {
+            return;
+        }
+
+        let RenderContext {
+            font_system,
+            swash_cache,
+            pixmap,
+            settings,
+        } = self;
+
+        let metrics = Metrics::new(settings.font_size, bounds.height as f32);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(Some(bounds.width as f32), Some(bounds.height as f32));
+        buffer.set_wrap(Wrap::None);
+
+        let mut attrs = Attrs::new();
+        if let Some(family) = &settings.font_family {
+            attrs = attrs.family(Family::Name(family));
+        }
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        let text_color = Color::rgba(color.0, color.1, color.2, color.3);
+        let mut ink_bounds: Option<(i32, i32, i32, i32)> = None;
+        buffer.draw(font_system, swash_cache, text_color, |x, y, w, h, _| {
+            let right = x.saturating_add(i32::try_from(w).unwrap_or(i32::MAX));
+            let bottom = y.saturating_add(i32::try_from(h).unwrap_or(i32::MAX));
+            ink_bounds = Some(match ink_bounds {
+                Some((left, top, old_right, old_bottom)) => (
+                    left.min(x),
+                    top.min(y),
+                    old_right.max(right),
+                    old_bottom.max(bottom),
+                ),
+                None => (x, y, right, bottom),
+            });
+        });
+
+        let Some((left, top, right, bottom)) = ink_bounds else {
+            return;
+        };
+        let ink_width = i64::from(right - left);
+        let ink_height = i64::from(bottom - top);
+        let offset_x =
+            i64::from(bounds.x) + (i64::from(bounds.width) - ink_width) / 2 - i64::from(left);
+        let offset_y =
+            i64::from(bounds.y) + (i64::from(bounds.height) - ink_height) / 2 - i64::from(top);
+        let offset_x = offset_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let offset_y = offset_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+
+        let mut dst = pixmap.as_mut();
+        buffer.draw(font_system, swash_cache, text_color, |x, y, w, h, color| {
+            let Some(rect) = Rect::from_xywh(
+                (offset_x + x) as f32,
+                (offset_y + y) as f32,
+                w as f32,
+                h as f32,
+            ) else {
+                return;
+            };
+            let mut paint = Paint::default();
+            let rgba = color.as_rgba();
+            paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+            dst.fill_rect(rect, &paint, Transform::default(), None);
+        });
+    }
+
     /// The width in pixels `text` would occupy when shaped with the active font,
     /// unconstrained (single line, no wrapping), rounded up.
     ///
@@ -546,6 +620,41 @@ mod tests {
         let px = render_text("12:00:00", 320, 32);
         let has_light = px.chunks_exact(4).any(|p| p[0] > 0x60);
         assert!(has_light, "no foreground pixels found");
+    }
+
+    #[test]
+    fn centered_text_centers_visible_ink_on_both_axes() {
+        let settings = RenderSettings {
+            background: (0, 0, 0, 0),
+            ..RenderSettings::default()
+        };
+        let mut ctx = RenderContext::with_settings(60, 40, settings);
+        let bounds = Bounds::new(7, 3, 40, 30);
+        ctx.draw_text_centered("j", bounds, FG);
+
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        for (index, pixel) in ctx.pixels().chunks_exact(4).enumerate() {
+            if pixel[3] == 0 {
+                continue;
+            }
+            let x = index as u32 % ctx.width();
+            let y = index as u32 / ctx.width();
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        assert_ne!(min_x, u32::MAX, "centered glyph painted no pixels");
+        let ink_center_x_twice = min_x + max_x + 1;
+        let ink_center_y_twice = min_y + max_y + 1;
+        let bounds_center_x_twice = 2 * bounds.x + bounds.width;
+        let bounds_center_y_twice = 2 * bounds.y + bounds.height;
+        assert!(ink_center_x_twice.abs_diff(bounds_center_x_twice) <= 1);
+        assert!(ink_center_y_twice.abs_diff(bounds_center_y_twice) <= 1);
     }
 
     #[test]

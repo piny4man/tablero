@@ -130,6 +130,14 @@ RUST_LOG=info cargo run -p tablero
     it hides when the daemon is unavailable. Left-click rotates forward through
     the advertised profiles, right-click rotates backward, and hovering shows
     the configured profile and driver tooltip.
+  - **Hypridle** — exact same-user process state read natively from procfs, with
+    no polling script or `pgrep`/`killall` helper. **Opt-in**: add `"hypridle"`
+    to a zone. The lock glyph uses the widget accent while Hypridle is active and
+    its foreground while inactive; left-click starts or stops the daemon and the
+    tooltip reports the current state.
+  - **Power** — a compact power glyph with configurable direct-launch actions.
+    **Opt-in**: add `"power"` to a zone. `on-click = "wlogout"` opens the logout
+    menu and `on-click-right = "hyprlock"` preserves a secondary lock action.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels
@@ -191,8 +199,9 @@ gap = 0
 
 # Modules are placed independently in left, center, and right zones. Valid names:
 # "workspaces", "title", "clock", "battery", "system", "network", "tray",
-# "bluetooth", "volume", "backlight", "notifications", "updates", and
-# "power-profiles-daemon". Repeats are de-duplicated, keeping first position.
+# "bluetooth", "volume", "backlight", "notifications", "updates", "hypridle",
+# "power", and "power-profiles-daemon". Repeats are de-duplicated, keeping first
+# position.
 modules-left = ["workspaces"]
 modules-center = ["title"]
 modules-right = ["clock", "battery", "system", "network", "power-profiles-daemon"]
@@ -218,7 +227,7 @@ size = 16.0
 | `bar.gap`      | integer (px)    | `0`                                           | Gap between adjacent modules in a zone.                          |
 | `bar.modules-left` | list of strings | `["workspaces"]`                          | Modules packed against the left edge.                            |
 | `bar.modules-center` | list of strings | `["title"]`                             | Modules centered independently of the edge zones.                |
-| `bar.modules-right` | list of strings | `["clock", "battery", "system", "network", "power-profiles-daemon"]` | Modules packed against the right edge. Also accepts the opt-in modules `"tray"`, `"bluetooth"`, `"volume"`, `"backlight"`, `"notifications"`, and `"updates"`. |
+| `bar.modules-right` | list of strings | `["clock", "battery", "system", "network", "power-profiles-daemon"]` | Modules packed against the right edge. Also accepts the opt-in modules `"tray"`, `"bluetooth"`, `"volume"`, `"backlight"`, `"notifications"`, `"updates"`, `"hypridle"`, and `"power"`. |
 | `theme.background` | hex color   | `"#181818"`                                   | Fill behind every widget.                                        |
 | `theme.foreground` | hex color   | `"#eaeaea"`                                   | Default text color.                                              |
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
@@ -262,8 +271,23 @@ Per-widget click handlers live on every `[widget.<name>]` table as
 spawns the file directly (no shell) — typical use is
 `[widget.bluetooth] on-click = "/path/to/blueman-manager"` or
 `[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
-a leading `~` for the user's home, expanded at click time. Today the bluetooth,
-volume, and updates widgets honor the field; other widgets ignore it.
+a leading `~` for the user's home, expanded at click time. Bare executable names
+are resolved through `PATH`; arguments and shell syntax are not supported. Today
+the bluetooth, volume, updates, and power widgets honor `on-click`. The power
+widget also accepts `on-click-right` with the same direct-spawn semantics:
+
+```toml
+[bar]
+modules-right = ["hypridle", "power", "clock"]
+
+[widget.hypridle]
+foreground = "#ff4a4d" # inactive
+accent = "#7decff"     # active
+
+[widget.power]
+on-click = "wlogout"
+on-click-right = "hyprlock"
+```
 
 The Arch package-updates module requires `checkupdates` from the official
 `pacman-contrib` package. `paru` is optional; when available, its AUR count is
@@ -542,15 +566,25 @@ surface placement and input need a live compositor. To verify on Hyprland:
        swaps to the slashed glyph and dims; right-clicking again restores
        it. The DND state stays in sync when toggled from inside the swaync
        panel instead.
-     - Restart resilience: stopping swaync removes the widget from the bar;
-       starting it again brings it back with the current state, without
-       restarting tablero. Note that swaync is usually DBus-activatable, so
+      - Restart resilience: stopping swaync removes the widget from the bar;
+        starting it again brings it back with the current state, without
+        restarting tablero. Note that swaync is usually DBus-activatable, so
        on most setups `pkill swaync` resurrects it near-instantly (any bus
        call to its name starts it again) — `systemctl --user mask swaync`
        first (and `unmask` after) to observe the widget-hidden state.
        tablero itself never triggers that activation: its presence probe is
-       sent with the `NO_AUTO_START` flag, so it observes the daemon rather
-       than restarting one the user stopped.
+        sent with the `NO_AUTO_START` flag, so it observes the daemon rather
+        than restarting one the user stopped.
+17. Verify the **Hypridle and power widgets** (opt-in: add `"hypridle"` and
+    `"power"` to a zone).
+    - Start with Hypridle running. The lock glyph should use the configured
+      accent and its tooltip should read `Hypridle active`.
+    - Left-click the lock. The process should receive `SIGTERM`, the glyph should
+      switch to the configured inactive foreground, and the tooltip should read
+      `Hypridle inactive`. Left-click again to start `hypridle` directly.
+    - Left-click the power glyph and confirm the configured `on-click` executable
+      starts. Right-click it and confirm `on-click-right` starts independently.
+      A missing executable should log a warning without terminating tablero.
 
 ## License
 

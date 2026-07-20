@@ -18,7 +18,7 @@
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, Widget, WidgetStyle, draw_icon_pill, glyph_label, measure_text_pill,
 };
 
 /// Glyph drawn while notifications are deliverable (Font Awesome, via Nerd Font).
@@ -166,17 +166,13 @@ impl Widget for NotificationsWidget {
             foreground: self.foreground(),
             border: self.style.border,
         };
-        draw_text_pill(ctx, &self.style, self.bounds, &self.display_text(), colors);
+        draw_icon_pill(ctx, &self.style, self.bounds, &self.display_text(), colors);
 
-        // The dot is painted over the pill, after the text, so it stays
-        // visible whatever the glyph underneath is doing.
+        // The dot is painted over the pill with the opaque attention foreground.
+        // Attention backgrounds are commonly translucent state fills and make
+        // poor badge colors at this small size.
         if let Some(dot) = self.dot_bounds(ctx.scale_factor()) {
-            let color = self
-                .style
-                .attention
-                .background
-                .unwrap_or(self.style.attention.foreground);
-            ctx.fill_rounded_rect(dot, color, dot.width as f32 / 2.0);
+            ctx.fill_rounded_rect(dot, self.style.attention.foreground, dot.width as f32 / 2.0);
         }
     }
 
@@ -311,7 +307,10 @@ mod tests {
 
     #[test]
     fn drawing_paints_the_attention_dot_over_the_pill() {
-        let mut widget = NotificationsWidget::new(Bounds::new(0, 0, 40, 32));
+        let mut style = WidgetStyle::default();
+        style.attention.background = Some((200, 0, 0, 16));
+        style.attention.foreground = (255, 74, 77, 255);
+        let mut widget = NotificationsWidget::new(Bounds::new(0, 0, 40, 32)).with_style(style);
         widget.update(&some(1, false));
         let mut ctx = RenderContext::new(64, 32);
         widget.draw(&mut ctx);
@@ -319,12 +318,7 @@ mod tests {
         // spans x in [32, 38), y in [2, 8) — its center sits at (35, 5).
         let px = ctx.pixels();
         let center = ((5 * 64 + 35) * 4) as usize;
-        let (r, g, b) = (px[center], px[center + 1], px[center + 2]);
-        // The default attention background is the muted alert red.
-        assert!(
-            r > g && r > b,
-            "dot center should be red, got ({r},{g},{b})"
-        );
+        assert_eq!(&px[center..center + 4], &[255, 74, 77, 255]);
     }
 
     #[test]

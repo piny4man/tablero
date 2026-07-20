@@ -25,8 +25,10 @@ pub mod backlight;
 pub mod battery;
 pub mod bluetooth;
 pub mod clock;
+pub mod hypridle;
 pub mod network;
 pub mod notifications;
+pub mod power;
 pub mod power_profiles;
 pub mod system;
 pub mod title;
@@ -39,8 +41,10 @@ pub use backlight::{Backlight, BacklightWidget};
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
+pub use hypridle::{Hypridle, HypridleWidget};
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use notifications::{Notifications, NotificationsWidget};
+pub use power::PowerWidget;
 pub use power_profiles::{PowerProfile, PowerProfilesState, PowerProfilesWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
@@ -140,6 +144,8 @@ pub enum Msg {
     PowerProfiles(Option<PowerProfilesState>),
     /// Available Arch repository and AUR updates; `None` hides the widget.
     Updates(Option<PackageUpdates>),
+    /// Whether the session's Hypridle daemon is currently running.
+    Hypridle(Hypridle),
 }
 
 impl Msg {
@@ -214,6 +220,8 @@ pub enum Command {
     },
     /// Select one of power-profiles-daemon's advertised profiles.
     SetPowerProfile(String),
+    /// Set whether the session's Hypridle daemon should be running.
+    SetHypridle(bool),
 }
 
 /// A normalized logical scroll direction.
@@ -428,6 +436,33 @@ pub(crate) fn draw_text_pill(
         bounds.height,
     );
     ctx.draw_text(text, inner, colors.foreground);
+}
+
+/// Paint a pill whose content is a standalone icon, centering the glyph's
+/// visible ink rather than its font line box.
+pub(crate) fn draw_icon_pill(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    icon: &str,
+    colors: StateColors,
+) {
+    if icon.is_empty() || bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    let scale = ctx.scale_factor();
+    if let Some(bg) = colors.background {
+        ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
+    }
+    if let Some(border) = colors.border.or(style.border) {
+        ctx.stroke_rounded_rect(
+            bounds,
+            border,
+            (style.radius * scale) as f32,
+            (style.border_width * scale) as f32,
+        );
+    }
+    ctx.draw_text_centered(icon, bounds, colors.foreground);
 }
 
 /// Draw `text` horizontally centered within `bounds` (vertical centering is

@@ -24,6 +24,7 @@ pub mod widget;
 pub mod backlight;
 pub mod bluetooth;
 pub mod command;
+pub mod hypridle;
 pub mod hyprland;
 pub mod networkmanager;
 pub mod notifications;
@@ -86,6 +87,7 @@ use smithay_client_toolkit::{
 use crate::backlight::BacklightProducer;
 use crate::bluetooth::BluetoothProducer;
 use crate::command::{CommandSender, command_channel};
+use crate::hypridle::HypridleProducer;
 use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
 use crate::notifications::NotificationsProducer;
@@ -1052,7 +1054,7 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// system-stats source, the NetworkManager connectivity source, the BlueZ
 /// bluetooth source, the native PipeWire volume source, the
 /// StatusNotifierItem tray host, swaync notification source, and optional Arch
-/// package-update poller — so the
+/// package-update and Hypridle process pollers — so the
 /// bar shows live workspaces, battery, CPU/memory load, network state,
 /// Bluetooth adapter state, the active output sink's volume, tray icons, and
 /// the notification indicator alongside the clock. The bluetooth, volume,
@@ -1060,7 +1062,8 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// any zone; the widget only appears when the user adds `"bluetooth"`,
 /// `"volume"`, `"tray"`, or `"notifications"` to a zone. The update poller is
 /// the exception: it starts only when `"updates"` is configured, avoiding
-/// needless subprocess and network work. The volume source runs on a dedicated
+/// needless subprocess and network work. Hypridle process polling is likewise
+/// enabled only when `"hypridle"` is configured. The volume source runs on a dedicated
 /// OS thread —
 /// PipeWire's main loop is synchronous, unlike the other producers' zbus
 /// backends. The clock itself is still driven by the synchronous tick timer;
@@ -1083,6 +1086,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // the opt-in module.
     if config.uses_widget(WidgetKind::Updates) {
         producers.push(Box::new(UpdatesProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Hypridle) {
+        producers.push(Box::new(HypridleProducer::new()));
     }
     run_with_producers(config, producers)
 }
@@ -1204,7 +1210,21 @@ pub fn run_with_producers(
             "power-profiles-commands",
             power_profiles::run_commands(power_rx),
         );
-        app.commands = vec![hypr_tx, sni_tx, run_tx, notif_tx, backlight_tx, power_tx];
+        let (hypridle_tx, hypridle_rx) = command_channel();
+        let hypridle_updates = bridge.sender();
+        bridge.spawn_task(
+            "hypridle-commands",
+            hypridle::run_commands(hypridle_rx, hypridle_updates),
+        );
+        app.commands = vec![
+            hypr_tx,
+            sni_tx,
+            run_tx,
+            notif_tx,
+            backlight_tx,
+            power_tx,
+            hypridle_tx,
+        ];
         info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
