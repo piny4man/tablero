@@ -3,6 +3,7 @@
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use log::warn;
@@ -157,7 +158,11 @@ async fn set_state(root: &Path, executable: &Path, desired: bool) -> io::Result<
     match required_action(!pids.is_empty(), desired) {
         HypridleAction::None => Ok(desired),
         HypridleAction::Start => {
-            TokioCommand::new(executable).spawn()?;
+            TokioCommand::new(executable)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
             Ok(true)
         }
         HypridleAction::Stop => {
