@@ -25,8 +25,10 @@ pub mod backlight;
 pub mod battery;
 pub mod bluetooth;
 pub mod clock;
+pub mod hypridle;
 pub mod network;
 pub mod notifications;
+pub mod power;
 pub mod power_profiles;
 pub mod system;
 pub mod title;
@@ -39,8 +41,10 @@ pub use backlight::{Backlight, BacklightWidget};
 pub use battery::{Battery, BatteryState, BatteryWidget};
 pub use bluetooth::{Bluetooth, BluetoothState, BluetoothWidget};
 pub use clock::ClockWidget;
+pub use hypridle::{Hypridle, HypridleWidget};
 pub use network::{Network, NetworkState, NetworkWidget};
 pub use notifications::{Notifications, NotificationsWidget};
+pub use power::PowerWidget;
 pub use power_profiles::{PowerProfile, PowerProfilesState, PowerProfilesWidget};
 pub use system::{SystemStats, SystemWidget};
 pub use title::{ActiveWindow, TitleWidget};
@@ -140,6 +144,8 @@ pub enum Msg {
     PowerProfiles(Option<PowerProfilesState>),
     /// Available Arch repository and AUR updates; `None` hides the widget.
     Updates(Option<PackageUpdates>),
+    /// Whether the session's Hypridle daemon is currently running.
+    Hypridle(Hypridle),
 }
 
 impl Msg {
@@ -214,6 +220,8 @@ pub enum Command {
     },
     /// Select one of power-profiles-daemon's advertised profiles.
     SetPowerProfile(String),
+    /// Set whether the session's Hypridle daemon should be running.
+    SetHypridle(bool),
 }
 
 /// A normalized logical scroll direction.

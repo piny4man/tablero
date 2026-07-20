@@ -70,10 +70,10 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, IconSetting,
-    NetworkWidget, NotificationsWidget, PowerProfilesWidget, StateColors, SystemWidget,
-    TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
-    backlight::validate_backlight_format, battery::validate_battery_format,
+    BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HypridleWidget,
+    IconSetting, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget, StateColors,
+    SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget, WidgetStyle,
+    WorkspaceWidget, backlight::validate_backlight_format, battery::validate_battery_format,
     power_profiles::validate_power_profiles_format, updates::validate_updates_format,
 };
 
@@ -241,6 +241,10 @@ pub enum WidgetKind {
     PowerProfilesDaemon,
     /// Available Arch repository and AUR package updates (opt-in).
     Updates,
+    /// Whether the Hypridle daemon is active, with a primary-click toggle (opt-in).
+    Hypridle,
+    /// Configurable session power launcher (opt-in).
+    Power,
 }
 
 /// The bar layout: which widgets populate each of the three zones, plus the
@@ -371,6 +375,12 @@ pub struct WidgetStyleConfig {
     /// compatibility; today bluetooth, volume, and updates honor it.
     #[serde(rename = "on-click")]
     pub on_click: Option<std::path::PathBuf>,
+    /// Executable path run when the widget is right-clicked.
+    ///
+    /// Uses the same direct-spawn semantics as [`on_click`](Self::on_click).
+    /// Currently honored by the power widget.
+    #[serde(rename = "on-click-right")]
+    pub on_click_right: Option<std::path::PathBuf>,
     /// Widget label format. Supported placeholders depend on the widget.
     pub format: Option<String>,
     /// Widget-specific icon configuration: a backlight ramp or named profile map.
@@ -495,6 +505,9 @@ impl WidgetStyleConfig {
         if self.on_click.is_some() {
             base.on_click = self.on_click.clone();
         }
+        if self.on_click_right.is_some() {
+            base.on_click_right = self.on_click_right.clone();
+        }
         if self.format.is_some() {
             base.format = self.format.clone();
         }
@@ -553,6 +566,10 @@ pub struct WidgetStyles {
     pub power_profiles_daemon: WidgetStyleConfig,
     /// Style and behavior for the Arch package-updates widget.
     pub updates: WidgetStyleConfig,
+    /// Style for the Hypridle state widget.
+    pub hypridle: WidgetStyleConfig,
+    /// Style and launch actions for the power widget.
+    pub power: WidgetStyleConfig,
 }
 
 impl WidgetStyles {
@@ -572,6 +589,8 @@ impl WidgetStyles {
             WidgetKind::Notifications => &self.notifications,
             WidgetKind::PowerProfilesDaemon => &self.power_profiles_daemon,
             WidgetKind::Updates => &self.updates,
+            WidgetKind::Hypridle => &self.hypridle,
+            WidgetKind::Power => &self.power,
         }
     }
 
@@ -592,6 +611,8 @@ impl WidgetStyles {
         self.power_profiles_daemon
             .apply(&mut base.power_profiles_daemon);
         self.updates.apply(&mut base.updates);
+        self.hypridle.apply(&mut base.hypridle);
+        self.power.apply(&mut base.power);
     }
 }
 
@@ -1153,6 +1174,12 @@ impl WidgetKind {
                     .with_style(style)
                     .with_on_click(on_click),
             ),
+            WidgetKind::Hypridle => Box::new(HypridleWidget::new(bounds).with_style(style)),
+            WidgetKind::Power => Box::new(
+                PowerWidget::new(bounds)
+                    .with_style(style)
+                    .with_on_click(on_click),
+            ),
         }
     }
 }
@@ -1261,6 +1288,12 @@ impl Config {
                                 .with_format(style_config.format.clone())
                                 .with_on_click(style_config.on_click.clone()),
                         ),
+                        WidgetKind::Power => Box::new(
+                            PowerWidget::new(bounds)
+                                .with_style(style)
+                                .with_on_click(style_config.on_click.clone())
+                                .with_on_click_right(style_config.on_click_right.clone()),
+                        ),
                         _ => kind.build(bounds, style, monitor, style_config.on_click.clone()),
                     }
                 })
@@ -1337,6 +1370,7 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::RenderContext;
     use crate::widget::ClickButton;
 
     #[test]
@@ -1406,6 +1440,8 @@ mod tests {
                 WidgetKind::Notifications,
                 WidgetKind::Battery,
                 WidgetKind::PowerProfilesDaemon,
+                WidgetKind::Hypridle,
+                WidgetKind::Power,
                 WidgetKind::Clock,
             ]
         );
@@ -1419,6 +1455,14 @@ mod tests {
             Some("{icon} {count}")
         );
         assert_eq!(parsed.widget.updates.padding, Some(6));
+        assert_eq!(
+            parsed.widget.power.on_click.as_deref(),
+            Some(std::path::Path::new("wlogout"))
+        );
+        assert_eq!(
+            parsed.widget.power.on_click_right.as_deref(),
+            Some(std::path::Path::new("hyprlock"))
+        );
         assert_eq!(
             parsed.widget.battery.format.as_deref(),
             Some("{icon} {percent}%")
@@ -1651,6 +1695,96 @@ mod tests {
         .unwrap();
         assert!(monitor.uses_widget(WidgetKind::Updates));
         assert!(!Config::default().uses_widget(WidgetKind::Updates));
+    }
+
+    #[test]
+    fn hypridle_and_power_are_opt_in_widget_names() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-right = ["hypridle", "power", "clock"]
+
+            [widget.power]
+            on-click = "wlogout"
+            on-click-right = "hyprlock"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.bar.modules_right,
+            vec![WidgetKind::Hypridle, WidgetKind::Power, WidgetKind::Clock]
+        );
+        assert_eq!(
+            config.widget.power.on_click_right.as_deref(),
+            Some(std::path::Path::new("hyprlock"))
+        );
+        assert!(config.uses_widget(WidgetKind::Hypridle));
+        assert!(config.uses_widget(WidgetKind::Power));
+    }
+
+    #[test]
+    fn power_actions_reach_the_built_dashboard() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-left = []
+            modules-center = []
+            modules-right = ["power"]
+
+            [widget.power]
+            on-click = "wlogout"
+            on-click-right = "hyprlock"
+            "#,
+        )
+        .unwrap();
+        let mut dashboard = config.build_dashboard(Bounds::new(0, 0, 100, 32), None);
+        let mut ctx = RenderContext::new(100, 32);
+        dashboard.layout(&mut ctx, 100, 32);
+
+        assert_eq!(
+            dashboard.on_click(99, 16, ClickButton::Left),
+            Some(crate::widget::Command::RunProgram("wlogout".into()))
+        );
+        assert_eq!(
+            dashboard.on_click(99, 16, ClickButton::Right),
+            Some(crate::widget::Command::RunProgram("hyprlock".into()))
+        );
+    }
+
+    #[test]
+    fn on_click_right_folds_onto_a_monitor_override() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.power]
+            on-click-right = "global-lock"
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.power]
+            on-click-right = "monitor-lock"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .resolve_for_output(Some("DP-1"))
+                .widget
+                .power
+                .on_click_right
+                .as_deref(),
+            Some(std::path::Path::new("monitor-lock"))
+        );
+        assert_eq!(
+            config
+                .resolve_for_output(Some("HDMI-A-1"))
+                .widget
+                .power
+                .on_click_right
+                .as_deref(),
+            Some(std::path::Path::new("global-lock"))
+        );
     }
 
     #[test]
