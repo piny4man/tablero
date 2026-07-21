@@ -1,6 +1,6 @@
 [package]
 name = "tablero"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["piny4man <development@pinya.dev>"]
 description = "A fast, native Wayland status bar for Hyprland"
@@ -11,13 +11,7 @@ readme = "../../README.md"
 keywords = ["wayland", "hyprland", "status-bar", "desktop", "linux"]
 categories = ["gui", "visualization"]
 publish = ["crates-io"]
-include = [
-    "src/**",
-    "tests/**",
-    "examples/**",
-    "config.example.toml",
-    "LICENSE",
-]
+include = ["src/**", "tests/**", "examples/**", "config.example.toml", "LICENSE"]
 
 [dependencies]
 # default-features = false drops the regex filter engine, the `jiff` datetime
@@ -35,7 +29,15 @@ smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
 wayland-client = "0.31"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util", "sync", "fs", "process"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "time",
+  "net",
+  "io-util",
+  "sync",
+  "fs",
+  "process",
+] }
 serde_json = "1"
 zbus = { version = "5.16.0", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }

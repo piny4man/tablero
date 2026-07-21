@@ -21,6 +21,7 @@
 //! The live DBus plumbing around them is kept deliberately thin.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,6 +48,13 @@ const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 /// The default object path of an item registered by bus name alone.
 const DEFAULT_ITEM_PATH: &str = "/StatusNotifierItem";
+/// The upper bound on any single DBus call to an item or menu. zbus applies no
+/// call timeout of its own, so an unanswered call parks the awaiting task
+/// forever — seen at session start, when items register before they are ready
+/// to serve properties. Bounding every peer call keeps one unresponsive app
+/// from freezing the tray for the whole session: timed-out reads retain cached
+/// state and retry, timed-out commands are logged and skipped.
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single raw `IconPixmap` entry: `(width, height, ARGB32 bytes)`.
 type RawPixmap = (i32, i32, Vec<u8>);
@@ -257,7 +265,24 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
 /// exits, the failed call drops the stale watcher registration instead of
 /// rendering it as an unknown `?` icon. Optional presentation properties still
 /// degrade to empty defaults so a partially implemented live item remains usable.
+///
+/// The read is bounded by [`CALL_TIMEOUT`]: an item that accepts a call but
+/// never replies is treated as unreadable, exactly like a fast failure — the
+/// cached item is retained and the read is retried, so one hung peer can never
+/// park the producer.
 async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
+    match tokio::time::timeout(CALL_TIMEOUT, read_item_props(conn, key)).await {
+        Ok(item) => item,
+        Err(_) => {
+            warn!("sni: reading item {key:?} timed out; treating it as unreadable");
+            None
+        }
+    }
+}
+
+/// The raw, unbounded property read behind [`read_item`]; separated so the
+/// caller can apply the timeout.
+async fn read_item_props(conn: &Connection, key: &str) -> Option<TrayItem> {
     let (name, path) = parse_item_address(key)?;
     let item = StatusNotifierItemProxy::builder(conn)
         .destination(name)
@@ -284,8 +309,10 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
 
 /// Build the current tray snapshot by reading every registered item.
 ///
-/// Items that cannot be addressed at all are dropped; everything else is folded
-/// into a normalized [`TrayState`] (which de-duplicates and sorts), so a
+/// Items are read concurrently so one slow item cannot delay the rest, and
+/// each read is bounded by [`CALL_TIMEOUT`] (see [`read_item`]). Items that
+/// cannot be read at all are dropped; everything else is folded into a
+/// normalized [`TrayState`] (which de-duplicates and sorts), so a
 /// re-enumeration that finds the same set produces an equal snapshot and no
 /// repaint.
 async fn reconcile_state(
@@ -293,14 +320,14 @@ async fn reconcile_state(
     addresses: &[String],
     items: &mut HashMap<String, TrayItem>,
 ) -> (TrayState, bool) {
-    let mut readings = Vec::with_capacity(addresses.len());
-    for address in addresses {
+    let readings = futures_util::future::join_all(addresses.iter().map(|address| async move {
         let item = read_item(conn, address).await;
         if item.is_none() {
             warn!("sni: reading registered item {address:?} failed; retaining cached state");
         }
-        readings.push((address.clone(), item));
-    }
+        (address.clone(), item)
+    }))
+    .await;
     let needs_retry = reconcile_items(items, addresses, readings);
     (TrayState::new(items.values().cloned()), needs_retry)
 }
@@ -630,20 +657,13 @@ fn interpret_watcher_name(reply: zbus::Result<RequestNameReply>) -> zbus::Result
     }
 }
 
-/// Drive the tray stream: ensure a watcher, register as host, then emit a fresh
-/// snapshot on every lifecycle or per-item change.
+/// One startup attempt: connect to the session bus, host (or defer to) the
+/// StatusNotifierWatcher, and register as a host, ready for enumeration.
 ///
-/// Re-enumeration is deliberately whole-snapshot: any change rebuilds the full
-/// [`TrayState`], which is cheap relative to the change rate and keeps dynamic
-/// item set correct without bespoke per-item bookkeeping. A low-cost periodic
-/// membership check recovers missed or closed signal streams without repeatedly
-/// decoding unchanged icon pixmaps. Returns `Ok(())` once the render loop drops
-/// its receiver. An initial session-bus connection failure propagates as an
-/// error the bridge logs and isolates.
-async fn run(tx: MsgSender) -> ProducerResult {
-    const RETRY_DELAY: Duration = Duration::from_secs(1);
-    const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-
+/// Retried by [`run`] until it succeeds: at compositor start the session bus
+/// or an external watcher may not be ready yet, and giving up would leave the
+/// tray dead for the whole session.
+async fn connect_and_register() -> zbus::Result<(Connection, StatusNotifierWatcherProxy<'static>)> {
     let conn = Connection::session().await?;
     ensure_watcher(&conn).await?;
 
@@ -658,6 +678,33 @@ async fn run(tx: MsgSender) -> ProducerResult {
     if let Err(e) = watcher.register_status_notifier_host(&host_name).await {
         warn!("sni: registering host failed: {e}");
     }
+    Ok((conn, watcher))
+}
+
+/// Drive the tray stream: ensure a watcher, register as host, then emit a fresh
+/// snapshot on every lifecycle or per-item change.
+///
+/// Re-enumeration is deliberately whole-snapshot: any change rebuilds the full
+/// [`TrayState`], which is cheap relative to the change rate and keeps dynamic
+/// item set correct without bespoke per-item bookkeeping. A low-cost periodic
+/// membership check recovers missed or closed signal streams without repeatedly
+/// decoding unchanged icon pixmaps. Startup is retried until the session bus
+/// and watcher are usable — failing here would leave the tray dead for the
+/// whole session when the bar starts before the bus is ready. Returns `Ok(())`
+/// once the render loop drops its receiver.
+async fn run(tx: MsgSender) -> ProducerResult {
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
+    let (conn, watcher) = loop {
+        match connect_and_register().await {
+            Ok(setup) => break setup,
+            Err(error) => {
+                warn!("sni: startup failed: {error}; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
 
     // Keep lifecycle subscriptions alive across snapshot rebuilds. Recreating
     // them after every read leaves a window where a newly opened app can
@@ -850,26 +897,62 @@ async fn item_change_stream(
     Some(merged.boxed())
 }
 
+/// Run one DBus `call` bounded by [`CALL_TIMEOUT`].
+///
+/// zbus applies no call timeout of its own, so without a bound an unanswered
+/// call parks the awaiting task forever. A timeout is reported as a generic
+/// failure so the caller's existing log-and-skip (or retry) handling covers it.
+async fn bounded<F, T>(call: F) -> zbus::Result<T>
+where
+    F: Future<Output = zbus::Result<T>>,
+{
+    bounded_for(CALL_TIMEOUT, call).await
+}
+
+/// [`bounded`] with an explicit timeout, so tests can use tiny durations.
+async fn bounded_for<F, T>(timeout: Duration, call: F) -> zbus::Result<T>
+where
+    F: Future<Output = zbus::Result<T>>,
+{
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Err(zbus::Error::Failure("call timed out".to_string())),
+    }
+}
+
 /// Drain tray commands from the render loop and execute SNI/DBusMenu calls.
 ///
 /// Runs on the producer bridge as the executor end of the
-/// [command channel](crate::command), alongside the Hyprland executor. Commands
-/// This executor handles item activation, menu opening, and menu-entry events;
-/// unrelated commands are ignored, mirroring the Hyprland executor. A failed
-/// call is logged and skipped, so one bad item never ends the stream. Returns
-/// `Ok(())` when the render loop drops its sender.
+/// [command channel](crate::command), alongside the Hyprland executor. This
+/// executor handles item activation, menu opening, and menu-entry events;
+/// unrelated commands are ignored, mirroring the Hyprland executor. Every call
+/// is bounded by the internal call timeout; a failed or timed-out call is
+/// logged and skipped, so one bad item never ends the stream. The session-bus
+/// connection is retried like the producer's startup — dying here would leave
+/// tray
+/// clicks and menus dead for the whole session when the bar starts before the
+/// bus is ready. Returns `Ok(())` when the render loop drops its sender.
 pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> ProducerResult {
-    let conn = Connection::session().await?;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    let conn = loop {
+        match Connection::session().await {
+            Ok(conn) => break conn,
+            Err(error) => {
+                warn!("sni: command executor cannot reach the session bus: {error}; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
     let mut monitored_menus = HashSet::new();
     while let Some(command) = commands.recv().await {
         match command {
             Command::ActivateTrayItem { key, x, y } => {
-                if let Err(e) = activate(&conn, &key, x, y).await {
+                if let Err(e) = bounded(activate(&conn, &key, x, y)).await {
                     warn!("sni: activating {key:?} failed: {e}");
                 }
             }
             Command::OpenTrayMenu { key, x, y } => {
-                if let Err(e) = open_menu(&conn, &updates, &key, x, y).await {
+                if let Err(e) = bounded(open_menu(&conn, &updates, &key, x, y)).await {
                     warn!("sni: opening menu for {key:?} failed: {e}");
                 } else if monitored_menus.insert(key.clone()) {
                     let monitor_conn = conn.clone();
@@ -884,7 +967,7 @@ pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> 
                 }
             }
             Command::ActivateTrayMenuItem { key, id } => {
-                if let Err(e) = activate_menu_item(&conn, &key, id).await {
+                if let Err(e) = bounded(activate_menu_item(&conn, &key, id)).await {
                     warn!("sni: activating menu item {id} for {key:?} failed: {e}");
                 }
             }
@@ -1021,8 +1104,13 @@ async fn monitor_menu(conn: Connection, updates: MsgSender, key: String) -> zbus
     while changes.next().await.is_some() {
         // Re-fetching the normalized tree handles both structural and property
         // signals with one consistent path and rejects malformed partial deltas.
-        let _ = menu.about_to_show(0).await;
-        send_menu_layout(&menu, &updates, &key).await?;
+        let _ = bounded(menu.about_to_show(0)).await;
+        // A failed or timed-out refresh must not end the monitor: the menu is
+        // never re-monitored for the session (`monitored_menus` retains the
+        // key), so log and wait for the next change signal instead.
+        if let Err(error) = bounded(send_menu_layout(&menu, &updates, &key)).await {
+            warn!("sni: refreshing menu for {key:?} failed: {error}");
+        }
     }
     Ok(())
 }
@@ -1176,6 +1264,49 @@ mod tests {
                 let wake = wait_for_sni_change(&mut lifecycle, &mut changes, Duration::ZERO).await;
 
                 assert!(matches!(wake, SniWake::Poll));
+            });
+    }
+
+    #[test]
+    fn an_unanswered_call_is_bounded_instead_of_parking_forever() {
+        // zbus applies no call timeout, so a peer that never replies must be
+        // cut off by our own bound, surfacing as an ordinary failure.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let never = std::future::pending::<zbus::Result<()>>();
+                let result = bounded_for(Duration::from_millis(10), never).await;
+                assert!(matches!(result, Err(zbus::Error::Failure(_))));
+            });
+    }
+
+    #[test]
+    fn a_prompt_answer_passes_through_the_bound() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let prompt = async { zbus::Result::Ok(7) };
+                assert_eq!(
+                    bounded_for(Duration::from_secs(1), prompt).await.ok(),
+                    Some(7)
+                );
+            });
+    }
+
+    #[test]
+    fn an_inner_error_passes_through_the_bound() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let failing = async { zbus::Result::<()>::Err(zbus::Error::Unsupported) };
+                let result = bounded_for(Duration::from_secs(1), failing).await;
+                assert!(matches!(result, Err(zbus::Error::Unsupported)));
             });
     }
 
