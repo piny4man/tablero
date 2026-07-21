@@ -1,9 +1,13 @@
 //! The clock widget: an `HH:MM` readout driven by [`Msg::Tick`].
 
+use std::path::PathBuf;
+
 use crate::clock::format_time;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+use super::{
+    ClickButton, Command, Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+};
 
 /// Default clock glyph: Nerd Font "clock" (`nf-fa-clock_o`).
 const CLOCK_GLYPH: &str = "\u{f017}";
@@ -19,6 +23,8 @@ pub struct ClockWidget {
     bounds: Bounds,
     text: String,
     style: WidgetStyle,
+    on_click: Option<PathBuf>,
+    on_click_right: Option<PathBuf>,
 }
 
 impl ClockWidget {
@@ -29,6 +35,8 @@ impl ClockWidget {
             bounds,
             text: String::new(),
             style: WidgetStyle::default(),
+            on_click: None,
+            on_click_right: None,
         }
     }
 
@@ -39,9 +47,28 @@ impl ClockWidget {
         self
     }
 
+    /// Set the executable run on a primary click.
+    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+        self.on_click = path;
+        self
+    }
+
+    /// Set the executable run on a secondary click.
+    pub fn with_on_click_right(mut self, path: Option<PathBuf>) -> Self {
+        self.on_click_right = path;
+        self
+    }
+
     /// The currently displayed clock text (empty before the first tick).
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        px >= self.bounds.x
+            && px < self.bounds.x + self.bounds.width
+            && py >= self.bounds.y
+            && py < self.bounds.y + self.bounds.height
     }
 
     /// The full pill text: the configured glyph joined to the clock readout, or
@@ -90,6 +117,17 @@ impl Widget for ClockWidget {
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
     }
+
+    fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        let path = match button {
+            ClickButton::Left => self.on_click.as_ref(),
+            ClickButton::Right => self.on_click_right.as_ref(),
+        }?;
+        Some(Command::RunProgram(path.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +169,31 @@ mod tests {
         let mut clock = ClockWidget::new(Bounds::new(0, 0, 1, 1));
         clock.set_bounds(Bounds::new(0, 0, 1920, 32));
         assert_eq!(clock.bounds(), Bounds::new(0, 0, 1920, 32));
+    }
+
+    #[test]
+    fn left_and_right_clicks_run_their_configured_programs() {
+        let left = PathBuf::from("gsimplecal");
+        let right = PathBuf::from("gnome-calendar");
+        let widget = ClockWidget::new(Bounds::new(10, 0, 100, 32))
+            .with_on_click(Some(left.clone()))
+            .with_on_click_right(Some(right.clone()));
+        assert_eq!(
+            widget.on_click(20, 16, ClickButton::Left),
+            Some(Command::RunProgram(left))
+        );
+        assert_eq!(
+            widget.on_click(20, 16, ClickButton::Right),
+            Some(Command::RunProgram(right))
+        );
+    }
+
+    #[test]
+    fn unconfigured_or_outside_clicks_are_ignored() {
+        let widget = ClockWidget::new(Bounds::new(10, 0, 100, 32));
+        assert_eq!(widget.on_click(20, 16, ClickButton::Left), None);
+
+        let widget = widget.with_on_click(Some(PathBuf::from("gsimplecal")));
+        assert_eq!(widget.on_click(200, 16, ClickButton::Left), None);
     }
 }

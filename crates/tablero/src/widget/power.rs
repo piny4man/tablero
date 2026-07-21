@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Widget, WidgetStyle, draw_icon_pill, glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, Tooltip, Widget, WidgetStyle, draw_icon_pill, glyph_label,
+    measure_text_pill,
 };
 
 const POWER_GLYPH: &str = "\u{f011}";
+const DEFAULT_TOOLTIP_FORMAT: &str = "Power menu";
 
 /// A static power glyph with independently configurable primary and secondary actions.
 pub struct PowerWidget {
@@ -16,6 +18,8 @@ pub struct PowerWidget {
     style: WidgetStyle,
     on_click: Option<PathBuf>,
     on_click_right: Option<PathBuf>,
+    tooltip: bool,
+    tooltip_format: String,
 }
 
 impl PowerWidget {
@@ -26,6 +30,8 @@ impl PowerWidget {
             style: WidgetStyle::default(),
             on_click: None,
             on_click_right: None,
+            tooltip: true,
+            tooltip_format: DEFAULT_TOOLTIP_FORMAT.to_string(),
         }
     }
 
@@ -44,6 +50,23 @@ impl PowerWidget {
     /// Set the executable run on a secondary click.
     pub fn with_on_click_right(mut self, path: Option<PathBuf>) -> Self {
         self.on_click_right = path;
+        self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, enabled: Option<bool>) -> Self {
+        if let Some(enabled) = enabled {
+            self.tooltip = enabled;
+        }
+        self
+    }
+
+    /// Set the hover tooltip text verbatim — no placeholders, since the power
+    /// widget carries no per-instance state.
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if let Some(format) = format {
+            self.tooltip_format = format;
+        }
         self
     }
 
@@ -96,6 +119,16 @@ impl Widget for PowerWidget {
         }?;
         Some(Command::RunProgram(path.clone()))
     }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.tooltip || !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_format.clone(),
+            bounds: self.bounds,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +171,30 @@ mod tests {
 
         let widget = widget.with_on_click(Some(PathBuf::from("wlogout")));
         assert_eq!(widget.on_click(42, 10, ClickButton::Left), None);
+    }
+
+    #[test]
+    fn tooltip_defaults_on_and_uses_supplied_format() {
+        let widget = PowerWidget::new(Bounds::new(10, 0, 32, 32));
+        assert_eq!(
+            widget.tooltip_at(20, 10).map(|tooltip| tooltip.text),
+            Some("Power menu".to_string())
+        );
+        assert_eq!(widget.tooltip_at(42, 10), None);
+    }
+
+    #[test]
+    fn tooltip_format_is_honored_and_can_be_disabled() {
+        let widget = PowerWidget::new(Bounds::new(10, 0, 32, 32))
+            .with_tooltip_format(Some("Power: shutdown".to_string()))
+            .with_tooltip(Some(false));
+        assert_eq!(widget.tooltip_at(20, 10), None);
+
+        let widget = PowerWidget::new(Bounds::new(10, 0, 32, 32))
+            .with_tooltip_format(Some("Power: shutdown".to_string()));
+        assert_eq!(
+            widget.tooltip_at(20, 10).map(|tooltip| tooltip.text),
+            Some("Power: shutdown".to_string())
+        );
     }
 }
