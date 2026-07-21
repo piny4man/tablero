@@ -405,9 +405,19 @@ impl Watcher {
             .lock()
             .map(|mut items| items.insert(address.clone()))
             .unwrap_or(false);
-        if inserted && let Err(e) = Self::status_notifier_item_registered(&emitter, &address).await
-        {
-            warn!("failed to emit StatusNotifierItemRegistered for {address}: {e}");
+        if inserted {
+            if let Err(e) = Self::status_notifier_item_registered(&emitter, &address).await {
+                warn!("failed to emit StatusNotifierItemRegistered for {address}: {e}");
+            }
+            // PropertiesChanged is what keeps caching proxies (other hosts, or
+            // a host built before this registration) from serving a frozen
+            // membership list.
+            if let Err(e) = self
+                .registered_status_notifier_items_changed(&emitter)
+                .await
+            {
+                warn!("failed to emit PropertiesChanged for {address}: {e}");
+            }
         }
         if inserted && let Some(mut owner_lost) = owner_lost {
             let emitter = emitter.to_owned();
@@ -417,11 +427,21 @@ impl Watcher {
                     return;
                 }
                 let removed = remove_registered_item(&items, &address);
-                if removed
-                    && let Err(error) =
+                if removed {
+                    if let Err(error) =
                         Self::status_notifier_item_unregistered(&emitter, &address).await
-                {
-                    warn!("failed to emit StatusNotifierItemUnregistered for {address}: {error}");
+                    {
+                        warn!(
+                            "failed to emit StatusNotifierItemUnregistered for {address}: {error}"
+                        );
+                    }
+                    let watcher = Watcher { items };
+                    if let Err(error) = watcher
+                        .registered_status_notifier_items_changed(&emitter)
+                        .await
+                    {
+                        warn!("failed to emit PropertiesChanged for {address}: {error}");
+                    }
                 }
             });
         }
@@ -657,6 +677,22 @@ fn interpret_watcher_name(reply: zbus::Result<RequestNameReply>) -> zbus::Result
     }
 }
 
+/// Build the long-lived watcher proxy the host reads membership through.
+///
+/// Property caching must stay off: zbus refreshes a cached property only on
+/// `PropertiesChanged`, which not every watcher emits for
+/// `RegisteredStatusNotifierItems`. A cached read would freeze the membership
+/// list at its startup value for the whole session — the tray would populate
+/// once and never show later registrations or removals.
+async fn build_watcher_proxy(
+    conn: &Connection,
+) -> zbus::Result<StatusNotifierWatcherProxy<'static>> {
+    StatusNotifierWatcherProxy::builder(conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+}
+
 /// One startup attempt: connect to the session bus, host (or defer to) the
 /// StatusNotifierWatcher, and register as a host, ready for enumeration.
 ///
@@ -667,7 +703,7 @@ async fn connect_and_register() -> zbus::Result<(Connection, StatusNotifierWatch
     let conn = Connection::session().await?;
     ensure_watcher(&conn).await?;
 
-    let watcher = StatusNotifierWatcherProxy::new(&conn).await?;
+    let watcher = build_watcher_proxy(&conn).await?;
     let host_name = format!("org.kde.StatusNotifierHost-{}-0", std::process::id());
     // External watchers such as Waybar validate that a host owns the service
     // name it registers. Without claiming it, initial enumeration can work but
@@ -790,6 +826,10 @@ fn normalize_addresses(mut addresses: Vec<String>) -> Vec<String> {
 async fn lifecycle_stream<'a>(
     watcher: &'a StatusNotifierWatcherProxy<'_>,
 ) -> zbus::Result<BoxStream<'a, ()>> {
+    // No RegisteredStatusNotifierItems property stream here: the watcher proxy
+    // runs with property caching off, and a PropertyStream never yields without
+    // the cache. The two lifecycle signals plus the reconcile poll cover
+    // membership changes.
     Ok(select_all(vec![
         watcher
             .receive_status_notifier_item_registered()
@@ -799,11 +839,6 @@ async fn lifecycle_stream<'a>(
         watcher
             .receive_status_notifier_item_unregistered()
             .await?
-            .map(|_| ())
-            .boxed(),
-        watcher
-            .receive_registered_status_notifier_items_changed()
-            .await
             .map(|_| ())
             .boxed(),
     ])
@@ -876,25 +911,40 @@ async fn item_change_stream(
         .build()
         .await
         .ok()?;
-    let dbus = DBusProxy::new(conn).await.ok()?;
-    let owner_changes = dbus
-        .receive_name_owner_changed_with_args(&[(0, name.as_str())])
-        .await
-        .ok()?
-        .map(|_| ())
-        .boxed();
-    let merged = select_all([
-        item.receive_new_icon().await.ok()?.map(|_| ()).boxed(),
-        item.receive_new_title().await.ok()?.map(|_| ()).boxed(),
-        item.receive_new_status().await.ok()?.map(|_| ()).boxed(),
-        item.receive_new_attention_icon()
+    // Keep whichever subscriptions succeed: one failure must not silently
+    // strip the item of every wake source, which would leave it stale until a
+    // membership change.
+    let mut streams: Vec<BoxStream<'static, ()>> = Vec::new();
+    if let Ok(dbus) = DBusProxy::new(conn).await
+        && let Ok(owner_changes) = dbus
+            .receive_name_owner_changed_with_args(&[(0, name.as_str())])
             .await
-            .ok()?
-            .map(|_| ())
-            .boxed(),
-        owner_changes,
-    ]);
-    Some(merged.boxed())
+    {
+        streams.push(owner_changes.map(|_| ()).boxed());
+    }
+    if let Ok(stream) = item.receive_new_icon().await {
+        streams.push(stream.map(|_| ()).boxed());
+    }
+    if let Ok(stream) = item.receive_new_title().await {
+        streams.push(stream.map(|_| ()).boxed());
+    }
+    if let Ok(stream) = item.receive_new_status().await {
+        streams.push(stream.map(|_| ()).boxed());
+    }
+    if let Ok(stream) = item.receive_new_attention_icon().await {
+        streams.push(stream.map(|_| ()).boxed());
+    }
+    if streams.is_empty() {
+        warn!("sni: no change subscriptions succeeded for {address}");
+        return None;
+    }
+    if streams.len() < 5 {
+        warn!(
+            "sni: only {} of 5 change subscriptions succeeded for {address}",
+            streams.len()
+        );
+    }
+    Some(select_all(streams).boxed())
 }
 
 /// Run one DBus `call` bounded by [`CALL_TIMEOUT`].
@@ -1492,5 +1542,141 @@ mod tests {
         // A blank theme path contributes no leading entry.
         let plain = icon_search_dirs("");
         assert!(!plain.contains(&PathBuf::from("")));
+    }
+
+    /// A private session bus for live-bus tests, killed on drop.
+    struct PrivateBus {
+        child: std::process::Child,
+        address: String,
+    }
+
+    impl PrivateBus {
+        /// Spawn `dbus-daemon` on a fresh address, or `None` if unavailable.
+        fn spawn() -> Option<Self> {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            let mut address = String::new();
+            let read =
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut address);
+            let address = address.trim().to_string();
+            if read.is_err() || address.is_empty() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Some(Self { child, address })
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn connect(address: &str) -> Connection {
+        zbus::connection::Builder::address(address)
+            .expect("valid bus address")
+            .build()
+            .await
+            .expect("connection to private bus")
+    }
+
+    /// Regression test for the frozen tray: membership read through the
+    /// production watcher proxy must reflect registrations and removals that
+    /// happen *after* the proxy is built, and the hosted watcher must emit
+    /// `PropertiesChanged` so caching consumers stay current too.
+    #[test]
+    fn hosted_watcher_propagates_membership_changes_after_startup() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let host = connect(&bus.address).await;
+                ensure_watcher(&host).await.expect("hosting the watcher");
+                let watcher = build_watcher_proxy(&host).await.expect("watcher proxy");
+                assert!(
+                    watcher
+                        .registered_status_notifier_items()
+                        .await
+                        .expect("initial membership read")
+                        .is_empty()
+                );
+
+                // A caching observer stays current only via PropertiesChanged;
+                // its reads regression-test the watcher's signal emission.
+                let observer = StatusNotifierWatcherProxy::new(&host)
+                    .await
+                    .expect("caching observer proxy");
+                assert!(
+                    observer
+                        .registered_status_notifier_items()
+                        .await
+                        .expect("priming the observer cache")
+                        .is_empty()
+                );
+
+                let app = connect(&bus.address).await;
+                let expected = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+                app.call_method(
+                    Some(WATCHER_NAME),
+                    WATCHER_PATH,
+                    Some("org.kde.StatusNotifierWatcher"),
+                    "RegisterStatusNotifierItem",
+                    &DEFAULT_ITEM_PATH,
+                )
+                .await
+                .expect("registering the item");
+
+                // The production (uncached) proxy sees the new item at once.
+                assert_eq!(
+                    watcher
+                        .registered_status_notifier_items()
+                        .await
+                        .expect("membership read after registration"),
+                    vec![expected.clone()]
+                );
+                // The caching observer converges once PropertiesChanged lands.
+                wait_for_membership(&observer, std::slice::from_ref(&expected)).await;
+
+                // Dropping the app's connection must unregister its item.
+                drop(app);
+                wait_for_membership(&watcher, &[]).await;
+                wait_for_membership(&observer, &[]).await;
+            });
+    }
+
+    /// Poll `proxy` until its membership equals `expected`, panicking after a
+    /// bound so a regression fails instead of hanging.
+    async fn wait_for_membership(proxy: &StatusNotifierWatcherProxy<'_>, expected: &[String]) {
+        let converged = async {
+            loop {
+                let items = proxy
+                    .registered_status_notifier_items()
+                    .await
+                    .unwrap_or_default();
+                if items == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), converged)
+            .await
+            .expect("membership converged to the expected set");
     }
 }
