@@ -72,7 +72,9 @@ RUST_LOG=info cargo run -p tablero
     on one output leave other bars unchanged. Long titles are truncated with
     `…` at 100 characters by default; `icon = "none"` keeps the default
     glyphless look.
-  - **Clock** — a live local clock (`HH:MM`).
+  - **Clock** — a live local clock (`HH:MM`). `on-click` and `on-click-right`
+  launch the configured program on a left- or right-click, useful for opening
+  a calendar app or quick date picker.
   - **Battery** — percentage and charge state via UPower (blank when no battery
     is present).
   - **Backlight** — screen brightness read directly from Linux sysfs. **Opt-in**:
@@ -89,7 +91,9 @@ RUST_LOG=info cargo run -p tablero
     zero or the required official check is unavailable.
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
-    NetworkManager is unavailable.
+    NetworkManager is unavailable. `on-click` and `on-click-right` launch the
+    configured program on a left- or right-click, useful for opening a network
+    manager such as `nm-connection-editor` or `networkmanager_dmenu`.
   - **Tray** — StatusNotifierItem (SNI) system-tray icons from background apps,
     over DBus. **Opt-in**: not in the default set; add `"tray"` to `widgets` to
     enable it. Left-click activates conventional items and opens menu-only
@@ -138,6 +142,8 @@ RUST_LOG=info cargo run -p tablero
   - **Power** — a compact power glyph with configurable direct-launch actions.
     **Opt-in**: add `"power"` to a zone. `on-click = "wlogout"` opens the logout
     menu and `on-click-right = "hyprlock"` preserves a secondary lock action.
+    A hover tooltip shows the configured `tooltip-format` text (default
+    `"Power menu"`); set `tooltip = false` to disable.
 - Draws through `cosmic-text` + `tiny-skia`, committed via a `wl_shm` ARGB8888
   buffer.
 - Handles **HiDPI / output scaling**: surface geometry stays in logical pixels

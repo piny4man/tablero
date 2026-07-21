@@ -1123,9 +1123,12 @@ impl WidgetKind {
     /// output this dashboard serves, threaded to the workspace widget so it
     /// shows only that monitor's workspaces; `None` builds the global fallback.
     /// `on_click` is the executable path the widget spawns when clicked —
-    /// `None` makes the widget display-only; today only the bluetooth and
-    /// volume widgets honor it, but every kind accepts the argument so
-    /// per-monitor `on-click` overrides apply uniformly.
+    /// `None` makes the widget display-only; every kind that honors clicks
+    /// (bluetooth, volume, updates, power, network, clock) accepts the argument
+    /// here so per-monitor `on-click` overrides apply uniformly. `on_click_right`
+    /// is the matching right-click handler, honored by network, clock, and
+    /// power. `tooltip`/`tooltip_format` configure hover tooltips; today the
+    /// power widget and power-profiles-daemon consume them.
     pub fn build(
         self,
         bounds: Bounds,
@@ -1292,8 +1295,22 @@ impl Config {
                             PowerWidget::new(bounds)
                                 .with_style(style)
                                 .with_on_click(style_config.on_click.clone())
-                                .with_on_click_right(style_config.on_click_right.clone()),
+                                .with_on_click_right(style_config.on_click_right.clone())
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone()),
                         ),
+                        WidgetKind::Network => Box::new(
+                            NetworkWidget::new(bounds)
+                                .with_style(style)
+                                .with_on_click(style_config.on_click.clone())
+                                .with_on_click_right(style_config.on_click_right.clone()),
+                        ) as Box<dyn Widget>,
+                        WidgetKind::Clock => Box::new(
+                            ClockWidget::new(bounds)
+                                .with_style(style)
+                                .with_on_click(style_config.on_click.clone())
+                                .with_on_click_right(style_config.on_click_right.clone()),
+                        ) as Box<dyn Widget>,
                         _ => kind.build(bounds, style, monitor, style_config.on_click.clone()),
                     }
                 })

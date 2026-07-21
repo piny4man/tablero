@@ -53,7 +53,7 @@ use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -244,7 +244,6 @@ impl Surface {
         self.scale = scale;
         self.ctx
             .set_settings(self.config.scaled_render_settings(scale));
-        info!("output scale changed to {}x", scale.get());
         self.draw(pool);
         true
     }
@@ -757,7 +756,7 @@ impl App {
             )
         });
         if built {
-            info!(
+            debug!(
                 "output {id} ({}) added; {} bar(s) live",
                 name.as_deref().unwrap_or("<unnamed>"),
                 self.outputs.len()
@@ -778,7 +777,7 @@ impl App {
             self.hide_tray_menu();
         }
         if self.outputs.remove(id).is_some() {
-            info!("output {id} removed; {} bar(s) live", self.outputs.len());
+            debug!("output {id} removed; {} bar(s) live", self.outputs.len());
         }
     }
 
@@ -1182,7 +1181,6 @@ pub fn run_with_producers(
                 app.handle_message(&msg, &message_qh);
             }
         })?;
-        let count = producers.len();
         for producer in producers {
             bridge.spawn(producer);
         }
@@ -1231,11 +1229,8 @@ pub fn run_with_producers(
             power_tx,
             hypridle_tx,
         ];
-        info!("producer bridge started with {count} producer(s)");
         Some(bridge)
     };
-
-    info!("tablero started: one {height}px bar per output");
 
     let signal = event_loop.get_signal();
     event_loop.run(None, &mut app, move |app| {
@@ -1526,12 +1521,9 @@ impl PointerHandler for App {
                     );
                     continue;
                 }
-                let clickable = self
-                    .outputs
-                    .values()
-                    .find(|bar| bar.owns(&event.surface))
-                    .is_some_and(|bar| bar.is_clickable_at(x, y));
-                if self.outputs.values().any(|bar| bar.owns(&event.surface)) {
+                let owner = self.outputs.values().find(|bar| bar.owns(&event.surface));
+                let clickable = owner.is_some_and(|bar| bar.is_clickable_at(x, y));
+                if owner.is_some() {
                     self.update_tooltip(&event.surface, x, y, _qh);
                     self.set_pointer_cursor(
                         conn,
@@ -1542,6 +1534,8 @@ impl PointerHandler for App {
                         },
                         matches!(event.kind, PointerEventKind::Enter { .. }),
                     );
+                } else if matches!(event.kind, PointerEventKind::Enter { .. }) {
+                    warn!("pointer enter on unknown surface id={}", event.surface.id());
                 }
             } else if matches!(event.kind, PointerEventKind::Leave { .. }) {
                 if self.outputs.values().any(|bar| bar.owns(&event.surface)) {

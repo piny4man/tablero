@@ -9,9 +9,14 @@
 //! its first reading, so a machine with no network stack never paints a stale or
 //! placeholder value.
 
+use std::path::PathBuf;
+
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Tooltip, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
+use super::{
+    ClickButton, Command, Msg, Tooltip, Widget, WidgetStyle, draw_text_pill, glyph_label,
+    measure_text_pill,
+};
 
 /// Default network glyphs (Font Awesome, via Nerd Font), chosen by connection
 /// state: a wifi arc, a wired sitemap, a cross when disconnected, and a question
@@ -138,6 +143,8 @@ pub struct NetworkWidget {
     bounds: Bounds,
     state: Option<Network>,
     style: WidgetStyle,
+    on_click: Option<PathBuf>,
+    on_click_right: Option<PathBuf>,
 }
 
 impl NetworkWidget {
@@ -149,6 +156,8 @@ impl NetworkWidget {
             bounds,
             state: None,
             style: WidgetStyle::default(),
+            on_click: None,
+            on_click_right: None,
         }
     }
 
@@ -156,6 +165,18 @@ impl NetworkWidget {
     /// chains off [`new`](NetworkWidget::new) at build time.
     pub fn with_style(mut self, style: WidgetStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Set the executable run on a primary click.
+    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+        self.on_click = path;
+        self
+    }
+
+    /// Set the executable run on a secondary click.
+    pub fn with_on_click_right(mut self, path: Option<PathBuf>) -> Self {
+        self.on_click_right = path;
         self
     }
 
@@ -236,6 +257,17 @@ impl Widget for NetworkWidget {
         self.bounds = bounds;
     }
 
+    fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        let path = match button {
+            ClickButton::Left => self.on_click.as_ref(),
+            ClickButton::Right => self.on_click_right.as_ref(),
+        }?;
+        Some(Command::RunProgram(path.clone()))
+    }
+
     fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
         if !self.contains(px, py) {
             return None;
@@ -250,6 +282,7 @@ impl Widget for NetworkWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::{ClickButton, Command};
     use chrono::{Local, TimeZone};
 
     fn network(state: NetworkState, ssid: Option<&str>) -> Msg {
@@ -423,5 +456,31 @@ mod tests {
             Some("Connection: Wi-Fi\nSSID: home-net".to_string())
         );
         assert_eq!(widget.tooltip_at(200, 16), None);
+    }
+
+    #[test]
+    fn left_and_right_clicks_run_their_configured_programs() {
+        let left = PathBuf::from("networkmanager_dmenu");
+        let right = PathBuf::from("nm-connection-editor");
+        let widget = NetworkWidget::new(Bounds::new(10, 0, 100, 32))
+            .with_on_click(Some(left.clone()))
+            .with_on_click_right(Some(right.clone()));
+        assert_eq!(
+            widget.on_click(20, 16, ClickButton::Left),
+            Some(Command::RunProgram(left))
+        );
+        assert_eq!(
+            widget.on_click(20, 16, ClickButton::Right),
+            Some(Command::RunProgram(right))
+        );
+    }
+
+    #[test]
+    fn unconfigured_or_outside_clicks_are_ignored() {
+        let widget = NetworkWidget::new(Bounds::new(10, 0, 100, 32));
+        assert_eq!(widget.on_click(20, 16, ClickButton::Left), None);
+
+        let widget = widget.with_on_click(Some(PathBuf::from("networkmanager_dmenu")));
+        assert_eq!(widget.on_click(200, 16, ClickButton::Left), None);
     }
 }
