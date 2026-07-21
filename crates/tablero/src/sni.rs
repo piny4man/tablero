@@ -923,14 +923,26 @@ where
 /// Drain tray commands from the render loop and execute SNI/DBusMenu calls.
 ///
 /// Runs on the producer bridge as the executor end of the
-/// [command channel](crate::command), alongside the Hyprland executor. Commands
-/// This executor handles item activation, menu opening, and menu-entry events;
+/// [command channel](crate::command), alongside the Hyprland executor. This
+/// executor handles item activation, menu opening, and menu-entry events;
 /// unrelated commands are ignored, mirroring the Hyprland executor. Every call
-/// is bounded by [`CALL_TIMEOUT`]; a failed or timed-out call is logged and
-/// skipped, so one bad item never ends the stream. Returns `Ok(())` when the
-/// render loop drops its sender.
+/// is bounded by the internal call timeout; a failed or timed-out call is
+/// logged and skipped, so one bad item never ends the stream. The session-bus
+/// connection is retried like the producer's startup — dying here would leave
+/// tray
+/// clicks and menus dead for the whole session when the bar starts before the
+/// bus is ready. Returns `Ok(())` when the render loop drops its sender.
 pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> ProducerResult {
-    let conn = Connection::session().await?;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    let conn = loop {
+        match Connection::session().await {
+            Ok(conn) => break conn,
+            Err(error) => {
+                warn!("sni: command executor cannot reach the session bus: {error}; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
     let mut monitored_menus = HashSet::new();
     while let Some(command) = commands.recv().await {
         match command {
@@ -1093,7 +1105,12 @@ async fn monitor_menu(conn: Connection, updates: MsgSender, key: String) -> zbus
         // Re-fetching the normalized tree handles both structural and property
         // signals with one consistent path and rejects malformed partial deltas.
         let _ = bounded(menu.about_to_show(0)).await;
-        bounded(send_menu_layout(&menu, &updates, &key)).await?;
+        // A failed or timed-out refresh must not end the monitor: the menu is
+        // never re-monitored for the session (`monitored_menus` retains the
+        // key), so log and wait for the next change signal instead.
+        if let Err(error) = bounded(send_menu_layout(&menu, &updates, &key)).await {
+            warn!("sni: refreshing menu for {key:?} failed: {error}");
+        }
     }
     Ok(())
 }
