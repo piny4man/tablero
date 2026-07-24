@@ -47,8 +47,10 @@ pub enum BuiltinIcon {
     NetworkWireless,
     /// A wired (Ethernet) network link.
     NetworkWired,
-    /// System load (CPU/memory).
+    /// System CPU load.
     System,
+    /// System memory load.
+    Memory,
     /// A Bluetooth adapter.
     Bluetooth,
     /// Pending package updates.
@@ -101,6 +103,7 @@ impl BuiltinIcon {
             BuiltinIcon::NetworkWireless => "wifi-filled",
             BuiltinIcon::NetworkWired => "ethernet-filled",
             BuiltinIcon::System => "cpu-filled",
+            BuiltinIcon::Memory => "memory-filled",
             BuiltinIcon::Bluetooth => "bluetooth-outline",
             BuiltinIcon::Updates => "box5-filled",
             BuiltinIcon::Notifications => "bell-filled",
@@ -200,6 +203,7 @@ mod tests {
             BuiltinIcon::NetworkWireless,
             BuiltinIcon::NetworkWired,
             BuiltinIcon::System,
+            BuiltinIcon::Memory,
             BuiltinIcon::Bluetooth,
             BuiltinIcon::Updates,
             BuiltinIcon::Notifications,

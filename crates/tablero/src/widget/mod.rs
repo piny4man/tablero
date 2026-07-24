@@ -70,6 +70,11 @@ const DEFAULT_PADDING: u32 = 8;
 const DEFAULT_BORDER_WIDTH: u32 = 1;
 /// Default percent below which a discharging battery shows its warn colors.
 const DEFAULT_WARN_THRESHOLD: u32 = 20;
+/// Default charging-state foreground — a bright ARC Raiders green, so a charging
+/// battery reads as "recovering" with no configuration. Only the battery widget
+/// swaps to its [`charging`](WidgetStyle::charging) colors, so in practice this
+/// default is battery-facing.
+pub(crate) const CHARGING_FOREGROUND: (u8, u8, u8, u8) = (0x5F, 0xF5, 0xA0, 0xFF);
 
 /// Every state update a widget can react to.
 ///
@@ -366,7 +371,7 @@ impl Default for WidgetStyle {
             },
             charging: StateColors {
                 background: None,
-                foreground: FG,
+                foreground: CHARGING_FOREGROUND,
                 border: None,
             },
         }
@@ -641,7 +646,7 @@ pub(crate) fn draw_icon_content(
 ) {
     match icon {
         ResolvedIcon::Builtin(builtin) => {
-            draw_builtin_content(ctx, style, bounds, *builtin, template, colors);
+            draw_builtin_content(ctx, style, bounds, &[*builtin], template, colors);
         }
         ResolvedIcon::None => {
             draw_text_pill(ctx, style, bounds, &icon_as_text(template, None), colors);
@@ -657,16 +662,35 @@ pub(crate) fn draw_icon_content(
     }
 }
 
-/// Draw a built-in vector icon and its text runs across `bounds`.
+/// Paint an icon `template` whose successive `{icon}` markers are drawn with
+/// successive entries from `icons`, letting a widget pair distinct icons with
+/// distinct readouts — a cpu icon before the CPU load, a memory icon before the
+/// memory load. When the template holds more markers than `icons` supplies, the
+/// last icon repeats. This is the multi-icon cousin of [`draw_icon_content`]'s
+/// built-in path; a custom glyph or the opted-out state stays on
+/// [`draw_icon_content`], which renders through the single-icon text pill.
+pub(crate) fn draw_builtin_icons(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    icons: &[BuiltinIcon],
+    template: &str,
+    colors: StateColors,
+) {
+    draw_builtin_content(ctx, style, bounds, icons, template, colors);
+}
+
+/// Draw the built-in vector icons and text runs of `template` across `bounds`,
+/// consuming `icons` one per `{icon}` marker (saturating to the last entry).
 fn draw_builtin_content(
     ctx: &mut RenderContext,
     style: &WidgetStyle,
     bounds: Bounds,
-    builtin: BuiltinIcon,
+    icons: &[BuiltinIcon],
     template: &str,
     colors: StateColors,
 ) {
-    if bounds.width == 0 || bounds.height == 0 {
+    if bounds.width == 0 || bounds.height == 0 || icons.is_empty() {
         return;
     }
     let edge = ctx.icon_edge();
@@ -689,12 +713,15 @@ fn draw_builtin_content(
     let gap = icon_gap(edge);
     let pad = style.padding * scale;
     let mut x = bounds.x + pad;
+    let mut icon_slot = 0;
     for (index, content) in boxes.iter().enumerate() {
         if index > 0 {
             x += gap;
         }
         match &content.text {
             None => {
+                let builtin = icons[icon_slot.min(icons.len() - 1)];
+                icon_slot += 1;
                 let iy = bounds.y + bounds.height.saturating_sub(edge) / 2;
                 ctx.draw_builtin_icon(builtin, Bounds::new(x, iy, edge, edge), colors.foreground);
             }

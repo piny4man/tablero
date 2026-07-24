@@ -459,7 +459,10 @@ impl WidgetStyleConfig {
                 self.charging,
                 StateColors {
                     background,
-                    foreground,
+                    // A charging battery reads green by default (the widget's
+                    // built-in charging accent), while still inheriting the base
+                    // pill background and border so only the glyph/text recolors.
+                    foreground: defaults.charging.foreground,
                     border,
                 },
             ),

@@ -6,12 +6,31 @@ use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, IconSetting, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
-    draw_icon_content, measure_icon_content,
+    ClickButton, Command, IconSetting, Msg, ResolvedIcon, StateColors, Tooltip, Widget,
+    WidgetStyle, draw_icon_content, measure_icon_content,
 };
 
 const DEFAULT_FORMAT: &str = "{icon}";
 const DEFAULT_TOOLTIP_FORMAT: &str = "Power profile: {profile}\nDriver: {driver}";
+
+/// Built-in per-profile foreground accents, following the ARC Raiders palette:
+/// power-saver green, balanced blue, performance yellow. They recolor the glyph
+/// (and any label/text override) while preserving the configured pill background
+/// and border; a profile outside the three standard names keeps the base color.
+const PROFILE_SAVER: (u8, u8, u8, u8) = (0x2D, 0xF1, 0x85, 0xFF);
+const PROFILE_BALANCED: (u8, u8, u8, u8) = (0x4C, 0xA6, 0xFF, 0xFF);
+const PROFILE_PERFORMANCE: (u8, u8, u8, u8) = (0xF9, 0xCF, 0x07, 0xFF);
+
+/// The built-in foreground accent for a daemon profile name, or `None` for any
+/// profile outside the three standard names.
+fn accent_for_profile(name: &str) -> Option<(u8, u8, u8, u8)> {
+    match name {
+        "power-saver" => Some(PROFILE_SAVER),
+        "balanced" => Some(PROFILE_BALANCED),
+        "performance" => Some(PROFILE_PERFORMANCE),
+        _ => None,
+    }
+}
 
 /// The built-in vector icon for a daemon profile name, defaulting to the
 /// balanced icon for any profile outside the three standard names.
@@ -269,6 +288,18 @@ impl PowerProfilesWidget {
         self.state.as_ref()?.active()
     }
 
+    /// The base colors with the foreground shifted to the active profile's
+    /// built-in accent (green saver, blue balanced, yellow performance), keeping
+    /// the configured pill background and border. An unknown profile — or none —
+    /// keeps the base foreground.
+    fn state_colors(&self) -> StateColors {
+        let base = self.style.base_colors();
+        match self.active().and_then(|p| accent_for_profile(p.name())) {
+            Some(foreground) => StateColors { foreground, ..base },
+            None => base,
+        }
+    }
+
     /// The plain-text glyph for `{icon}` in a tooltip: a custom override, a
     /// user-configured named glyph, or empty (the built-in vector icon has no
     /// text form to place in a tooltip string).
@@ -331,7 +362,7 @@ impl Widget for PowerProfilesWidget {
             self.bounds,
             &self.icon(),
             &self.template(),
-            self.style.base_colors(),
+            self.state_colors(),
         );
     }
 
@@ -403,6 +434,34 @@ mod tests {
             widget.icon(),
             ResolvedIcon::Builtin(BuiltinIcon::PowerProfileSaver)
         );
+    }
+
+    #[test]
+    fn each_profile_recolors_the_foreground_to_its_accent() {
+        let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32));
+        let base = WidgetStyle::default().base_colors();
+        widget.update(&state("power-saver"));
+        assert_eq!(widget.state_colors().foreground, PROFILE_SAVER);
+        widget.update(&state("balanced"));
+        assert_eq!(widget.state_colors().foreground, PROFILE_BALANCED);
+        // The pill background/border come from the base style, unchanged.
+        assert_eq!(widget.state_colors().background, base.background);
+        assert_eq!(widget.state_colors().border, base.border);
+        widget.update(&state("performance"));
+        assert_eq!(widget.state_colors().foreground, PROFILE_PERFORMANCE);
+    }
+
+    #[test]
+    fn an_unknown_or_absent_profile_keeps_the_base_colors() {
+        let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32));
+        // No reading yet: base colors.
+        assert_eq!(widget.state_colors(), WidgetStyle::default().base_colors());
+        // A profile outside the three standard names is not recolored.
+        widget.update(&Msg::PowerProfiles(Some(PowerProfilesState::new(
+            "turbo",
+            vec![PowerProfile::new("turbo", "driver", "cpu", "platform")],
+        ))));
+        assert_eq!(widget.state_colors(), WidgetStyle::default().base_colors());
     }
 
     #[test]

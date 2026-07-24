@@ -68,11 +68,11 @@ radius = 2
 padding = 12
 icon = "none"
 
+# App tray icons arrive pre-rendered from each application, so a panel plate and
+# outline only box them in and clash with their own colors. Left transparent, the
+# icons sit directly on the bar the way Waybar renders them — sharp and self-styled.
 [widget.tray]
-background = "#1c0e1ee8"
 foreground = "#eae2cf"
-border = "#3d1f3a"
-border-width = 1
 radius = 2
 padding = 6
 
@@ -191,12 +191,9 @@ padding = 8
 format = "{icon}"
 tooltip = true
 tooltip-format = "POWER MODE: {profile}\nDRIVER: {driver}"
-
-[widget.power-profiles-daemon.format-icons]
-default = ""
-performance = ""
-balanced = ""
-power-saver = ""
+# No `format-icons` map: the built-in vector icons carry their own accent per
+# profile — green for power-saver, blue for balanced, yellow for performance.
+# Set a `format-icons` table here to override them with your own text glyphs.
 
 # Cyan means the idle daemon is protecting the session; red means it is paused.
 # Left-click toggles the native Hypridle process state without a helper script.

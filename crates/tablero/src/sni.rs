@@ -213,12 +213,15 @@ pub fn menu_mode(menu_path: Option<&str>, item_is_menu: Option<bool>) -> TrayMen
     }
 }
 
-/// Resolve an item's icon: prefer an embedded pixmap, else a themed PNG.
+/// Resolve an item's icon: prefer the sharper source between a themed PNG and an
+/// embedded pixmap.
 ///
-/// Pixmaps are self-contained and need no theme lookup, so they win when present;
-/// otherwise the icon name is resolved against the item's `IconThemePath` and the
-/// standard system icon directories. Any failure along the themed path (no file,
-/// unreadable, undecodable) yields `None` — the item simply shows its initial.
+/// Items often ship a small embedded `IconPixmap` (commonly 22×22) alongside a
+/// richer themed icon; upscaling the small pixmap is what makes a tray icon look
+/// blocky next to hosts like Waybar that favor the themed art. So both sources
+/// are resolved and the larger by pixel area wins — the themed icon on a tie, as
+/// it is typically the crisper, purpose-built asset. An item that ships only one
+/// source uses it; one that ships neither yields `None` and shows its initial.
 ///
 /// The PNG read is async so it never blocks the single-worker producer runtime.
 async fn resolve_icon(
@@ -226,13 +229,41 @@ async fn resolve_icon(
     pixmaps: &[RawPixmap],
     theme_path: &str,
 ) -> Option<TrayIcon> {
-    if let Some(icon) = select_pixmap(pixmaps) {
-        return Some(icon);
-    }
+    let pixmap = select_pixmap(pixmaps);
+    let themed = resolve_themed_icon(icon_name, theme_path).await;
+    richer_icon(themed, pixmap)
+}
+
+/// Resolve `icon_name` against the item's `IconThemePath` and the standard system
+/// icon directories, decoding the first match. Any failure along the way (no
+/// file, unreadable, undecodable) yields `None`.
+async fn resolve_themed_icon(icon_name: &str, theme_path: &str) -> Option<TrayIcon> {
     let dirs = icon_search_dirs(theme_path);
     let file = find_icon_file(icon_name, &dirs)?;
     let bytes = tokio::fs::read(file).await.ok()?;
     TrayIcon::from_png_bytes(&bytes).ok()
+}
+
+/// Pick the sharper of a themed icon and an embedded pixmap: the one with the
+/// larger pixel area, with the themed art winning ties (it is the purpose-built
+/// asset). Falls back to whichever single source is present, or `None` when
+/// neither is.
+fn richer_icon(themed: Option<TrayIcon>, pixmap: Option<TrayIcon>) -> Option<TrayIcon> {
+    match (themed, pixmap) {
+        (Some(themed), Some(pixmap)) => {
+            if icon_area(&pixmap) > icon_area(&themed) {
+                Some(pixmap)
+            } else {
+                Some(themed)
+            }
+        }
+        (themed, pixmap) => themed.or(pixmap),
+    }
+}
+
+/// A tray icon's pixel area, the size proxy [`richer_icon`] compares on.
+fn icon_area(icon: &TrayIcon) -> u64 {
+    u64::from(icon.width()) * u64::from(icon.height())
 }
 
 /// The directories to search for a themed icon PNG, most specific first.
@@ -1419,6 +1450,30 @@ mod tests {
         let truncated = (4, 4, vec![0, 0, 0, 0]); // claims 64 bytes, has 4
         assert!(select_pixmap(&[zero, truncated]).is_none());
         assert!(select_pixmap(&[]).is_none());
+    }
+
+    #[test]
+    fn richer_icon_prefers_the_larger_source_and_ties_go_to_themed() {
+        // Distinct sizes and colors so the winner is identifiable.
+        let themed = TrayIcon::from_argb32(1, 1, &[255, 255, 0, 0]).unwrap();
+        let bigger_pixmap = TrayIcon::from_argb32(2, 2, &[255; 16]).unwrap();
+        // The larger pixmap wins over a small themed icon.
+        let chosen = richer_icon(Some(themed.clone()), Some(bigger_pixmap.clone()))
+            .expect("a source is chosen");
+        assert_eq!((chosen.width(), chosen.height()), (2, 2));
+
+        // Equal area: the themed art wins the tie as the purpose-built asset.
+        let small_pixmap = TrayIcon::from_argb32(1, 1, &[255, 0, 255, 0]).unwrap();
+        let chosen = richer_icon(Some(themed.clone()), Some(small_pixmap)).unwrap();
+        assert_eq!(chosen, themed);
+
+        // A single present source is used regardless of which it is.
+        assert_eq!(richer_icon(Some(themed.clone()), None), Some(themed));
+        assert_eq!(
+            richer_icon(None, Some(bigger_pixmap.clone())),
+            Some(bigger_pixmap)
+        );
+        assert!(richer_icon(None, None).is_none());
     }
 
     #[test]

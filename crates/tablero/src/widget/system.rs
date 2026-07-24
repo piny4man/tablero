@@ -4,14 +4,21 @@
 //! [`Msg::System`]; [`SystemWidget`] renders it, repainting
 //! only when a visible percentage actually changes.
 //!
-//! Both readings are whole-percent CPU and memory load, so the widget shows a
-//! compact `CPU x% MEM y%` the user reads at a glance — basic system pressure
+//! Both readings are whole-percent CPU and memory load, shown compactly at a
+//! glance: a cpu icon and a memory icon each labeling their own percent, or the
+//! spelled-out `CPU x% MEM y%` when icons are opted out — basic system pressure
 //! without opening another tool.
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
+use super::{
+    Msg, ResolvedIcon, Widget, WidgetStyle, draw_builtin_icons, draw_icon_content,
+    measure_icon_content,
+};
+
+/// The built-in icons for the readout's two slots: cpu load, then memory load.
+const SYSTEM_ICONS: [BuiltinIcon; 2] = [BuiltinIcon::System, BuiltinIcon::Memory];
 
 /// A normalized snapshot of system pressure: CPU and memory load, each a whole
 /// percent.
@@ -109,18 +116,31 @@ impl SystemWidget {
         self.state.map(SystemStats::label).unwrap_or_default()
     }
 
-    /// The pill template: an `{icon}` slot paired with the load readout, or
-    /// empty before the first sample (so the widget reserves no slot).
+    /// The pill template, or empty before the first sample (so the widget
+    /// reserves no slot).
+    ///
+    /// With the built-in icons, each `{icon}` slot labels its own percent — a cpu
+    /// icon before CPU load, a memory icon before memory load — so the readout
+    /// stays legible without the `CPU`/`MEM` words. A custom glyph or the
+    /// opted-out state keeps the spelled-out labels behind a single leading slot,
+    /// so the readout is unambiguous when there is no per-stat icon to name it.
     fn template(&self) -> String {
-        match self.state {
-            Some(stats) => format!("{{icon}} {}", stats.label()),
-            None => String::new(),
+        let Some(stats) = self.state else {
+            return String::new();
+        };
+        match self.icon() {
+            ResolvedIcon::Builtin(_) => {
+                format!("{{icon}} {}% {{icon}} {}%", stats.cpu(), stats.mem())
+            }
+            _ => format!("{{icon}} {}", stats.label()),
         }
     }
 
     /// The system icon, resolved against its [`System`](BuiltinIcon::System)
-    /// default so a custom `icon`/`icon = "none"` still overrides it. `None`
-    /// before the first sample (nothing to show).
+    /// default so a custom `icon`/`icon = "none"` still overrides it. This is the
+    /// widget's icon *setting* — [`Builtin`](ResolvedIcon::Builtin) means the pair
+    /// of built-in icons in [`SYSTEM_ICONS`] is drawn, one per slot. `None` before
+    /// the first sample (nothing to show).
     fn icon(&self) -> ResolvedIcon {
         match self.state {
             Some(_) => self.style.resolve_icon(BuiltinIcon::System),
@@ -146,14 +166,24 @@ impl Widget for SystemWidget {
     fn draw(&self, ctx: &mut RenderContext) {
         // Before the first sample the template is empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
-        draw_icon_content(
-            ctx,
-            &self.style,
-            self.bounds,
-            &self.icon(),
-            &self.template(),
-            self.style.base_colors(),
-        );
+        let template = self.template();
+        let colors = self.style.base_colors();
+        match self.icon() {
+            // Two distinct built-in icons, one per slot (cpu, then memory).
+            ResolvedIcon::Builtin(_) => {
+                draw_builtin_icons(
+                    ctx,
+                    &self.style,
+                    self.bounds,
+                    &SYSTEM_ICONS,
+                    &template,
+                    colors,
+                );
+            }
+            // A custom glyph or the opted-out state renders through the single-icon
+            // text pill, exactly as before per-stat icons existed.
+            other => draw_icon_content(ctx, &self.style, self.bounds, &other, &template, colors),
+        }
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
@@ -255,13 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn template_pairs_the_system_icon_with_the_readout() {
+    fn template_gives_each_built_in_icon_its_own_percent() {
         let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
         // Nothing to show before the first sample: no icon, no slot.
         assert_eq!(widget.icon(), ResolvedIcon::None);
         assert_eq!(widget.template(), "");
         widget.update(&stats(12.0, 47.0));
-        assert_eq!(widget.template(), "{icon} CPU 12% MEM 47%");
+        // With built-in icons, a cpu slot labels the CPU percent and a memory slot
+        // labels the memory percent — no spelled-out words.
+        assert_eq!(widget.template(), "{icon} 12% {icon} 47%");
         assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::System));
     }
 

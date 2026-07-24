@@ -121,6 +121,16 @@ impl Battery {
     }
 }
 
+/// Discharging-battery foreground by charge tier, following the ARC Raiders
+/// palette: a healthy pack on battery power shifts orange → yellow → green as it
+/// fills. The critical tier below the style's `warn_threshold` is painted by the
+/// configurable [`warn`](WidgetStyle::warn) colors, and a charging pack by the
+/// [`charging`](WidgetStyle::charging) colors, so these three cover the
+/// everyday-discharge range.
+const LEVEL_LOW: (u8, u8, u8, u8) = (0xF5, 0xC7, 0x0F, 0xFF);
+const LEVEL_MID: (u8, u8, u8, u8) = (0xF9, 0xCF, 0x07, 0xFF);
+const LEVEL_HIGH: (u8, u8, u8, u8) = (0x2D, 0xF1, 0x85, 0xFF);
+
 /// The default semantic icon for a battery snapshot: a charging bolt while power
 /// is flowing in, a full battery when topped off, otherwise a low/half/full
 /// battery picked by charge tercile.
@@ -205,8 +215,9 @@ impl BatteryWidget {
         self.style.resolve_icon(default_icon(battery))
     }
 
-    /// The pill colors for the current reading: the style's warn colors when a
-    /// discharging battery is below its threshold, otherwise the base colors.
+    /// The pill colors for the current reading: the style's charging colors while
+    /// power is flowing in, its warn colors when a discharging battery is below
+    /// its threshold, otherwise the base colors recolored by charge tier.
     fn state_colors(&self, battery: Battery) -> StateColors {
         if battery.state() == BatteryState::Charging {
             self.style.charging
@@ -215,7 +226,23 @@ impl BatteryWidget {
         {
             self.style.warn
         } else {
-            self.style.base_colors()
+            self.level_colors(battery.percent())
+        }
+    }
+
+    /// The base colors with the foreground shifted to the charge-tier color, so a
+    /// healthy pack on battery power reads orange → yellow → green as it fills
+    /// while the configured pill background and border are preserved. The
+    /// critical tier is handled separately by [`warn`](WidgetStyle::warn).
+    fn level_colors(&self, percent: u8) -> StateColors {
+        let foreground = match percent {
+            0..=40 => LEVEL_LOW,
+            41..=70 => LEVEL_MID,
+            _ => LEVEL_HIGH,
+        };
+        StateColors {
+            foreground,
+            ..self.style.base_colors()
         }
     }
 }
@@ -452,27 +479,44 @@ mod tests {
     #[test]
     fn a_low_discharging_battery_uses_the_warn_colors() {
         // Default style, default 20% threshold: below it while discharging swaps
-        // to the warn colors; at or above it keeps the base colors.
+        // to the warn colors.
         let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
         let style = WidgetStyle::default();
         assert_eq!(
             widget.state_colors(Battery::new(BatteryState::Discharging, 15.0)),
             style.warn
         );
-        assert_eq!(
-            widget.state_colors(Battery::new(BatteryState::Discharging, 50.0)),
-            style.base_colors()
-        );
     }
 
     #[test]
-    fn a_low_battery_on_ac_keeps_the_base_colors() {
-        // The warn swap is for *discharging* only: a low battery that is charging
-        // is recovering, not in trouble, so it stays in the base colors.
+    fn a_healthy_discharging_battery_recolors_by_charge_tier() {
+        // At or above the warn threshold the foreground steps orange → yellow →
+        // green with the charge, while the base background and border are kept.
+        let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        let base = WidgetStyle::default().base_colors();
+        let fg = |percent| {
+            widget
+                .state_colors(Battery::new(BatteryState::Discharging, percent))
+                .foreground
+        };
+        assert_eq!(fg(30.0), LEVEL_LOW);
+        assert_eq!(fg(55.0), LEVEL_MID);
+        assert_eq!(fg(90.0), LEVEL_HIGH);
+        // Only the foreground moves; the pill fill and border stay the base ones.
+        let colors = widget.state_colors(Battery::new(BatteryState::Discharging, 55.0));
+        assert_eq!(colors.background, base.background);
+        assert_eq!(colors.border, base.border);
+    }
+
+    #[test]
+    fn a_battery_on_ac_uses_the_charging_colors() {
+        // The warn swap is for *discharging* only: a battery that is charging is
+        // recovering, not in trouble, so it takes the charging colors (green by
+        // default) regardless of level.
         let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
         assert_eq!(
             widget.state_colors(Battery::new(BatteryState::Charging, 5.0)),
-            WidgetStyle::default().base_colors()
+            WidgetStyle::default().charging
         );
     }
 
