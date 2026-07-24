@@ -1,0 +1,17 @@
+[package]
+name = "icongen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Dev tool: flatten icons/*.svg into tablero's builtin_icon_paths.rs"
+
+# This crate is a build-time code generator, never linked into the tablero
+# binary. Its SVG-parsing dependencies (roxmltree, svgtypes) therefore never
+# reach the shipped crate — they exist only to regenerate the flattened, static
+# path tables that tablero renders with tiny-skia at runtime.
+[dependencies]
+roxmltree = "0.20"
+svgtypes = "0.15"
+
+[lints]
+workspace = true

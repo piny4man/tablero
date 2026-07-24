@@ -7,14 +7,13 @@
 
 use std::path::PathBuf;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Tooltip, Widget, WidgetStyle, draw_text_pill, measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
+    measure_icon_content,
 };
-
-/// Default package glyph: Font Awesome cube (`nf-fa-cube`).
-const UPDATES_GLYPH: &str = "\u{f1b2}";
 
 /// Validate the placeholders accepted by [`UpdatesWidget`].
 pub fn validate_updates_format(format: &str) -> Result<(), String> {
@@ -161,16 +160,24 @@ impl UpdatesWidget {
             .unwrap_or_default()
     }
 
-    fn display_text(&self) -> String {
+    /// The format template — the icon slot marked by `{icon}`, with `{count}`
+    /// already substituted — or empty while no updates are available (so the
+    /// widget reserves no slot).
+    fn template(&self) -> String {
         let Some(updates) = &self.state else {
             return String::new();
         };
-        let icon = self.style.glyph(UPDATES_GLYPH);
         let count = updates.total().to_string();
         match &self.format {
-            Some(format) => format.replace("{count}", &count).replace("{icon}", icon),
-            None => format!("{icon} {count}"),
+            Some(format) => format.replace("{count}", &count),
+            None => format!("{{icon}} {count}"),
         }
+    }
+
+    /// The updates icon resolved against its [`Updates`](BuiltinIcon::Updates)
+    /// default.
+    fn icon(&self) -> ResolvedIcon {
+        self.style.resolve_icon(BuiltinIcon::Updates)
     }
 
     fn tooltip_text(&self) -> Option<String> {
@@ -223,17 +230,18 @@ impl Widget for UpdatesWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -325,15 +333,16 @@ mod tests {
         widget.update(&updates(7, 3));
         assert!(widget.update(&Msg::Updates(None)));
         assert_eq!(widget.label(), "");
-        assert_eq!(widget.display_text(), "");
+        assert_eq!(widget.template(), "");
     }
 
     #[test]
-    fn configured_format_substitutes_count_and_icon() {
+    fn configured_format_keeps_the_icon_slot_and_substitutes_count() {
         let mut widget = UpdatesWidget::new(Bounds::new(0, 0, 100, 32))
             .with_format(Some("{count}{icon}".to_string()));
         widget.update(&updates(4, 2));
-        assert_eq!(widget.display_text(), format!("6{UPDATES_GLYPH}"));
+        assert_eq!(widget.template(), "6{icon}");
+        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::Updates));
     }
 
     #[test]

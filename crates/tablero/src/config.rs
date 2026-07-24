@@ -33,8 +33,9 @@
 //! accent     = "#eaeaea"
 //!
 //! [font]
-//! # family is unset by default (the system default font is used; a Nerd Font is
-//! # recommended so widget glyph icons render).
+//! # family is unset by default (the system default font is used). Widget icons
+//! # are built-in vector art, so no icon font is needed; a Nerd Font only matters
+//! # if you set custom text glyphs via `icon`/`format-icons`.
 //! size = 16.0
 //!
 //! # Per-widget styling is opt-in; an absent [widget.<name>] table leaves that
@@ -458,7 +459,10 @@ impl WidgetStyleConfig {
                 self.charging,
                 StateColors {
                     background,
-                    foreground,
+                    // A charging battery reads green by default (the widget's
+                    // built-in charging accent), while still inheriting the base
+                    // pill background and border so only the glyph/text recolors.
+                    foreground: defaults.charging.foreground,
                     border,
                 },
             ),

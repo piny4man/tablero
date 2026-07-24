@@ -15,12 +15,10 @@
 
 use std::path::PathBuf;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
-
-/// Bluetooth brand glyph (Font Awesome, via Nerd Font).
-const BLUETOOTH_GLYPH: &str = "\u{f294}"; // nf-fa-bluetooth
+use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
 
 /// The power state of the local Bluetooth adapter, normalized from BlueZ.
 ///
@@ -170,10 +168,16 @@ impl BluetoothWidget {
         self.state.label()
     }
 
-    /// The full pill text: the bluetooth glyph joined to the label. Always
-    /// non-empty, so the widget always reserves a slot.
-    fn display_text(&self) -> String {
-        glyph_label(self.style.glyph(BLUETOOTH_GLYPH), &self.state.label())
+    /// The format template — the icon slot marked by `{icon}` ahead of the label.
+    /// Always non-empty, so the widget always reserves a slot.
+    fn template(&self) -> String {
+        format!("{{icon}} {}", self.state.label())
+    }
+
+    /// The bluetooth icon resolved against its
+    /// [`Bluetooth`](BuiltinIcon::Bluetooth) default.
+    fn icon(&self) -> ResolvedIcon {
+        self.style.resolve_icon(BuiltinIcon::Bluetooth)
     }
 }
 
@@ -194,17 +198,18 @@ impl Widget for BluetoothWidget {
     fn draw(&self, ctx: &mut RenderContext) {
         // Always draws: the initial Unavailable state still has a non-empty
         // label, so the slot is reserved from the very first frame.
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -352,20 +357,16 @@ mod tests {
     }
 
     #[test]
-    fn display_text_prefixes_the_bluetooth_glyph() {
+    fn template_marks_the_icon_slot_before_the_label() {
         let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32));
-        // Initial Unavailable state already shows the glyph + label.
-        assert_eq!(
-            widget.display_text(),
-            format!("{BLUETOOTH_GLYPH} unavailable")
-        );
+        // The bluetooth icon is constant; only the label tracks state.
+        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::Bluetooth));
+        // Initial Unavailable state already reserves the icon slot + label.
+        assert_eq!(widget.template(), "{icon} unavailable");
         widget.update(&bt(BluetoothState::On, 2));
-        assert_eq!(
-            widget.display_text(),
-            format!("{BLUETOOTH_GLYPH} 2 connected")
-        );
+        assert_eq!(widget.template(), "{icon} 2 connected");
         widget.update(&bt(BluetoothState::Off, 0));
-        assert_eq!(widget.display_text(), format!("{BLUETOOTH_GLYPH} off"));
+        assert_eq!(widget.template(), "{icon} off");
     }
 
     #[test]

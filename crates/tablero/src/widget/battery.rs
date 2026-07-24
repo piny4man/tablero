@@ -9,10 +9,11 @@
 //! its first reading, so a laptop without a battery never paints a stale or
 //! placeholder value.
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    Msg, StateColors, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+    Msg, ResolvedIcon, StateColors, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
 };
 
 /// Validate the battery format placeholders accepted by [`BatteryWidget`].
@@ -41,15 +42,6 @@ pub fn validate_battery_format(format: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
-/// Default battery glyphs (Font Awesome, via Nerd Font): a discharge ramp picked
-/// by charge quintile, plus a bolt shown while charging or topped off on AC.
-const BATTERY_EMPTY: &str = "\u{f244}"; // nf-fa-battery_empty
-const BATTERY_QUARTER: &str = "\u{f243}"; // nf-fa-battery_quarter
-const BATTERY_HALF: &str = "\u{f242}"; // nf-fa-battery_half
-const BATTERY_THREE_QUARTERS: &str = "\u{f241}"; // nf-fa-battery_three_quarters
-const BATTERY_FULL: &str = "\u{f240}"; // nf-fa-battery_full
-const BATTERY_CHARGING: &str = "\u{f0e7}"; // nf-fa-bolt
 
 /// The charge direction of a battery, normalized from a raw power-daemon state.
 ///
@@ -129,17 +121,27 @@ impl Battery {
     }
 }
 
-/// The default glyph for a battery snapshot: a bolt while charging or full on AC,
-/// otherwise the discharge ramp picked by charge quintile.
-fn default_glyph(battery: Battery) -> &'static str {
+/// Discharging-battery foreground by charge tier, following the ARC Raiders
+/// palette: a healthy pack on battery power shifts orange → yellow → green as it
+/// fills. The critical tier below the style's `warn_threshold` is painted by the
+/// configurable [`warn`](WidgetStyle::warn) colors, and a charging pack by the
+/// [`charging`](WidgetStyle::charging) colors, so these three cover the
+/// everyday-discharge range.
+const LEVEL_LOW: (u8, u8, u8, u8) = (0xF5, 0xC7, 0x0F, 0xFF);
+const LEVEL_MID: (u8, u8, u8, u8) = (0xF9, 0xCF, 0x07, 0xFF);
+const LEVEL_HIGH: (u8, u8, u8, u8) = (0x2D, 0xF1, 0x85, 0xFF);
+
+/// The default semantic icon for a battery snapshot: a charging bolt while power
+/// is flowing in, a full battery when topped off, otherwise a low/half/full
+/// battery picked by charge tercile.
+fn default_icon(battery: Battery) -> BuiltinIcon {
     match battery.state() {
-        BatteryState::Charging | BatteryState::Full => BATTERY_CHARGING,
+        BatteryState::Charging => BuiltinIcon::BatteryCharging,
+        BatteryState::Full => BuiltinIcon::BatteryFull,
         _ => match battery.percent() {
-            0..=19 => BATTERY_EMPTY,
-            20..=39 => BATTERY_QUARTER,
-            40..=59 => BATTERY_HALF,
-            60..=79 => BATTERY_THREE_QUARTERS,
-            _ => BATTERY_FULL,
+            0..=33 => BuiltinIcon::BatteryLow,
+            34..=66 => BuiltinIcon::BatteryHalf,
+            _ => BuiltinIcon::BatteryFull,
         },
     }
 }
@@ -193,26 +195,29 @@ impl BatteryWidget {
         self.state.map(Battery::label).unwrap_or_default()
     }
 
-    /// The full pill text: the state-derived glyph joined to the label, or empty
-    /// when no battery is present (so the widget reserves no slot).
-    fn display_text(&self) -> String {
+    /// The format template — the icon slot marked by `{icon}`, with `{percent}`
+    /// and `{state}` already substituted — or empty when no battery is present (so
+    /// the widget reserves no slot).
+    fn template(&self) -> String {
         match self.state {
-            Some(battery) => {
-                let icon = self.style.glyph(default_glyph(battery));
-                match &self.format {
-                    Some(format) => format
-                        .replace("{icon}", icon)
-                        .replace("{percent}", &battery.percent().to_string())
-                        .replace("{state}", battery.state().label()),
-                    None => glyph_label(icon, &battery.label()),
-                }
-            }
+            Some(battery) => match &self.format {
+                Some(format) => format
+                    .replace("{percent}", &battery.percent().to_string())
+                    .replace("{state}", battery.state().label()),
+                None => format!("{{icon}} {}", battery.label()),
+            },
             None => String::new(),
         }
     }
 
-    /// The pill colors for the current reading: the style's warn colors when a
-    /// discharging battery is below its threshold, otherwise the base colors.
+    /// The battery's icon resolved against the state-derived semantic default.
+    fn icon(&self, battery: Battery) -> ResolvedIcon {
+        self.style.resolve_icon(default_icon(battery))
+    }
+
+    /// The pill colors for the current reading: the style's charging colors while
+    /// power is flowing in, its warn colors when a discharging battery is below
+    /// its threshold, otherwise the base colors recolored by charge tier.
     fn state_colors(&self, battery: Battery) -> StateColors {
         if battery.state() == BatteryState::Charging {
             self.style.charging
@@ -221,7 +226,23 @@ impl BatteryWidget {
         {
             self.style.warn
         } else {
-            self.style.base_colors()
+            self.level_colors(battery.percent())
+        }
+    }
+
+    /// The base colors with the foreground shifted to the charge-tier color, so a
+    /// healthy pack on battery power reads orange → yellow → green as it fills
+    /// while the configured pill background and border are preserved. The
+    /// critical tier is handled separately by [`warn`](WidgetStyle::warn).
+    fn level_colors(&self, percent: u8) -> StateColors {
+        let foreground = match percent {
+            0..=40 => LEVEL_LOW,
+            41..=70 => LEVEL_MID,
+            _ => LEVEL_HIGH,
+        };
+        StateColors {
+            foreground,
+            ..self.style.base_colors()
         }
     }
 }
@@ -244,18 +265,24 @@ impl Widget for BatteryWidget {
         // An absent battery draws nothing: the dashboard has already cleared the
         // background, so the widget's slot is left blank.
         if let Some(battery) = self.state {
-            draw_text_pill(
+            draw_icon_content(
                 ctx,
                 &self.style,
                 self.bounds,
-                &self.display_text(),
+                &self.icon(battery),
+                &self.template(),
                 self.state_colors(battery),
             );
         }
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        match self.state {
+            Some(battery) => {
+                measure_icon_content(ctx, &self.style, &self.icon(battery), &self.template())
+            }
+            None => 0,
+        }
     }
 
     fn bounds(&self) -> Bounds {
@@ -380,44 +407,38 @@ mod tests {
     }
 
     #[test]
-    fn default_glyph_ramps_by_quintile_while_discharging() {
-        let glyph = |percent| default_glyph(Battery::new(BatteryState::Discharging, percent));
-        // Each fifth of the charge range steps the ramp up one notch, empty→full.
-        assert_eq!(glyph(0.0), BATTERY_EMPTY);
-        assert_eq!(glyph(19.0), BATTERY_EMPTY);
-        assert_eq!(glyph(20.0), BATTERY_QUARTER);
-        assert_eq!(glyph(39.0), BATTERY_QUARTER);
-        assert_eq!(glyph(40.0), BATTERY_HALF);
-        assert_eq!(glyph(59.0), BATTERY_HALF);
-        assert_eq!(glyph(60.0), BATTERY_THREE_QUARTERS);
-        assert_eq!(glyph(79.0), BATTERY_THREE_QUARTERS);
-        assert_eq!(glyph(80.0), BATTERY_FULL);
-        assert_eq!(glyph(100.0), BATTERY_FULL);
+    fn default_icon_ramps_by_tercile_while_discharging() {
+        let icon = |percent| default_icon(Battery::new(BatteryState::Discharging, percent));
+        // Each third of the charge range steps the ramp up one notch, low→full.
+        assert_eq!(icon(0.0), BuiltinIcon::BatteryLow);
+        assert_eq!(icon(33.0), BuiltinIcon::BatteryLow);
+        assert_eq!(icon(34.0), BuiltinIcon::BatteryHalf);
+        assert_eq!(icon(66.0), BuiltinIcon::BatteryHalf);
+        assert_eq!(icon(67.0), BuiltinIcon::BatteryFull);
+        assert_eq!(icon(100.0), BuiltinIcon::BatteryFull);
     }
 
     #[test]
-    fn charging_or_full_shows_the_bolt_glyph() {
-        // On AC the ramp is irrelevant — a bolt marks power going in or topped off.
+    fn charging_shows_the_bolt_and_full_shows_a_full_battery() {
+        // On AC the ramp is irrelevant — a bolt marks power going in, and a full
+        // battery marks a topped-off pack.
         assert_eq!(
-            default_glyph(Battery::new(BatteryState::Charging, 5.0)),
-            BATTERY_CHARGING
+            default_icon(Battery::new(BatteryState::Charging, 5.0)),
+            BuiltinIcon::BatteryCharging
         );
         assert_eq!(
-            default_glyph(Battery::new(BatteryState::Full, 100.0)),
-            BATTERY_CHARGING
+            default_icon(Battery::new(BatteryState::Full, 100.0)),
+            BuiltinIcon::BatteryFull
         );
     }
 
     #[test]
-    fn display_text_prefixes_the_state_glyph() {
+    fn template_marks_the_icon_slot_before_the_label() {
         let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
-        // Nothing to show before the first reading: no glyph, no slot.
-        assert_eq!(widget.display_text(), "");
+        // Nothing to show before the first reading: no slot.
+        assert_eq!(widget.template(), "");
         widget.update(&battery(BatteryState::Discharging, 85.0));
-        assert_eq!(
-            widget.display_text(),
-            format!("{BATTERY_FULL} 85% discharging")
-        );
+        assert_eq!(widget.template(), "{icon} 85% discharging");
     }
 
     #[test]
@@ -425,7 +446,8 @@ mod tests {
         let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32))
             .with_format(Some("{icon} {percent}%".to_string()));
         widget.update(&battery(BatteryState::Charging, 81.0));
-        assert_eq!(widget.display_text(), format!("{BATTERY_CHARGING} 81%"));
+        // `{icon}` stays a marker for the layout helper; `{percent}` is filled in.
+        assert_eq!(widget.template(), "{icon} 81%");
     }
 
     #[test]
@@ -457,27 +479,44 @@ mod tests {
     #[test]
     fn a_low_discharging_battery_uses_the_warn_colors() {
         // Default style, default 20% threshold: below it while discharging swaps
-        // to the warn colors; at or above it keeps the base colors.
+        // to the warn colors.
         let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
         let style = WidgetStyle::default();
         assert_eq!(
             widget.state_colors(Battery::new(BatteryState::Discharging, 15.0)),
             style.warn
         );
-        assert_eq!(
-            widget.state_colors(Battery::new(BatteryState::Discharging, 50.0)),
-            style.base_colors()
-        );
     }
 
     #[test]
-    fn a_low_battery_on_ac_keeps_the_base_colors() {
-        // The warn swap is for *discharging* only: a low battery that is charging
-        // is recovering, not in trouble, so it stays in the base colors.
+    fn a_healthy_discharging_battery_recolors_by_charge_tier() {
+        // At or above the warn threshold the foreground steps orange → yellow →
+        // green with the charge, while the base background and border are kept.
+        let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        let base = WidgetStyle::default().base_colors();
+        let fg = |percent| {
+            widget
+                .state_colors(Battery::new(BatteryState::Discharging, percent))
+                .foreground
+        };
+        assert_eq!(fg(30.0), LEVEL_LOW);
+        assert_eq!(fg(55.0), LEVEL_MID);
+        assert_eq!(fg(90.0), LEVEL_HIGH);
+        // Only the foreground moves; the pill fill and border stay the base ones.
+        let colors = widget.state_colors(Battery::new(BatteryState::Discharging, 55.0));
+        assert_eq!(colors.background, base.background);
+        assert_eq!(colors.border, base.border);
+    }
+
+    #[test]
+    fn a_battery_on_ac_uses_the_charging_colors() {
+        // The warn swap is for *discharging* only: a battery that is charging is
+        // recovering, not in trouble, so it takes the charging colors (green by
+        // default) regardless of level.
         let widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
         assert_eq!(
             widget.state_colors(Battery::new(BatteryState::Charging, 5.0)),
-            WidgetStyle::default().base_colors()
+            WidgetStyle::default().charging
         );
     }
 

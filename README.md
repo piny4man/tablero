@@ -112,10 +112,10 @@ RUST_LOG=info cargo run -p tablero
     that executable directly (no shell), so a typical use is `on-click =
     "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
   - **Volume** — the active output sink's level (`Vol N%`) and mute state
-    (`Mute`), read over the native PipeWire wire protocol. The glyph swaps
-    between headphones / speakers / monitor / phone / TV based on the
-    active sink's device kind, so the user can tell at a glance which
-    output the level they see is on. **Opt-in**: not in the default set;
+    (`Mute`), read over the native PipeWire wire protocol. The icon is a
+    built-in speaker that follows the level — low / medium / high, or a
+    muted variant when muted — so the fill hints at the level at a glance.
+    Switching the active sink still triggers a repaint. **Opt-in**: not in the default set;
     add `"volume"` to a zone to enable it. The widget reserves no slot
     when no PipeWire server is reachable (or no output sink exists),
     matching how the `network` and `system` widgets treat an absent
@@ -271,6 +271,22 @@ background = "#2df18520"
 foreground = "#5ff5a0"
 border = "#2df185"
 ```
+
+Widget icons are **built-in vector art** drawn directly with `tiny-skia`, so no
+icon font, SVG parser, or bundled glyph set is shipped — the icon inherits the
+widget's state colors and scales with the output. Each icon-bearing widget takes
+an `icon` field on its `[widget.<name>]` table:
+
+- omitted → the widget's built-in icon,
+- `icon = "none"` → **opt out**; the widget renders label-only (or nothing, for
+  icon-only widgets like `power`), keeping a simple text look,
+- `icon = "<text>"` → override with any literal string, e.g. a Nerd Font glyph
+  or an emoji, rendered as text in place of the vector icon.
+
+For widgets with a `format`/`format-icons` string (battery, backlight,
+power-profiles-daemon, updates), the `{icon}` placeholder marks where the icon
+sits; a `format-icons` entry supplies a per-state text glyph that overrides the
+built-in art for that state.
 
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget
@@ -534,9 +550,9 @@ surface placement and input need a live compositor. To verify on Hyprland:
  15. Verify the **volume widget** (opt-in: add `"volume"` to a zone). With
      a running PipeWire server (pipewire + wireplumber / pipewire-pulse)
      and at least one output sink configured:
-     - The widget appears with a device-kind glyph (headphones, speakers,
-       monitor, …) and a label of `Vol N%` (where `N` is the active sink's
-       level). On a system with PipeWire but no output sink configured,
+     - The widget appears with a built-in speaker icon whose fill follows the
+       level (low / medium / high) and a label of `Vol N%` (where `N` is the
+       active sink's level). On a system with PipeWire but no output sink configured,
        the widget reserves no slot (matching the `network` / `system`
        pattern); on a system with no PipeWire running, the widget also
        reserves no slot.
@@ -546,14 +562,13 @@ surface placement and input need a live compositor. To verify on Hyprland:
        seconds when the cached state changes). The widget should track
        per-cent: `12%`, `13%`, …
      - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
-       the label flips to `Mute` with the volume-mute glyph; toggling
-       mute back restores `Vol N%` with the device glyph.
+       the label flips to `Mute` with the muted speaker icon; toggling
+       mute back restores `Vol N%` with the level-based icon.
      - With multiple sinks configured (e.g. headphones + monitor speakers),
        play audio through one and confirm the widget tracks *that* sink
        (active sink has its `NodeState` set to `Running`); switching
        playback to a different sink updates the widget to that sink
-       within a poll, and the glyph follows the device kind (e.g.
-       headphones → speakers).
+       within a poll.
      - If a `[widget.volume] on-click = "/path/to/executable"` is set
        (typical: `pavucontrol`), left-click the widget and confirm the
        configured process is spawned (no shell, direct exec). A missing

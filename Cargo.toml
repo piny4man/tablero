@@ -1,7 +1,12 @@
 [workspace]
 members = [
     "crates/tablero",
+    "tools/icongen",
 ]
+# The bar is the only shipped artifact; `icongen` is a build-time SVG flattener.
+# Default builds/tests target just the bar so its lean dependency graph stays the
+# common path — run the generator explicitly with `cargo run -p icongen`.
+default-members = ["crates/tablero"]
 resolver = "2"
 
 # Size-optimized release build. The bar is a long-running daemon whose render

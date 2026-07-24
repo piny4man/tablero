@@ -12,31 +12,27 @@
 //! audio server usually means the user has none, not that the user is interested
 //! in seeing a placeholder.
 //!
-//! The device kind drives the glyph, not the label — the label is the bare
-//! `Vol N%` (or `Mute`) the user reads at a glance, and the glyph is a small
-//! visual hint that swaps between headphones, speakers, monitor, and so on
-//! whenever the active sink changes. Keeping the label short is what keeps the
+//! The level bucket drives the icon, not the label — the label is the bare
+//! `Vol N%` (or `Mute`) the user reads at a glance, and the icon is a small
+//! visual hint that swaps between the low/medium/high/muted speaker glyphs as
+//! the level crosses its thresholds. Keeping the label short is what keeps the
 //! widget narrow enough to live in the right cluster next to the other status
 //! pills.
 
 use std::path::PathBuf;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
-
-/// Glyph drawn when the volume is muted (Font Awesome, via Nerd Font).
-const MUTED_GLYPH: &str = "\u{f6a9}"; // nf-fa-volume-mute
-/// Glyph drawn for the generic "Other" device kind — a plain speaker icon.
-const OTHER_GLYPH: &str = "\u{f028}"; // nf-fa-volume-up
+use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
 
 /// The kind of audio output the active sink represents, derived from the
 /// PipeWire `device.icon-name` (preferred) or `device.form-factor` (fallback).
 ///
-/// The variant drives the widget glyph so the user can tell at a glance whether
-/// the level they see is on their headphones, monitor speakers, USB headset, or
-/// some other device. It is not surfaced in the label — that stays `Vol N%` or
-/// `Mute` regardless of which device is active.
+/// The variant is retained on the snapshot so a sink switch counts as a visible
+/// change worth repainting, even though the rendered icon now follows the
+/// level bucket rather than the device. It is not surfaced in the label — that
+/// stays `Vol N%` or `Mute` regardless of which device is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     /// Headphones (`device.icon-name` in `audio-headphones*` or
@@ -55,28 +51,13 @@ pub enum DeviceKind {
     /// the `Monitor` branch).
     Tv,
     /// Anything the heuristics could not classify (no icon, unknown form
-    /// factor, or a custom value). Renders with the generic volume glyph.
+    /// factor, or a custom value).
     Other,
 }
 
-impl DeviceKind {
-    /// The Nerd Font glyph for this device kind.
-    pub fn glyph(self) -> &'static str {
-        match self {
-            DeviceKind::Headphones => "\u{f025}", // nf-fa-headphones
-            DeviceKind::Headset => "\u{f02ce}",   // nf-md-headset
-            DeviceKind::Speakers => "\u{f0577}",  // nf-md-speaker
-            DeviceKind::Monitor => "\u{f02d3}",   // nf-md-monitor
-            DeviceKind::Phone => "\u{f00e2}",     // nf-md-cellphone
-            DeviceKind::Tv => "\u{f036b}",        // nf-md-television
-            DeviceKind::Other => OTHER_GLYPH,
-        }
-    }
-}
-
 /// A normalized snapshot of the active output sink: the playback level (whole
-/// percent) and the current mute state, plus the device kind that drives the
-/// glyph.
+/// percent) and the current mute state, plus the device kind retained for
+/// change detection.
 ///
 /// Normalization happens once, at the producer boundary, so the widget and the
 /// redraw policy compare clean, canonical values: `level` is clamped to
@@ -117,7 +98,8 @@ impl Volume {
         self.muted
     }
 
-    /// The device kind the snapshot was taken from — drives the glyph.
+    /// The device kind the snapshot was taken from — retained so a sink switch
+    /// registers as a visible change.
     pub fn device(self) -> DeviceKind {
         self.device
     }
@@ -209,21 +191,29 @@ impl VolumeWidget {
         self.state.map(Volume::label).unwrap_or_default()
     }
 
-    /// The full pill text: the device-kind glyph (or muted glyph when muted)
-    /// joined to the label. Empty before the first reading, so the widget
-    /// reserves no slot.
-    fn display_text(&self) -> String {
+    /// The pill template: an `{icon}` slot paired with the level label. Empty
+    /// before the first reading, so the widget reserves no slot.
+    fn template(&self) -> String {
         match &self.state {
-            Some(volume) => {
-                let glyph = if volume.muted {
-                    MUTED_GLYPH
-                } else {
-                    self.style.glyph(volume.device.glyph())
-                };
-                glyph_label(glyph, &volume.label())
-            }
+            Some(volume) => format!("{{icon}} {}", volume.label()),
             None => String::new(),
         }
+    }
+
+    /// The speaker icon for the current level bucket — muted, then low/medium/high
+    /// by percent — resolved against the style so a custom `icon`/`icon = "none"`
+    /// still overrides it. `None` before the first reading (nothing to show).
+    fn icon(&self) -> ResolvedIcon {
+        let default = match &self.state {
+            Some(volume) if volume.muted() => BuiltinIcon::VolumeMuted,
+            Some(volume) => match volume.level() {
+                0..=33 => BuiltinIcon::VolumeLow,
+                34..=66 => BuiltinIcon::VolumeMedium,
+                _ => BuiltinIcon::VolumeHigh,
+            },
+            None => return ResolvedIcon::None,
+        };
+        self.style.resolve_icon(default)
     }
 }
 
@@ -242,19 +232,20 @@ impl Widget for VolumeWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // An absent volume leaves `display_text` empty, so the pill paints
+        // An absent volume leaves the template empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -289,26 +280,6 @@ mod tests {
 
     fn vol(level: f32, muted: bool, device: DeviceKind) -> Msg {
         Msg::Volume(Some(Volume::new(level, muted, device)))
-    }
-
-    #[test]
-    fn device_kind_glyphs_are_distinct() {
-        // The glyph is the only on-screen signal for the device kind, so a
-        // duplicate would be a bug.
-        let all = [
-            DeviceKind::Headphones,
-            DeviceKind::Headset,
-            DeviceKind::Speakers,
-            DeviceKind::Monitor,
-            DeviceKind::Phone,
-            DeviceKind::Tv,
-            DeviceKind::Other,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a.glyph(), b.glyph());
-            }
-        }
     }
 
     #[test]
@@ -462,32 +433,65 @@ mod tests {
     }
 
     #[test]
-    fn display_text_uses_a_device_driven_glyph() {
+    fn icon_reflects_the_level_bucket_and_mute() {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
-        // Nothing to show before the first reading: no glyph, no slot.
-        assert_eq!(widget.display_text(), "");
-        // Unmuted: the device glyph is used.
-        widget.update(&vol(0.5, false, DeviceKind::Headphones));
+        // Nothing to show before the first reading: no icon, no slot.
+        assert_eq!(widget.icon(), ResolvedIcon::None);
+        assert_eq!(widget.template(), "");
+        // Low / medium / high buckets by level.
+        widget.update(&vol(0.10, false, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::VolumeLow));
+        widget.update(&vol(0.50, false, DeviceKind::Speakers));
         assert_eq!(
-            widget.display_text(),
-            format!("{} Vol 50%", DeviceKind::Headphones.glyph())
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::VolumeMedium)
         );
-        // Muted: the muted glyph always wins.
-        widget.update(&vol(0.5, true, DeviceKind::Speakers));
-        assert_eq!(widget.display_text(), format!("{MUTED_GLYPH} Mute"));
+        widget.update(&vol(0.90, false, DeviceKind::Speakers));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::VolumeHigh)
+        );
+        // Muted always wins over the level.
+        widget.update(&vol(0.90, true, DeviceKind::Speakers));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::VolumeMuted)
+        );
     }
 
     #[test]
-    fn display_text_honors_a_custom_icon_setting() {
-        // The widget's resolved WidgetStyle can override the built-in glyph;
-        // the mute override still wins.
+    fn template_pairs_the_icon_slot_with_the_label() {
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
+        widget.update(&vol(0.42, false, DeviceKind::Speakers));
+        assert_eq!(widget.template(), "{icon} Vol 42%");
+        widget.update(&vol(0.42, true, DeviceKind::Speakers));
+        assert_eq!(widget.template(), "{icon} Mute");
+    }
+
+    #[test]
+    fn a_custom_icon_setting_overrides_the_built_in() {
+        // The widget's resolved WidgetStyle can override the built-in icon with
+        // a text glyph of the user's choosing.
         let style = WidgetStyle {
             icon: crate::widget::IconSetting::Custom("\u{f013}".to_string()),
             ..WidgetStyle::default()
         };
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32)).with_style(style);
         widget.update(&vol(0.5, false, DeviceKind::Speakers));
-        assert_eq!(widget.display_text(), "\u{f013} Vol 50%");
+        assert_eq!(widget.icon(), ResolvedIcon::Text("\u{f013}".into()));
+    }
+
+    #[test]
+    fn icon_none_setting_opts_out_but_keeps_the_label() {
+        let style = WidgetStyle {
+            icon: crate::widget::IconSetting::None,
+            ..WidgetStyle::default()
+        };
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32)).with_style(style);
+        widget.update(&vol(0.5, false, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::None);
+        // The level label still shows even with the icon opted out.
+        assert_eq!(widget.template(), "{icon} Vol 50%");
     }
 
     #[test]

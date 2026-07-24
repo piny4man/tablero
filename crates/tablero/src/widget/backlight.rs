@@ -1,15 +1,14 @@
 //! Backlight state and widget rendering.
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    Command, Msg, ScrollDirection, Widget, WidgetStyle, draw_text_pill, measure_text_pill,
+    Command, IconSetting, Msg, ResolvedIcon, ScrollDirection, Widget, WidgetStyle,
+    draw_icon_content, measure_icon_content,
 };
 
-const DEFAULT_FORMAT: &str = "{icon}  {percent}%";
-const DEFAULT_ICONS: &[&str] = &[
-    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-];
+const DEFAULT_FORMAT: &str = "{icon} {percent}%";
 
 /// One kernel backlight device normalized for display and selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +93,9 @@ pub struct BacklightWidget {
     style: WidgetStyle,
     preferred_device: Option<String>,
     format: String,
-    format_icons: Vec<String>,
+    /// A user-supplied `{icon}` ramp. `None` selects the built-in seven-step
+    /// vector brightness ramp; `Some` is a Waybar-style text override.
+    format_icons: Option<Vec<String>>,
     scroll_step: f64,
 }
 
@@ -107,10 +108,7 @@ impl BacklightWidget {
             style: WidgetStyle::default(),
             preferred_device: None,
             format: DEFAULT_FORMAT.to_string(),
-            format_icons: DEFAULT_ICONS
-                .iter()
-                .map(|icon| (*icon).to_string())
-                .collect(),
+            format_icons: None,
             scroll_step: 1.0,
         }
     }
@@ -135,10 +133,11 @@ impl BacklightWidget {
         self
     }
 
-    /// Set the icon ramp used by `{icon}`.
+    /// Set the icon ramp used by `{icon}`, overriding the built-in vector ramp
+    /// with a Waybar-style list of text glyphs.
     pub fn with_format_icons(mut self, icons: Option<Vec<String>>) -> Self {
         if let Some(icons) = icons {
-            self.format_icons = icons;
+            self.format_icons = Some(icons);
         }
         self
     }
@@ -151,25 +150,39 @@ impl BacklightWidget {
         self
     }
 
-    /// Current rendered text, empty while no device is available.
-    pub fn label(&self) -> String {
+    /// The format template — the icon slot marked by `{icon}`, with `{percent}`
+    /// already substituted — or empty while no device is available (so the widget
+    /// reserves no slot).
+    fn template(&self) -> String {
         let Some(backlight) = &self.state else {
             return String::new();
         };
-        let icon = match &self.style.icon {
-            super::IconSetting::Default => self.icon(backlight.percent),
-            super::IconSetting::None => "",
-            super::IconSetting::Custom(icon) => icon,
-        };
         self.format
-            .replace("{icon}", icon)
             .replace("{percent}", &backlight.percent.to_string())
     }
 
-    fn icon(&self, percent: u8) -> &str {
-        let index = (percent as usize * self.format_icons.len()) / 101;
-        &self.format_icons[index]
+    /// The backlight's icon at `percent`: opted out, a fixed custom string, a
+    /// Waybar-style text ramp entry when the user supplied `format-icons`, or the
+    /// built-in seven-step vector ramp otherwise.
+    fn resolved_icon(&self, percent: u8) -> ResolvedIcon {
+        match &self.style.icon {
+            IconSetting::None => ResolvedIcon::None,
+            IconSetting::Custom(icon) => ResolvedIcon::Text(icon.clone()),
+            IconSetting::Default => match &self.format_icons {
+                Some(icons) if !icons.is_empty() => {
+                    let index = (percent as usize * icons.len()) / 101;
+                    ResolvedIcon::Text(icons[index].clone())
+                }
+                _ => ResolvedIcon::Builtin(BuiltinIcon::Backlight(builtin_level(percent))),
+            },
+        }
     }
+}
+
+/// The seven-step built-in brightness ramp position for a percentage, `0` (off)
+/// through `6` (full).
+fn builtin_level(percent: u8) -> u8 {
+    ((u32::from(percent) * 7) / 101) as u8
 }
 
 impl Widget for BacklightWidget {
@@ -186,17 +199,28 @@ impl Widget for BacklightWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
-            ctx,
-            &self.style,
-            self.bounds,
-            &self.label(),
-            self.style.base_colors(),
-        );
+        if let Some(backlight) = &self.state {
+            draw_icon_content(
+                ctx,
+                &self.style,
+                self.bounds,
+                &self.resolved_icon(backlight.percent),
+                &self.template(),
+                self.style.base_colors(),
+            );
+        }
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.label())
+        match &self.state {
+            Some(backlight) => measure_icon_content(
+                ctx,
+                &self.style,
+                &self.resolved_icon(backlight.percent),
+                &self.template(),
+            ),
+            None => 0,
+        }
     }
 
     fn bounds(&self) -> Bounds {
@@ -257,21 +281,29 @@ mod tests {
     }
 
     #[test]
-    fn format_uses_percent_and_icon_ramp() {
+    fn a_custom_format_icons_ramp_is_a_text_override() {
         let mut widget = BacklightWidget::new(Bounds::new(0, 0, 200, 32))
-            .with_format(Some("{icon}  {percent}%".to_string()))
+            .with_format(Some("{icon} {percent}%".to_string()))
             .with_format_icons(Some(vec!["low".into(), "mid".into(), "high".into()]));
         widget.update(&Msg::Backlight(vec![Backlight::new("panel", 50, 100)]));
-        assert_eq!(widget.label(), "mid  50%");
-        widget.update(&Msg::Backlight(vec![Backlight::new("panel", 100, 100)]));
-        assert_eq!(widget.label(), "high  100%");
+        assert_eq!(widget.template(), "{icon} 50%");
+        assert_eq!(widget.resolved_icon(50), ResolvedIcon::Text("mid".into()));
+        assert_eq!(widget.resolved_icon(100), ResolvedIcon::Text("high".into()));
     }
 
     #[test]
-    fn defaults_use_the_documented_brightness_icon_ramp() {
+    fn defaults_use_the_builtin_seven_step_ramp() {
         let mut widget = BacklightWidget::new(Bounds::new(0, 0, 200, 32));
         widget.update(&Msg::Backlight(vec![Backlight::new("panel", 30, 100)]));
-        assert_eq!(widget.label(), "  30%");
+        assert_eq!(widget.template(), "{icon} 30%");
+        assert_eq!(
+            widget.resolved_icon(0),
+            ResolvedIcon::Builtin(BuiltinIcon::Backlight(0))
+        );
+        assert_eq!(
+            widget.resolved_icon(100),
+            ResolvedIcon::Builtin(BuiltinIcon::Backlight(6))
+        );
     }
 
     #[test]
@@ -283,9 +315,10 @@ mod tests {
                 ..WidgetStyle::default()
             });
         widget.update(&Msg::Backlight(vec![Backlight::new("panel", 50, 100)]));
-        assert_eq!(widget.label(), "fixed:50");
+        assert_eq!(widget.template(), "{icon}:50");
+        assert_eq!(widget.resolved_icon(50), ResolvedIcon::Text("fixed".into()));
         widget.style.icon = IconSetting::None;
-        assert_eq!(widget.label(), ":50");
+        assert_eq!(widget.resolved_icon(50), ResolvedIcon::None);
     }
 
     #[test]

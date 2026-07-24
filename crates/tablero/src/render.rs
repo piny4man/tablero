@@ -4,6 +4,8 @@ use tiny_skia::{
     Stroke, Transform,
 };
 
+use crate::icon::BuiltinIcon;
+
 /// Opaque dark background color (R, G, B, A).
 pub const BG: (u8, u8, u8, u8) = (0x18, 0x18, 0x18, 0xFF);
 /// Opaque light foreground text color (R, G, B, A).
@@ -466,6 +468,37 @@ impl RenderContext {
         self.pixmap
             .as_mut()
             .draw_pixmap(0, 0, src, &paint, transform, None);
+    }
+
+    /// The square edge, in physical pixels, a built-in vector icon should occupy
+    /// to sit visually alongside text at the active font size.
+    ///
+    /// The font is already pre-scaled into `font_size` (physical pixels), so the
+    /// icon box tracks the text without a second scale multiply — the same
+    /// invariant [`scale_factor`](Self::scale_factor) documents. Widgets center
+    /// this box vertically within their pill and reserve it in their measured
+    /// width.
+    pub fn icon_edge(&self) -> u32 {
+        self.settings.font_size.round().max(1.0) as u32
+    }
+
+    /// Fill a semantic [`BuiltinIcon`] into `bounds` in straight-alpha `color`.
+    ///
+    /// The vector artwork is scaled to fit the slot (preserving aspect ratio)
+    /// and centered, inheriting the widget's state color so an icon matches the
+    /// text beside it. A no-op for a zero-area slot or a fully transparent color.
+    /// This is the vector counterpart to [`draw_icon`](Self::draw_icon)'s raster
+    /// blit and the only path built-in icons take to the pixmap.
+    pub fn draw_builtin_icon(
+        &mut self,
+        icon: BuiltinIcon,
+        bounds: Bounds,
+        color: (u8, u8, u8, u8),
+    ) {
+        if bounds.width == 0 || bounds.height == 0 || color.3 == 0 {
+            return;
+        }
+        crate::icon::draw_into(&mut self.pixmap, icon, bounds, color);
     }
 
     /// Premultiplied RGBA8888 bytes of the current frame (`[R, G, B, A]` per
