@@ -2,15 +2,36 @@
 
 use std::collections::BTreeMap;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, IconSetting, Msg, Tooltip, Widget, WidgetStyle, draw_text_pill,
-    measure_text_pill,
+    ClickButton, Command, IconSetting, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
+    draw_icon_content, measure_icon_content,
 };
 
 const DEFAULT_FORMAT: &str = "{icon}";
 const DEFAULT_TOOLTIP_FORMAT: &str = "Power profile: {profile}\nDriver: {driver}";
+
+/// The built-in vector icon for a daemon profile name, defaulting to the
+/// balanced icon for any profile outside the three standard names.
+fn builtin_for_profile(name: &str) -> BuiltinIcon {
+    match name {
+        "performance" => BuiltinIcon::PowerProfilePerformance,
+        "power-saver" => BuiltinIcon::PowerProfileSaver,
+        _ => BuiltinIcon::PowerProfileBalanced,
+    }
+}
+
+/// Look up a profile's text glyph in a user-supplied named icon map, falling
+/// back to a `default` entry and then to an empty string.
+fn icon_text_for(icons: &BTreeMap<String, String>, name: &str) -> String {
+    icons
+        .get(name)
+        .or_else(|| icons.get("default"))
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// One profile advertised by power-profiles-daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +168,10 @@ pub struct PowerProfilesWidget {
     format: String,
     tooltip_format: String,
     tooltip: bool,
-    format_icons: BTreeMap<String, String>,
+    /// A user-supplied Waybar-style named icon map. `None` selects the built-in
+    /// per-profile vector icons; `Some` overrides them with text glyphs keyed by
+    /// profile name (with an optional `default` fallback).
+    format_icons: Option<BTreeMap<String, String>>,
 }
 
 impl PowerProfilesWidget {
@@ -160,12 +184,7 @@ impl PowerProfilesWidget {
             format: DEFAULT_FORMAT.to_string(),
             tooltip_format: DEFAULT_TOOLTIP_FORMAT.to_string(),
             tooltip: true,
-            format_icons: BTreeMap::from([
-                ("default".to_string(), "".to_string()),
-                ("performance".to_string(), "".to_string()),
-                ("balanced".to_string(), "".to_string()),
-                ("power-saver".to_string(), "".to_string()),
-            ]),
+            format_icons: None,
         }
     }
 
@@ -199,25 +218,50 @@ impl PowerProfilesWidget {
         self
     }
 
-    /// Replace the named icon map.
+    /// Override the built-in per-profile vector icons with a Waybar-style named
+    /// icon map. `Some` swaps to text glyphs keyed by profile name; `None` keeps
+    /// the built-in icons.
     pub fn with_format_icons(mut self, icons: Option<BTreeMap<String, String>>) -> Self {
         if let Some(icons) = icons {
-            self.format_icons = icons;
+            self.format_icons = Some(icons);
         }
         self
     }
 
-    /// Current rendered label, empty while the daemon is unavailable.
-    pub fn label(&self) -> String {
+    /// The bar template: the format with the profile/driver fields expanded and
+    /// the `{icon}` marker preserved, or empty while the daemon is unavailable so
+    /// the widget reserves no slot.
+    fn template(&self) -> String {
         self.active()
-            .map(|profile| self.expand(&self.format, profile))
+            .map(|profile| self.expand_template(&self.format, profile))
             .unwrap_or_default()
+    }
+
+    /// The active profile's icon: opted out, a fixed custom string, a Waybar-style
+    /// named text glyph when the user supplied `format-icons`, or the built-in
+    /// per-profile vector icon otherwise. Resolves to [`None`](ResolvedIcon::None)
+    /// while the daemon is unavailable.
+    fn icon(&self) -> ResolvedIcon {
+        match &self.style.icon {
+            IconSetting::None => ResolvedIcon::None,
+            IconSetting::Custom(icon) => ResolvedIcon::Text(icon.clone()),
+            IconSetting::Default => match self.active() {
+                None => ResolvedIcon::None,
+                Some(profile) => match &self.format_icons {
+                    Some(icons) => ResolvedIcon::Text(icon_text_for(icons, profile.name())),
+                    None => ResolvedIcon::Builtin(builtin_for_profile(profile.name())),
+                },
+            },
+        }
     }
 
     /// Current expanded tooltip, when enabled and available.
     pub fn tooltip_text(&self) -> Option<String> {
         self.tooltip
-            .then(|| self.active().map(|p| self.expand(&self.tooltip_format, p)))
+            .then(|| {
+                self.active()
+                    .map(|p| self.expand_tooltip(&self.tooltip_format, p))
+            })
             .flatten()
     }
 
@@ -225,22 +269,35 @@ impl PowerProfilesWidget {
         self.state.as_ref()?.active()
     }
 
-    fn icon(&self, profile: &PowerProfile) -> &str {
+    /// The plain-text glyph for `{icon}` in a tooltip: a custom override, a
+    /// user-configured named glyph, or empty (the built-in vector icon has no
+    /// text form to place in a tooltip string).
+    fn icon_text(&self, profile: &PowerProfile) -> String {
         match &self.style.icon {
-            IconSetting::None => "",
-            IconSetting::Custom(icon) => icon,
-            IconSetting::Default => self
-                .format_icons
-                .get(profile.name())
-                .or_else(|| self.format_icons.get("default"))
-                .map(String::as_str)
-                .unwrap_or(""),
+            IconSetting::None => String::new(),
+            IconSetting::Custom(icon) => icon.clone(),
+            IconSetting::Default => match &self.format_icons {
+                Some(icons) => icon_text_for(icons, profile.name()),
+                None => String::new(),
+            },
         }
     }
 
-    fn expand(&self, format: &str, profile: &PowerProfile) -> String {
+    /// Expand the profile/driver fields, leaving the `{icon}` marker for the
+    /// layout helpers to fill with the resolved icon.
+    fn expand_template(&self, format: &str, profile: &PowerProfile) -> String {
         format
-            .replace("{icon}", self.icon(profile))
+            .replace("{profile}", profile.name())
+            .replace("{driver}", profile.driver())
+            .replace("{cpu_driver}", profile.cpu_driver())
+            .replace("{platform_driver}", profile.platform_driver())
+    }
+
+    /// Expand every field for a plain-text tooltip, rendering `{icon}` as its
+    /// text form.
+    fn expand_tooltip(&self, format: &str, profile: &PowerProfile) -> String {
+        format
+            .replace("{icon}", &self.icon_text(profile))
             .replace("{profile}", profile.name())
             .replace("{driver}", profile.driver())
             .replace("{cpu_driver}", profile.cpu_driver())
@@ -268,17 +325,18 @@ impl Widget for PowerProfilesWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.label(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.label())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -325,10 +383,40 @@ mod tests {
     }
 
     #[test]
-    fn default_label_uses_active_profile_icon() {
+    fn default_uses_the_built_in_per_profile_icon() {
         let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32));
         widget.update(&state("balanced"));
-        assert_eq!(widget.label(), "");
+        // The default `{icon}` template keeps its icon slot and resolves to the
+        // profile's built-in vector art.
+        assert_eq!(widget.template(), "{icon}");
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::PowerProfileBalanced)
+        );
+        widget.update(&state("performance"));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::PowerProfilePerformance)
+        );
+        widget.update(&state("power-saver"));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::PowerProfileSaver)
+        );
+    }
+
+    #[test]
+    fn a_named_format_icons_map_is_a_text_override() {
+        let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32)).with_format_icons(
+            Some(BTreeMap::from([
+                ("balanced".to_string(), "B".to_string()),
+                ("default".to_string(), "?".to_string()),
+            ])),
+        );
+        widget.update(&state("balanced"));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("B".into()));
+        widget.update(&state("performance"));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("?".into()));
     }
 
     #[test]
@@ -337,7 +425,7 @@ mod tests {
             .with_format(Some("{icon} {profile}".into()))
             .with_tooltip_format(Some("{driver}/{cpu_driver}/{platform_driver}".into()));
         widget.update(&state("balanced"));
-        assert_eq!(widget.label(), " balanced");
+        assert_eq!(widget.template(), "{icon} balanced");
         assert_eq!(
             widget.tooltip_text().as_deref(),
             Some("multiple/amd_pstate/placeholder")
@@ -362,7 +450,8 @@ mod tests {
     fn unavailable_daemon_hides_and_disables_interaction() {
         let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32));
         widget.update(&Msg::PowerProfiles(None));
-        assert_eq!(widget.label(), "");
+        assert_eq!(widget.template(), "");
+        assert_eq!(widget.icon(), ResolvedIcon::None);
         assert_eq!(widget.on_click(10, 10, ClickButton::Left), None);
         assert_eq!(widget.tooltip_at(10, 10), None);
     }

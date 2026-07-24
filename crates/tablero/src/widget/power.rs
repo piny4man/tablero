@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Tooltip, Widget, WidgetStyle, draw_icon_pill, glyph_label,
-    measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
+    measure_icon_content,
 };
 
-const POWER_GLYPH: &str = "\u{f011}";
 const DEFAULT_TOOLTIP_FORMAT: &str = "Power menu";
 
 /// A static power glyph with independently configurable primary and secondary actions.
@@ -70,8 +70,15 @@ impl PowerWidget {
         self
     }
 
-    fn display_text(&self) -> String {
-        glyph_label(self.style.glyph(POWER_GLYPH), "")
+    /// The power widget is a lone always-present `{icon}` slot.
+    fn template(&self) -> String {
+        "{icon}".to_string()
+    }
+
+    /// The power icon, resolved against its [`Power`](BuiltinIcon::Power) default
+    /// so a custom `icon`/`icon = "none"` still overrides it.
+    fn icon(&self) -> ResolvedIcon {
+        self.style.resolve_icon(BuiltinIcon::Power)
     }
 
     fn contains(&self, px: u32, py: u32) -> bool {
@@ -88,17 +95,18 @@ impl Widget for PowerWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_icon_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {

@@ -1,13 +1,12 @@
 //! Hypridle process-state indicator and toggle.
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, StateColors, Tooltip, Widget, WidgetStyle, draw_icon_pill,
-    glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, StateColors, Tooltip, Widget, WidgetStyle,
+    draw_icon_content, measure_icon_content,
 };
-
-const LOCK_GLYPH: &str = "\u{f023}";
 
 /// Whether the session's Hypridle daemon is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,10 +49,25 @@ impl HypridleWidget {
         self
     }
 
-    fn display_text(&self) -> String {
-        self.state
-            .map(|_| glyph_label(self.style.glyph(LOCK_GLYPH), ""))
-            .unwrap_or_default()
+    /// A lone `{icon}` slot once a reading has arrived, or empty before it so the
+    /// widget reserves no slot.
+    fn template(&self) -> String {
+        match self.state {
+            Some(_) => "{icon}".to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// The lock icon: open while the idle daemon is active, closed while it is
+    /// inhibited — resolved against its state-appropriate built-in so a custom
+    /// `icon`/`icon = "none"` still overrides it.
+    fn icon(&self) -> ResolvedIcon {
+        let default = if self.state.is_some_and(Hypridle::active) {
+            BuiltinIcon::HypridleActive
+        } else {
+            BuiltinIcon::HypridleInactive
+        };
+        self.style.resolve_icon(default)
     }
 
     fn colors(&self) -> StateColors {
@@ -89,17 +103,18 @@ impl Widget for HypridleWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_icon_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {

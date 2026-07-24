@@ -8,12 +8,10 @@
 //! compact `CPU x% MEM y%` the user reads at a glance — basic system pressure
 //! without opening another tool.
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill};
-
-/// Default system glyph: Nerd Font "microchip" (`nf-fa-microchip`).
-const SYSTEM_GLYPH: &str = "\u{f2db}";
+use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
 
 /// A normalized snapshot of system pressure: CPU and memory load, each a whole
 /// percent.
@@ -111,12 +109,22 @@ impl SystemWidget {
         self.state.map(SystemStats::label).unwrap_or_default()
     }
 
-    /// The full pill text: the configured glyph joined to the load readout, or
+    /// The pill template: an `{icon}` slot paired with the load readout, or
     /// empty before the first sample (so the widget reserves no slot).
-    fn display_text(&self) -> String {
+    fn template(&self) -> String {
         match self.state {
-            Some(stats) => glyph_label(self.style.glyph(SYSTEM_GLYPH), &stats.label()),
+            Some(stats) => format!("{{icon}} {}", stats.label()),
             None => String::new(),
+        }
+    }
+
+    /// The system icon, resolved against its [`System`](BuiltinIcon::System)
+    /// default so a custom `icon`/`icon = "none"` still overrides it. `None`
+    /// before the first sample (nothing to show).
+    fn icon(&self) -> ResolvedIcon {
+        match self.state {
+            Some(_) => self.style.resolve_icon(BuiltinIcon::System),
+            None => ResolvedIcon::None,
         }
     }
 }
@@ -136,19 +144,20 @@ impl Widget for SystemWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // Before the first sample `display_text` is empty, so the pill paints
+        // Before the first sample the template is empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -246,15 +255,37 @@ mod tests {
     }
 
     #[test]
-    fn display_text_prefixes_the_system_glyph() {
+    fn template_pairs_the_system_icon_with_the_readout() {
         let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
-        // Nothing to show before the first sample: no glyph, no slot.
-        assert_eq!(widget.display_text(), "");
+        // Nothing to show before the first sample: no icon, no slot.
+        assert_eq!(widget.icon(), ResolvedIcon::None);
+        assert_eq!(widget.template(), "");
         widget.update(&stats(12.0, 47.0));
-        assert_eq!(
-            widget.display_text(),
-            format!("{SYSTEM_GLYPH} CPU 12% MEM 47%")
-        );
+        assert_eq!(widget.template(), "{icon} CPU 12% MEM 47%");
+        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::System));
+    }
+
+    #[test]
+    fn a_custom_icon_setting_overrides_the_built_in() {
+        let style = WidgetStyle {
+            icon: crate::widget::IconSetting::Custom("\u{f2db}".to_string()),
+            ..WidgetStyle::default()
+        };
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32)).with_style(style);
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("\u{f2db}".into()));
+    }
+
+    #[test]
+    fn icon_none_setting_opts_out_but_keeps_the_readout() {
+        let style = WidgetStyle {
+            icon: crate::widget::IconSetting::None,
+            ..WidgetStyle::default()
+        };
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32)).with_style(style);
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(widget.icon(), ResolvedIcon::None);
+        assert_eq!(widget.template(), "{icon} CPU 12% MEM 47%");
     }
 
     #[test]

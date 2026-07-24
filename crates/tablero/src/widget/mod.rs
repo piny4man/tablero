@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Local};
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, FG, RenderContext};
 
 pub mod backlight;
@@ -273,6 +274,22 @@ pub enum IconSetting {
     Custom(String),
 }
 
+/// An [`IconSetting`] resolved against a widget's semantic default.
+///
+/// A widget calls [`WidgetStyle::resolve_icon`] with the [`BuiltinIcon`] its
+/// current state calls for; the result tells the shared layout helpers what to
+/// draw in the icon slot: nothing, the built-in vector art, or a literal user
+/// override string rendered as text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedIcon {
+    /// The icon is opted out (`icon = "none"`): draw nothing in the slot.
+    None,
+    /// Draw this built-in vector icon.
+    Builtin(BuiltinIcon),
+    /// Draw this literal string as text (a custom `icon`/`format-icons` glyph).
+    Text(String),
+}
+
 /// Resolved pill colors for one widget state (normal, warn, attention, charging).
 ///
 /// `background` is `None` when that state draws no pill — the text floats
@@ -365,6 +382,24 @@ impl WidgetStyle {
             IconSetting::Default => default,
             IconSetting::None => "",
             IconSetting::Custom(s) => s,
+        }
+    }
+
+    /// Resolve the icon slot against a widget's semantic `default`.
+    ///
+    /// [`IconSetting::Default`] adopts the built-in vector art, [`None`] opts
+    /// out, and [`Custom`] keeps the user's literal string as a text override —
+    /// the vector-era counterpart to [`glyph`](Self::glyph). Widgets that pick
+    /// their default from state (a battery level, a volume level) pass the
+    /// state-appropriate [`BuiltinIcon`] here each frame.
+    ///
+    /// [`None`]: IconSetting::None
+    /// [`Custom`]: IconSetting::Custom
+    pub fn resolve_icon(&self, default: BuiltinIcon) -> ResolvedIcon {
+        match &self.icon {
+            IconSetting::Default => ResolvedIcon::Builtin(default),
+            IconSetting::None => ResolvedIcon::None,
+            IconSetting::Custom(s) => ResolvedIcon::Text(s.clone()),
         }
     }
 
@@ -463,6 +498,216 @@ pub(crate) fn draw_icon_pill(
         );
     }
     ctx.draw_text_centered(icon, bounds, colors.foreground);
+}
+
+/// One horizontal box in an icon-plus-label layout: either the icon slot or a
+/// measured run of text.
+struct ContentBox {
+    /// The text to draw, or `None` for the icon slot.
+    text: Option<String>,
+    /// The box's width in physical pixels (the icon edge, or the shaped text).
+    width: u32,
+}
+
+/// The gap between an icon and an adjacent text run, in physical pixels. A
+/// quarter of the icon edge tracks a normal inter-word space at the font size.
+fn icon_gap(edge: u32) -> u32 {
+    (edge / 4).max(1)
+}
+
+/// Split a format template on `{icon}` markers into drawable boxes, measuring
+/// each text run. Whitespace bordering a marker is dropped — it becomes the
+/// [`icon_gap`] between boxes — so the icon reads as its own element rather than
+/// depending on the font preserving a leading space. Empty runs are skipped, so
+/// a bare `{icon}` yields a single icon box.
+fn icon_boxes(ctx: &mut RenderContext, edge: u32, template: &str) -> Vec<ContentBox> {
+    let mut boxes = Vec::new();
+    let mut rest = template;
+    loop {
+        match rest.find("{icon}") {
+            Some(idx) => {
+                let text = rest[..idx].trim();
+                if !text.is_empty() {
+                    let width = ctx.measure_text(text);
+                    boxes.push(ContentBox {
+                        text: Some(text.to_string()),
+                        width,
+                    });
+                }
+                boxes.push(ContentBox {
+                    text: None,
+                    width: edge,
+                });
+                rest = &rest[idx + "{icon}".len()..];
+            }
+            None => {
+                let text = rest.trim();
+                if !text.is_empty() {
+                    let width = ctx.measure_text(text);
+                    boxes.push(ContentBox {
+                        text: Some(text.to_string()),
+                        width,
+                    });
+                }
+                break;
+            }
+        }
+    }
+    boxes
+}
+
+/// Flatten an icon template to plain text, substituting the `{icon}` markers
+/// with `repl` (or dropping them for the opted-out state). Runs are joined with
+/// a single space so no stray whitespace survives a removed marker.
+fn icon_as_text(template: &str, repl: Option<&str>) -> String {
+    let repl = repl.map(str::trim).filter(|s| !s.is_empty());
+    let mut parts: Vec<&str> = Vec::new();
+    let mut rest = template;
+    loop {
+        match rest.find("{icon}") {
+            Some(idx) => {
+                let before = rest[..idx].trim();
+                if !before.is_empty() {
+                    parts.push(before);
+                }
+                if let Some(repl) = repl {
+                    parts.push(repl);
+                }
+                rest = &rest[idx + "{icon}".len()..];
+            }
+            None => {
+                let last = rest.trim();
+                if !last.is_empty() {
+                    parts.push(last);
+                }
+                break;
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+/// Whether `template`'s only content is the icon slot(s) — no accompanying text.
+/// Such a widget renders as a single centered glyph, so a text override keeps the
+/// ink-centered look rather than left-aligning.
+fn is_icon_only(template: &str) -> bool {
+    template.contains("{icon}") && template.replace("{icon}", " ").trim().is_empty()
+}
+
+/// The pill width an icon `template` needs under `style`, resolved for `icon`.
+///
+/// For a [`Builtin`](ResolvedIcon::Builtin) icon this reserves the icon edge plus
+/// each text run plus the gaps between them; for a text override or the opted-out
+/// state it falls back to [`measure_text_pill`] over the flattened string. Empty
+/// content measures zero, so an opted-out icon-only widget reserves no slot.
+pub(crate) fn measure_icon_content(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    icon: &ResolvedIcon,
+    template: &str,
+) -> u32 {
+    match icon {
+        ResolvedIcon::Builtin(_) => {
+            let edge = ctx.icon_edge();
+            let boxes = icon_boxes(ctx, edge, template);
+            if boxes.is_empty() {
+                return 0;
+            }
+            let gap = icon_gap(edge);
+            let content: u32 =
+                boxes.iter().map(|b| b.width).sum::<u32>() + gap * (boxes.len() as u32 - 1);
+            content + 2 * style.padding * ctx.scale_factor()
+        }
+        ResolvedIcon::None => measure_text_pill(ctx, style, &icon_as_text(template, None)),
+        ResolvedIcon::Text(s) => measure_text_pill(ctx, style, &icon_as_text(template, Some(s))),
+    }
+}
+
+/// Paint an icon `template` resolved for `icon`, in `colors`.
+///
+/// A [`Builtin`](ResolvedIcon::Builtin) icon lays the vector art and its text
+/// runs out horizontally, each in `colors.foreground`, behind the style's pill.
+/// A text override or the opted-out state renders through the text-pill path
+/// (ink-centered when the widget is icon-only, left-aligned otherwise), so a
+/// custom glyph looks exactly as it did before built-in icons existed. A no-op
+/// for empty content or a zero-area slot.
+pub(crate) fn draw_icon_content(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    icon: &ResolvedIcon,
+    template: &str,
+    colors: StateColors,
+) {
+    match icon {
+        ResolvedIcon::Builtin(builtin) => {
+            draw_builtin_content(ctx, style, bounds, *builtin, template, colors);
+        }
+        ResolvedIcon::None => {
+            draw_text_pill(ctx, style, bounds, &icon_as_text(template, None), colors);
+        }
+        ResolvedIcon::Text(s) => {
+            let text = icon_as_text(template, Some(s));
+            if is_icon_only(template) {
+                draw_icon_pill(ctx, style, bounds, &text, colors);
+            } else {
+                draw_text_pill(ctx, style, bounds, &text, colors);
+            }
+        }
+    }
+}
+
+/// Draw a built-in vector icon and its text runs across `bounds`.
+fn draw_builtin_content(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    builtin: BuiltinIcon,
+    template: &str,
+    colors: StateColors,
+) {
+    if bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    let edge = ctx.icon_edge();
+    let boxes = icon_boxes(ctx, edge, template);
+    if boxes.is_empty() {
+        return;
+    }
+    let scale = ctx.scale_factor();
+    if let Some(bg) = colors.background {
+        ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
+    }
+    if let Some(border) = colors.border.or(style.border) {
+        ctx.stroke_rounded_rect(
+            bounds,
+            border,
+            (style.radius * scale) as f32,
+            (style.border_width * scale) as f32,
+        );
+    }
+    let gap = icon_gap(edge);
+    let pad = style.padding * scale;
+    let mut x = bounds.x + pad;
+    for (index, content) in boxes.iter().enumerate() {
+        if index > 0 {
+            x += gap;
+        }
+        match &content.text {
+            None => {
+                let iy = bounds.y + bounds.height.saturating_sub(edge) / 2;
+                ctx.draw_builtin_icon(builtin, Bounds::new(x, iy, edge, edge), colors.foreground);
+            }
+            Some(text) => {
+                ctx.draw_text(
+                    text,
+                    Bounds::new(x, bounds.y, content.width, bounds.height),
+                    colors.foreground,
+                );
+            }
+        }
+        x += content.width;
+    }
 }
 
 /// Draw `text` horizontally centered within `bounds` (vertical centering is

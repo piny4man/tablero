@@ -33,8 +33,9 @@
 //! accent     = "#eaeaea"
 //!
 //! [font]
-//! # family is unset by default (the system default font is used; a Nerd Font is
-//! # recommended so widget glyph icons render).
+//! # family is unset by default (the system default font is used). Widget icons
+//! # are built-in vector art, so no icon font is needed; a Nerd Font only matters
+//! # if you set custom text glyphs via `icon`/`format-icons`.
 //! size = 16.0
 //!
 //! # Per-widget styling is opt-in; an absent [widget.<name>] table leaves that

@@ -3,14 +3,13 @@
 use std::path::PathBuf;
 
 use crate::clock::format_time;
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Widget, WidgetStyle, draw_text_pill, glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content,
+    measure_icon_content,
 };
-
-/// Default clock glyph: Nerd Font "clock" (`nf-fa-clock_o`).
-const CLOCK_GLYPH: &str = "\u{f017}";
 
 /// A live clock rendered through the widget architecture.
 ///
@@ -71,13 +70,18 @@ impl ClockWidget {
             && py < self.bounds.y + self.bounds.height
     }
 
-    /// The full pill text: the configured glyph joined to the clock readout, or
-    /// empty before the first tick (so the widget reserves no slot).
-    fn display_text(&self) -> String {
+    /// The format template — the icon slot marked by `{icon}` ahead of the clock
+    /// readout — or empty before the first tick (so the widget reserves no slot).
+    fn template(&self) -> String {
         if self.text.is_empty() {
             return String::new();
         }
-        glyph_label(self.style.glyph(CLOCK_GLYPH), &self.text)
+        format!("{{icon}} {}", self.text)
+    }
+
+    /// The clock's icon resolved against its [`Clock`](BuiltinIcon::Clock) default.
+    fn icon(&self) -> ResolvedIcon {
+        self.style.resolve_icon(BuiltinIcon::Clock)
     }
 }
 
@@ -97,17 +101,18 @@ impl Widget for ClockWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        draw_text_pill(
+        draw_icon_content(
             ctx,
             &self.style,
             self.bounds,
-            &self.display_text(),
+            &self.icon(),
+            &self.template(),
             self.style.base_colors(),
         );
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {

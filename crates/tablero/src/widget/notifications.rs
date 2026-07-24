@@ -15,16 +15,13 @@
 //! swaync control-center panel, the secondary button to toggle DND, and the
 //! producer that owns the swaync connection executes both.
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Widget, WidgetStyle, draw_icon_pill, glyph_label, measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content,
+    measure_icon_content,
 };
-
-/// Glyph drawn while notifications are deliverable (Font Awesome, via Nerd Font).
-const BELL_GLYPH: &str = "\u{f0f3}"; // nf-fa-bell
-/// Glyph drawn while Do-Not-Disturb is on.
-const BELL_OFF_GLYPH: &str = "\u{f1f6}"; // nf-fa-bell_slash
 
 /// How far each color channel is scaled toward black for the DND look, percent.
 const DIM_PERCENT: u32 = 55;
@@ -104,17 +101,25 @@ impl NotificationsWidget {
         self
     }
 
-    /// The pill text: the bell glyph alone (slashed under DND), or empty while
-    /// the daemon is absent so the widget reserves no slot. The count is shown
-    /// by the dot, never as text — the widget stays one glyph wide.
-    fn display_text(&self) -> String {
+    /// The template: a lone `{icon}` slot while the daemon is present, or empty
+    /// while it is absent so the widget reserves no slot. The count is shown by
+    /// the dot, never as text — the widget stays one icon wide.
+    fn template(&self) -> String {
         match &self.state {
-            Some(n) => {
-                let glyph = if n.dnd { BELL_OFF_GLYPH } else { BELL_GLYPH };
-                glyph_label(self.style.glyph(glyph), "")
-            }
+            Some(_) => "{icon}".to_string(),
             None => String::new(),
         }
+    }
+
+    /// The bell icon: slashed under Do-Not-Disturb, upright otherwise — resolved
+    /// against its state-appropriate built-in so a custom `icon`/`icon = "none"`
+    /// still overrides it.
+    fn icon(&self) -> ResolvedIcon {
+        let default = match self.state {
+            Some(n) if n.dnd => BuiltinIcon::NotificationsOff,
+            _ => BuiltinIcon::Notifications,
+        };
+        self.style.resolve_icon(default)
     }
 
     /// The foreground the bell is drawn in: the style's normal foreground,
@@ -159,14 +164,21 @@ impl Widget for NotificationsWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // An absent daemon leaves `display_text` empty, so the pill paints
+        // An absent daemon leaves the template empty, so the content paints
         // nothing: the dashboard has already cleared the background.
         let colors = super::StateColors {
             background: self.style.background,
             foreground: self.foreground(),
             border: self.style.border,
         };
-        draw_icon_pill(ctx, &self.style, self.bounds, &self.display_text(), colors);
+        draw_icon_content(
+            ctx,
+            &self.style,
+            self.bounds,
+            &self.icon(),
+            &self.template(),
+            colors,
+        );
 
         // The dot is painted over the pill with the opaque attention foreground.
         // Attention backgrounds are commonly translucent state fills and make
@@ -177,7 +189,7 @@ impl Widget for NotificationsWidget {
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }
 
     fn bounds(&self) -> Bounds {
@@ -247,17 +259,24 @@ mod tests {
     }
 
     #[test]
-    fn display_text_is_the_bell_glyph_alone() {
+    fn a_present_daemon_shows_the_upright_bell_icon() {
         let mut widget = NotificationsWidget::new(Bounds::new(0, 0, 100, 32));
         widget.update(&some(3, false));
-        assert_eq!(widget.display_text(), BELL_GLYPH);
+        assert_eq!(widget.template(), "{icon}");
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::Notifications)
+        );
     }
 
     #[test]
     fn dnd_swaps_to_the_slashed_bell_and_dims_the_foreground() {
         let mut widget = NotificationsWidget::new(Bounds::new(0, 0, 100, 32));
         widget.update(&some(0, true));
-        assert_eq!(widget.display_text(), BELL_OFF_GLYPH);
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::NotificationsOff)
+        );
         assert_eq!(widget.foreground(), dim(widget.style.foreground));
     }
 
@@ -269,7 +288,11 @@ mod tests {
                 ..WidgetStyle::default()
             });
         widget.update(&some(1, false));
-        assert_eq!(widget.display_text(), "");
+        // The template still reserves an icon slot, but the resolved icon opts
+        // out, so the content — measured and drawn — collapses to nothing.
+        assert_eq!(widget.icon(), ResolvedIcon::None);
+        let mut ctx = RenderContext::new(200, 32);
+        assert_eq!(widget.measure(&mut ctx, 32), 0);
     }
 
     #[test]

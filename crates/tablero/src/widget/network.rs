@@ -11,20 +11,13 @@
 
 use std::path::PathBuf;
 
+use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, Tooltip, Widget, WidgetStyle, draw_text_pill, glyph_label,
-    measure_text_pill,
+    ClickButton, Command, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
+    measure_icon_content,
 };
-
-/// Default network glyphs (Font Awesome, via Nerd Font), chosen by connection
-/// state: a wifi arc, a wired sitemap, a cross when disconnected, and a question
-/// mark when the state is indeterminate.
-const WIRELESS_GLYPH: &str = "\u{f1eb}"; // nf-fa-wifi
-const WIRED_GLYPH: &str = "\u{f0e8}"; // nf-fa-sitemap
-const DISCONNECTED_GLYPH: &str = "\u{f00d}"; // nf-fa-times
-const UNKNOWN_GLYPH: &str = "\u{f128}"; // nf-fa-question
 
 /// The kind of network connection in use, normalized from a raw daemon reading.
 ///
@@ -105,8 +98,8 @@ impl Network {
     /// The compact display label, e.g. `"home-net"`, `"wired"`, or
     /// `"disconnected"`.
     ///
-    /// The Wi-Fi glyph already communicates the connection type, so a wireless
-    /// link shows only its SSID. Without one, the glyph stands alone. Keeping
+    /// The Wi-Fi icon already communicates the connection type, so a wireless
+    /// link shows only its SSID. Without one, the icon stands alone. Keeping
     /// this a pure function makes the rendered text deterministic and
     /// unit-testable without painting pixels.
     pub fn label(&self) -> String {
@@ -118,15 +111,14 @@ impl Network {
     }
 }
 
-/// The default glyph for a connection state: a wifi arc on a wireless link, a
-/// sitemap on a wired one, a cross when disconnected, and a question mark when
-/// the state is indeterminate.
-fn default_glyph(state: NetworkState) -> &'static str {
+/// The default semantic icon for a connection state: a wired symbol on an
+/// Ethernet link, otherwise the wireless symbol — there is no distinct
+/// disconnected/unknown artwork, so those states reuse the generic network mark
+/// and lean on the accompanying label to disambiguate.
+fn default_icon(state: NetworkState) -> BuiltinIcon {
     match state {
-        NetworkState::Wireless => WIRELESS_GLYPH,
-        NetworkState::Wired => WIRED_GLYPH,
-        NetworkState::Disconnected => DISCONNECTED_GLYPH,
-        NetworkState::Unknown => UNKNOWN_GLYPH,
+        NetworkState::Wired => BuiltinIcon::NetworkWired,
+        _ => BuiltinIcon::NetworkWireless,
     }
 }
 
@@ -186,16 +178,19 @@ impl NetworkWidget {
         self.state.as_ref().map(Network::label).unwrap_or_default()
     }
 
-    /// The full pill text: the state-derived glyph joined to the label, or empty
-    /// while the network is unavailable (so the widget reserves no slot).
-    fn display_text(&self) -> String {
+    /// The format template — the icon slot marked by `{icon}` ahead of the label
+    /// — or empty while the network is unavailable (so the widget reserves no
+    /// slot). A wireless link with no SSID collapses to a bare icon.
+    fn template(&self) -> String {
         match &self.state {
-            Some(network) => glyph_label(
-                self.style.glyph(default_glyph(network.state())),
-                &network.label(),
-            ),
+            Some(network) => format!("{{icon}} {}", network.label()),
             None => String::new(),
         }
+    }
+
+    /// The network's icon resolved against the state-derived semantic default.
+    fn icon(&self, network: &Network) -> ResolvedIcon {
+        self.style.resolve_icon(default_icon(network.state()))
     }
 
     /// Connection details kept off the bar's compact label.
@@ -234,19 +229,27 @@ impl Widget for NetworkWidget {
     }
 
     fn draw(&self, ctx: &mut RenderContext) {
-        // An unavailable network leaves `display_text` empty, so the pill paints
+        // An unavailable network leaves the template empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
-        draw_text_pill(
-            ctx,
-            &self.style,
-            self.bounds,
-            &self.display_text(),
-            self.style.base_colors(),
-        );
+        if let Some(network) = &self.state {
+            draw_icon_content(
+                ctx,
+                &self.style,
+                self.bounds,
+                &self.icon(network),
+                &self.template(),
+                self.style.base_colors(),
+            );
+        }
     }
 
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
-        measure_text_pill(ctx, &self.style, &self.display_text())
+        match &self.state {
+            Some(network) => {
+                measure_icon_content(ctx, &self.style, &self.icon(network), &self.template())
+            }
+            None => 0,
+        }
     }
 
     fn bounds(&self) -> Bounds {
@@ -418,21 +421,32 @@ mod tests {
     }
 
     #[test]
-    fn display_text_uses_a_state_driven_glyph() {
+    fn template_marks_the_icon_slot_and_icon_follows_the_state() {
         let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
-        // Nothing to show before the first reading: no glyph, no slot.
-        assert_eq!(widget.display_text(), "");
-        // Each connection state picks its own glyph ahead of the label.
+        // Nothing to show before the first reading: no slot.
+        assert_eq!(widget.template(), "");
+        // Each connection state resolves its own semantic icon ahead of the label.
         widget.update(&network(NetworkState::Wireless, Some("home-net")));
-        assert_eq!(widget.display_text(), format!("{WIRELESS_GLYPH} home-net"));
-        widget.update(&network(NetworkState::Wireless, None));
-        assert_eq!(widget.display_text(), WIRELESS_GLYPH);
-        widget.update(&network(NetworkState::Wired, None));
-        assert_eq!(widget.display_text(), format!("{WIRED_GLYPH} wired"));
-        widget.update(&network(NetworkState::Disconnected, None));
+        assert_eq!(widget.template(), "{icon} home-net");
         assert_eq!(
-            widget.display_text(),
-            format!("{DISCONNECTED_GLYPH} disconnected")
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless)
+        );
+        widget.update(&network(NetworkState::Wireless, None));
+        // A wireless link with no usable SSID collapses to a bare icon slot.
+        assert_eq!(widget.template(), "{icon} ");
+        widget.update(&network(NetworkState::Wired, None));
+        assert_eq!(widget.template(), "{icon} wired");
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWired)
+        );
+        widget.update(&network(NetworkState::Disconnected, None));
+        // No disconnect artwork exists, so the generic network icon stands in.
+        assert_eq!(widget.template(), "{icon} disconnected");
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless)
         );
     }
 

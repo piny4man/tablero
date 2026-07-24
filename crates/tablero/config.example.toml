@@ -39,8 +39,10 @@ foreground = "#eae2cf"
 accent = "#7decff"
 
 [font]
-# Install this Nerd Font for the intended compact telemetry look and glyphs.
-# Remove `family` to use the system default if it is unavailable.
+# Widget icons are built-in vector art, so no icon font is required. `family`
+# just picks the text face for labels; remove it to use the system default. A
+# Nerd Font is only needed if you set custom text glyphs via `icon = "…"` or a
+# `format-icons` string.
 family = "JetBrainsMono Nerd Font"
 size = 15.0
 
