@@ -4,7 +4,7 @@
 //! states, a network arc, and so on — instead of Nerd Font private-use
 //! codepoints. Each [`BuiltinIcon`] maps to path data flattened from the
 //! project's `icons/*.svg` at build time (see `tools/icongen`) and stored in the
-//! generated [`builtin_icon_paths`] module. Rendering is a handful of
+//! generated `builtin_icon_paths` module. Rendering is a handful of
 //! [`tiny_skia`] path fills per icon, so no SVG parser, icon font, or other
 //! icon-rendering dependency ships in the binary.
 //!
@@ -27,7 +27,7 @@ use builtin_icon_paths::{Cmd, ICONS, RawIcon};
 /// Widgets choose a variant from their current state (a battery picks
 /// [`BatteryCharging`](BuiltinIcon::BatteryCharging) while charging, a volume
 /// control picks a level); the concrete vector art each maps to is an
-/// implementation detail resolved by [`stem`](BuiltinIcon::stem).
+/// implementation detail resolved by its private `stem` mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinIcon {
     /// The clock readout's leading icon.
