@@ -205,9 +205,11 @@ impl VolumeWidget {
     /// still overrides it. `None` before the first reading (nothing to show).
     fn icon(&self) -> ResolvedIcon {
         let default = match &self.state {
-            Some(volume) if volume.muted() => BuiltinIcon::VolumeMuted,
+            // 0% is silent whether or not the mute flag is set, so it reads as
+            // muted rather than as the quietest audible step.
+            Some(volume) if volume.muted() || volume.level() == 0 => BuiltinIcon::VolumeMuted,
             Some(volume) => match volume.level() {
-                0..=33 => BuiltinIcon::VolumeLow,
+                1..=33 => BuiltinIcon::VolumeLow,
                 34..=66 => BuiltinIcon::VolumeMedium,
                 _ => BuiltinIcon::VolumeHigh,
             },
@@ -453,6 +455,12 @@ mod tests {
         );
         // Muted always wins over the level.
         widget.update(&vol(0.90, true, DeviceKind::Speakers));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::VolumeMuted)
+        );
+        // 0% is silent, so it takes the muted icon even with the flag clear.
+        widget.update(&vol(0.0, false, DeviceKind::Speakers));
         assert_eq!(
             widget.icon(),
             ResolvedIcon::Builtin(BuiltinIcon::VolumeMuted)

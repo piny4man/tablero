@@ -113,8 +113,9 @@ RUST_LOG=info cargo run -p tablero
     "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
   - **Volume** — the active output sink's level (`Vol N%`) and mute state
     (`Mute`), read over the native PipeWire wire protocol. The icon is a
-    built-in speaker that follows the level — low / medium / high, or a
-    muted variant when muted — so the fill hints at the level at a glance.
+    built-in speaker that follows the level — one more wave per step from
+    low to high, and the muted speaker when muted or at 0% — so the icon
+    hints at the level at a glance.
     Switching the active sink still triggers a repaint. **Opt-in**: not in the default set;
     add `"volume"` to a zone to enable it. The widget reserves no slot
     when no PipeWire server is reachable (or no output sink exists),
@@ -160,6 +161,12 @@ RUST_LOG=info cargo run -p tablero
   dedicated OS thread (PipeWire's `MainLoop` is synchronous and
   file-descriptor-driven, unlike zbus), and reaches the Tokio runtime the
   same way — by sending `Msg::Volume`s through the cross-thread `MsgSender`.
+  That thread supervises its own connection: a `core.sync` heartbeat proves the
+  server is really there (connecting to a socket-activated `pipewire-0` before
+  the daemon exists otherwise *succeeds* and then never handshakes), and an
+  unanswered one reconnects on a 1s→30s backoff — so a bar started before its
+  audio server, or a daemon restarted under it, costs a couple of seconds
+  rather than the session.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
@@ -550,8 +557,9 @@ surface placement and input need a live compositor. To verify on Hyprland:
  15. Verify the **volume widget** (opt-in: add `"volume"` to a zone). With
      a running PipeWire server (pipewire + wireplumber / pipewire-pulse)
      and at least one output sink configured:
-     - The widget appears with a built-in speaker icon whose fill follows the
-       level (low / medium / high) and a label of `Vol N%` (where `N` is the
+     - The widget appears with a built-in speaker icon whose waves follow the
+       level (bare speaker at 1-33%, one wave at 34-66%, two waves above; the
+       muted speaker at 0%) and a label of `Vol N%` (where `N` is the
        active sink's level). On a system with PipeWire but no output sink configured,
        the widget reserves no slot (matching the `network` / `system`
        pattern); on a system with no PipeWire running, the widget also
@@ -563,7 +571,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
        per-cent: `12%`, `13%`, …
      - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
        the label flips to `Mute` with the muted speaker icon; toggling
-       mute back restores `Vol N%` with the level-based icon.
+       mute back restores `Vol N%` with the level-based icon. Setting the
+       level to `0%` unmuted shows `Vol 0%` with the same muted icon.
      - With multiple sinks configured (e.g. headphones + monitor speakers),
        play audio through one and confirm the widget tracks *that* sink
        (active sink has its `NodeState` set to `Running`); switching
@@ -574,6 +583,13 @@ surface placement and input need a live compositor. To verify on Hyprland:
        configured process is spawned (no shell, direct exec). A missing
        or non-executable path is logged as an error and does not crash
        the bar.
+     - Restart the audio server under the running bar with `systemctl --user
+       restart pipewire.service` and confirm the widget briefly reserves no
+       slot and then comes back with the right level, instead of freezing or
+       disappearing for the rest of the session. Starting the bar *before*
+       PipeWire (the usual compositor-autostart race) is the same code path;
+       `RUST_LOG=tablero=debug` shows the reconnect and the
+       `PipeWire core handshake complete` that follows it.
  16. Verify the **notifications widget** (opt-in: add `"notifications"` to a
      zone). With swaync running as the session's notification daemon:
      - The widget appears as a bell glyph with no dot. With swaync not

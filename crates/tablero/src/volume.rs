@@ -18,6 +18,32 @@
 //! producer does. Errors propagate through the oneshot the same way the
 //! bluetooth producer's `?` does.
 //!
+//! # Surviving a PipeWire server that is not there yet
+//!
+//! The bar is commonly started by the compositor's autostart *before* the
+//! user's PipeWire daemon, and `pw_context_connect` against a socket-activated
+//! `pipewire-0` **succeeds** in that window — the connection is accepted at the
+//! socket level but the client handshake never completes. The server then
+//! delivers no registry global and no error, so a single-shot main loop parks
+//! in `epoll_wait` on a dead connection for the rest of the session and the
+//! widget stays invisible, silently, forever.
+//!
+//! A connection is therefore only trusted once the core answers a
+//! [`sync`](pipewire::core::Core::sync) with a `done` event. One is issued
+//! immediately after connecting and a watchdog timer re-issues it every
+//! `HEARTBEAT_INTERVAL`; an unanswered sync quits the main loop, and the
+//! session supervisor reconnects on a backoff that starts at `RETRY_DELAY` and
+//! caps at `MAX_RETRY_DELAY`. The same check recovers a daemon that dies
+//! mid-session, and the backoff keeps a host with no PipeWire at all down to
+//! one quiet attempt every 30 seconds.
+//!
+//! Reproducing the never-handshaked case without touching the session's audio:
+//! bind a unix socket under `$XDG_RUNTIME_DIR` that accepts connections and
+//! never answers, then point the producer at it with
+//! `PIPEWIRE_REMOTE=<socket-name> cargo run --example volume-bridge -- 20`.
+//! Sending it at a socket that does not exist yet, and creating it a few
+//! seconds in, reproduces the boot race the same way.
+//!
 //! # Active-sink selection
 //!
 //! PipeWire may expose many sinks (multiple wired/wireless adapters, HDMI
@@ -31,35 +57,40 @@
 //!    alphabetically first node name (deterministic, no surprises; this is
 //!    the rule the user picked).
 //! 2. If no sink is running, fall back to the sink whose name matches the
-//!    configured default audio sink in the `default.configured.audio.sink`
-//!    metadata — i.e. what the user has actually told the system to use.
-//! 3. If neither resolves, emit `Msg::Volume(None)` and `warn!` — a fresh
-//!    bar without a usable audio source reserves no slot for the volume
-//!    widget, matching the absent-source behavior of the `network` and
-//!    `system` widgets.
+//!    configured default audio sink in the `default.audio.sink` metadata —
+//!    i.e. what the user has actually told the system to use.
+//! 3. If neither resolves, fall back to the first sink by name, so a reachable
+//!    audio server always shows a reading. Only a server with no sinks at all
+//!    emits `Msg::Volume(None)`, which reserves no slot for the volume widget —
+//!    matching the absent-source behavior of the `network` and `system`
+//!    widgets.
 //!
-//! Polling (rather than per-property signal subscriptions) is what keeps the
-//! implementation tractable: the volume can change at any time (key press,
-//! GUI slider, app that auto-balances audio), so a static signal subscription
-//! would miss many of those events. A 2-second ticker reads the cached state
-//! and only re-emits when the normalized snapshot actually differs.
+//! The volume can change at any time (key press, GUI slider, app that
+//! auto-balances audio), so every sink `info` / `param` event and every
+//! `default.audio.sink` change re-evaluates the snapshot immediately. A
+//! 2-second ticker re-reads the same cached state as a safety net for anything
+//! the server did not push. Either way a snapshot is only sent when the
+//! normalized value actually differs, plus one forced re-emit every
+//! `RESYNC_TICKS` ticks in case a message never reached the render loop.
 //!
 //! # Pure parsing
 //!
 //! Device-kind classification and active-sink selection are pure functions
 //! tests drive directly with strings and slices — no PipeWire server needed.
-//! The SPA POD decoding for the volume/mute Props is a thin FFI wrapper around
-//! [`Pod::get_float`] / [`Pod::get_bool`] and is exercised by the integration
-//! test in `tests/volume.rs`, not the unit tests.
+//! The SPA POD decoding for the volume/mute Props is exercised by the unit
+//! tests in this file, which serialize a real `SPA_TYPE_OBJECT_Props` POD with
+//! libspa and round-trip it back through [`parse_props_pod`] — including the
+//! volume-only and mute-only PODs PipeWire is free to push.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info, warn};
 use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 use pipewire::node::{Node, NodeInfoRef, NodeState};
@@ -81,6 +112,48 @@ use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 /// on a timer and the render loop is idle, waking only when a sample changes
 /// a visible label.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a fresh connection has to answer its first `core.sync` before it
+/// is written off as never-handshaked and retried.
+///
+/// Two seconds is far longer than a live daemon needs (the handshake is a
+/// couple of socket round-trips on the same machine) and short enough that a
+/// bar racing its audio server recovers before the user looks at it. The
+/// timeout fails safe: being too aggressive costs one reconnect that then
+/// succeeds.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often an established connection is re-checked with a `core.sync`.
+///
+/// This is what notices a daemon that died without closing the socket cleanly.
+/// Ten seconds keeps the recovery bound tight while costing two tiny protocol
+/// messages per interval.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long [`supervise`] waits before the first reconnect attempt.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The ceiling the reconnect backoff doubles up to.
+///
+/// A host with no PipeWire at all never succeeds, so the backoff exists to keep
+/// that case down to one cheap attempt every 30 seconds instead of one per
+/// second for the life of the session.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// How many poll ticks pass between forced re-emits of the current snapshot.
+///
+/// [`on_tick`] gates sends on a real change, which means a snapshot that never
+/// reached the render loop is never re-sent and the widget stays blank until
+/// the volume physically changes. Dropping the gate every 15th tick (~30s at
+/// the default interval) bounds that to half a minute. It is nearly free:
+/// `VolumeWidget::update` diffs its own state, so an unchanged value costs one
+/// channel message and no redraw.
+const RESYNC_TICKS: u32 = 15;
+
+/// The object id of the PipeWire core itself (`PW_ID_CORE`), which the
+/// `pipewire` crate does not re-export. `done` and `error` events carrying this
+/// id are about the connection rather than about a bound proxy.
+const PW_ID_CORE: u32 = 0;
 
 /// The PipeWire metadata key whose value is the configured default audio sink.
 ///
@@ -210,13 +283,30 @@ fn is_node_running(state: &NodeState<'_>) -> bool {
     matches!(state, NodeState::Running)
 }
 
-/// Extract `(volume, mute)` from a PipeWire `ParamType::Props` POD.
+/// The volume and/or mute state carried by one `ParamType::Props` POD.
+///
+/// Both fields are optional because PipeWire pushes `Props` updates
+/// incrementally: a POD may carry `channelVolumes` without `mute`, or the other
+/// way round. Requiring both in the same POD used to discard those updates
+/// silently, which could leave a sink's cached volume unset forever — and an
+/// unset volume renders as no widget at all. Each present field is merged onto
+/// the cached sink entry instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropsUpdate {
+    /// User-volume in `[0, 1]`, from `channelVolumes` when present.
+    pub volume: Option<f32>,
+    /// Mute flag, from `mute` when present.
+    pub muted: Option<bool>,
+}
+
+/// Extract the volume and/or mute state from a PipeWire `ParamType::Props` POD.
 ///
 /// `pod_bytes` is the raw byte slice of a `spa_pod` whose body is a
 /// `SPA_TYPE_OBJECT_Props` (the `ParamType::Props` object). The function
 /// looks up the `channelVolumes` (per-channel Float array) and `mute`
-/// (Bool) properties and returns the parsed values. Returns `None` for any
-/// malformed input — a transient type drift never takes the source down.
+/// (Bool) properties, either of which may be absent. Returns `None` only when
+/// the input is malformed or carries neither property — a transient type drift
+/// never takes the source down.
 ///
 /// **Why `channelVolumes` and not `volume`.** In wireplumber /
 /// pipewire-pulse, the `SPA_PROP_volume` field is the **sink's max
@@ -228,7 +318,7 @@ fn is_node_running(state: &NodeState<'_>) -> bool {
 /// `channelVolumes`, applies `cbrt` to recover the user-volume in
 /// `[0, 1]`, clamps to `[0, 1]`, and returns that — so the widget shows
 /// the same number pactl / waybar do.
-pub fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
+pub fn parse_props_pod(pod_bytes: &[u8]) -> Option<PropsUpdate> {
     use pipewire::spa::pod::Value;
     use pipewire::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
 
@@ -239,28 +329,40 @@ pub fn parse_props_pod(pod_bytes: &[u8]) -> Option<(f32, bool)> {
     // libspa-sys bindgen output pins the key at `0x10008`; the test in
     // this file asserts the wire format to catch a header / bindgen
     // drift.
-    let channel_volumes_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_channelVolumes))?;
-    let mute_pod = obj.find_prop(pipewire::spa::utils::Id(SPA_PROP_mute))?;
+    let volume = obj
+        .find_prop(pipewire::spa::utils::Id(SPA_PROP_channelVolumes))
+        .and_then(|channel_volumes_pod| {
+            // Deserialize the channel-volumes value into a `Value` enum so we
+            // can pull the per-channel Float array out of whatever shape the
+            // serializer chose.
+            let value: Value =
+                pipewire::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
+                    channel_volumes_pod.value().as_bytes(),
+                )
+                .ok()
+                .map(|(_, v)| v)?;
+            // Compute the user-volume from the per-channel Float array (or a
+            // single Float for mono sinks). The `Value` owns the data, so we
+            // borrow into it; binding `value` to a name keeps it alive for the
+            // duration of the borrow.
+            match &value {
+                Value::ValueArray(pipewire::spa::pod::ValueArray::Float(v)) => {
+                    average_to_user_volume(v)
+                }
+                Value::Float(v) => average_to_user_volume(&[*v]),
+                _ => None,
+            }
+        });
+    let muted = obj
+        .find_prop(pipewire::spa::utils::Id(SPA_PROP_mute))
+        .and_then(|mute_pod| mute_pod.value().get_bool().ok());
 
-    // Deserialize the channel-volumes value into a `Value` enum so we
-    // can pull the per-channel Float array out of whatever shape the
-    // serializer chose.
-    let value: Value = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
-        channel_volumes_pod.value().as_bytes(),
-    )
-    .ok()
-    .map(|(_, v)| v)?;
-    // Compute the user-volume from the per-channel Float array (or a
-    // single Float for mono sinks). The `Value` owns the data, so we
-    // borrow into it; binding `value` to a name keeps it alive for the
-    // duration of the borrow.
-    let user_volume = match &value {
-        Value::ValueArray(pipewire::spa::pod::ValueArray::Float(v)) => average_to_user_volume(v)?,
-        Value::Float(v) => average_to_user_volume(&[*v])?,
-        _ => return None,
-    };
-    let mute = mute_pod.value().get_bool().ok()?;
-    Some((user_volume, mute))
+    // A POD that carries neither property tells us nothing; anything else is a
+    // partial update worth merging.
+    if volume.is_none() && muted.is_none() {
+        return None;
+    }
+    Some(PropsUpdate { volume, muted })
 }
 
 /// Average a slice of per-channel linear amplitudes and apply the cubic
@@ -286,23 +388,69 @@ pub fn average_to_user_volume(channels: &[f32]) -> Option<f32> {
     Some(cbrt.clamp(0.0, 1.0))
 }
 
+/// The producer's outbound channel plus the shutdown flag that survives a
+/// reconnect.
+///
+/// [`supervise`] outlives any single PipeWire session, so it needs to tell a
+/// server that went away (reconnect) apart from a render loop that went away
+/// (stop). The only signal for the latter is a closed channel, which is
+/// observed deep inside the event callbacks — this carries the flag back out.
+#[derive(Clone)]
+struct Emitter {
+    tx: MsgSender,
+    closed: Arc<AtomicBool>,
+}
+
+impl Emitter {
+    fn new(tx: MsgSender) -> Self {
+        Self {
+            tx,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Send a message, latching [`Emitter::is_closed`] when the render loop has
+    /// dropped its receiver. Nothing else can be done about a closed channel,
+    /// so the error is recorded rather than propagated through every callback.
+    fn send(&self, msg: Msg) {
+        if self.tx.send(msg).is_err() {
+            debug!("volume: tx.send returned Closed");
+            self.closed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the render loop has gone away, which is the producer's cue to
+    /// stop reconnecting and return `Ok(())`.
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+}
+
 /// Cached state for one PipeWire sink node.
+///
+/// The volume and mute flags are tracked separately because PipeWire is free to
+/// push a `Props` POD carrying only one of them; see [`PropsUpdate`].
 #[derive(Clone)]
 struct SinkEntry {
     name: String,
     device: DeviceKind,
     running: bool,
-    /// `(volume, mute)` from the last Props POD we successfully parsed.
-    volume: Option<(f32, bool)>,
+    /// User-volume in `[0, 1]` from the last `channelVolumes` we parsed.
+    volume: Option<f32>,
+    /// Mute flag from the last `mute` we parsed.
+    muted: Option<bool>,
 }
 
 /// A [`Producer`] that polls PipeWire for the active output sink and emits
 /// [`Msg::Volume`] snapshots on every change.
 ///
 /// Construct with [`new`](VolumeProducer::new) and hand it to the producer
-/// bridge; it spawns a dedicated PipeWire main-loop thread on [`run`](Producer::run),
-/// reads an initial snapshot, then re-emits on every tick until the system
-/// PipeWire server closes or the render loop shuts down.
+/// bridge; it spawns a dedicated PipeWire main-loop thread on
+/// [`run`](Producer::run). Snapshots are event-driven — every sink `info`,
+/// `param`, and metadata change re-evaluates the active sink — with a poll on
+/// `interval` as the safety net for anything the server did not push. It
+/// reconnects for as long as the render loop is alive, so a PipeWire daemon
+/// that is not up yet (or restarts later) costs a few seconds, not the session.
 pub struct VolumeProducer {
     interval: Duration,
 }
@@ -337,24 +485,26 @@ impl Producer for VolumeProducer {
     }
 }
 
-/// Drive the producer: bring up the PipeWire main loop on a dedicated OS
-/// thread, seed the bar with the first reading, and re-emit on every tick.
+/// Drive the producer: run the PipeWire main loop on a dedicated OS thread,
+/// reconnecting for as long as the render loop wants messages.
 ///
-/// A failed system-PipeWire connection propagates as an error the bridge logs
-/// and isolates — the bar keeps running, the volume widget simply stays
-/// blank. A per-tick error (malformed POD, dropped metadata, …) degrades to
-/// [`Msg::Volume(None)`] and `warn!`s; the next tick retries the live read.
+/// The thread runs [`supervise`], which only returns once the render loop has
+/// dropped its receiver. A PipeWire server that is missing, not up yet, or
+/// restarted is a recoverable condition handled inside that loop, so — unlike
+/// every other producer — a connection failure here does not end the producer.
+/// The widget goes blank via [`Msg::Volume(None)`] while there is no reachable
+/// audio server and fills back in on reconnect.
 async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
     let (done_tx, done_rx) = oneshot::channel();
-    let tx_for_thread = tx.clone();
+    let emitter = Emitter::new(tx);
     thread::Builder::new()
         .name("tablero-volume".to_string())
         .spawn(move || {
-            // The thread owns the PipeWire main loop and exits when the loop
-            // terminates (server disconnect, OS error, …). The result
-            // travels back via the oneshot so the producer bridge can log it
-            // like any other producer failure.
-            let result = run_main_loop(tx_for_thread, period);
+            // The thread owns every PipeWire main loop this producer creates and
+            // exits when the render loop goes away. The result travels back via
+            // the oneshot so the producer bridge can log it like any other
+            // producer failure.
+            let result = supervise(&emitter, period);
             let _ = done_tx.send(result);
         })
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -368,23 +518,168 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
     }
 }
 
-/// Run the PipeWire main loop until the server goes away or an unrecoverable
-/// error surfaces.
+/// What one [`run_session`] attempt achieved before it ended.
+struct SessionOutcome {
+    /// Whether the core ever answered a sync, i.e. whether we were genuinely
+    /// talking to a PipeWire server. This is what [`supervise`] uses to tell
+    /// "the server restarted under us" (recover fast, say so once) from "there
+    /// is no server here" (back off quietly).
+    handshook: bool,
+    /// Why the session ended. `Ok(())` means the main loop was asked to quit —
+    /// by the watchdog, a core error, or the server closing the connection.
+    result: ProducerResult,
+}
+
+/// Own successive PipeWire sessions until the render loop goes away.
+///
+/// Reconnects with an exponential backoff from [`RETRY_DELAY`] to
+/// [`MAX_RETRY_DELAY`], resetting to the fast cadence whenever a session
+/// actually reached the server, so:
+///
+/// * a bar that started before its audio server recovers in a couple of
+///   seconds and says so once, at `warn` level;
+/// * a daemon that restarts mid-session is picked up on the next heartbeat and
+///   recovers at the same fast cadence;
+/// * a host with no PipeWire at all settles at one cheap attempt every 30
+///   seconds, logged at `debug`, rather than warning once a second forever.
+///
+/// The widget is only blanked once a *retry* has failed. A session that
+/// handshaked and then died usually comes back on the very next attempt, and
+/// emitting [`Msg::Volume(None)`] eagerly would just blink the pill.
+fn supervise(tx: &Emitter, period: Duration) -> ProducerResult {
+    // Initialize PipeWire once for the thread. The `init`/`deinit` pair is a
+    // global reference count; the static refcount means a leak-free shutdown is
+    // the OS's job when the process exits.
+    pipewire::init();
+
+    let mut delay = RETRY_DELAY;
+    let mut failures: u32 = 0;
+    loop {
+        let outcome = run_session(tx, period);
+        if tx.is_closed() {
+            // The render loop dropped its receiver: nothing left to feed.
+            return Ok(());
+        }
+        if outcome.handshook {
+            // The server was reachable this time, so whatever just happened is
+            // a fresh problem rather than a host without PipeWire.
+            failures = 0;
+            delay = RETRY_DELAY;
+        }
+        failures += 1;
+        let ended = match &outcome.result {
+            Ok(()) => "ended".to_string(),
+            Err(e) => format!("failed: {e}"),
+        };
+        if failures == 1 {
+            warn!("volume: PipeWire session {ended}; reconnecting in {delay:?}");
+        } else {
+            debug!("volume: PipeWire session {ended} (attempt {failures}); retrying in {delay:?}");
+            // Only now is the source demonstrably gone rather than restarting,
+            // so the pill can be blanked without blinking it.
+            tx.send(Msg::Volume(None));
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(MAX_RETRY_DELAY);
+    }
+}
+
+/// Run one PipeWire session: connect, watch sinks, and emit snapshots until the
+/// main loop quits.
+///
+/// Returns how the attempt went rather than a bare `Result`, because
+/// [`supervise`] needs to know whether the server was ever actually reachable.
+fn run_session(tx: &Emitter, period: Duration) -> SessionOutcome {
+    // Set by the core's `done` callback. `Cell` rather than an atomic because
+    // the whole session is single-threaded — PipeWire's main loop and every
+    // listener run on this thread.
+    let handshook = Rc::new(Cell::new(false));
+    let result = run_main_loop(tx, period, &handshook);
+    SessionOutcome {
+        handshook: handshook.get(),
+        result,
+    }
+}
+
+/// Run the PipeWire main loop until the server goes away, the watchdog gives up
+/// on it, or an unrecoverable error surfaces.
 ///
 /// Every read of PipeWire state is funneled through the shared
 /// [`Arc<Mutex<State>>`]; a periodic timer re-evaluates the active sink and
-/// emits a [`Msg::Volume`] if the normalized snapshot changed.
-fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
-    // Initialize PipeWire once. The `init`/`deinit` pair is a global
-    // reference count; calling it per thread is safe, and the static
-    // refcount means a leak-free shutdown is the OS's job when the
-    // process exits.
-    pipewire::init();
-
+/// emits a [`Msg::Volume`] if the normalized snapshot changed. `handshook` is
+/// set once the core answers a sync, which is what proves the connection is
+/// real; see the module docs on surviving a server that is not there yet.
+fn run_main_loop(tx: &Emitter, period: Duration, handshook: &Rc<Cell<bool>>) -> ProducerResult {
     let mainloop = MainLoopRc::new(None)?;
     let context = ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
+    debug!("volume: connected to PipeWire; awaiting the core handshake");
+
+    // Liveness. `pw_context_connect` succeeds against a socket-activated
+    // `pipewire-0` even when no daemon has accepted the connection yet, and the
+    // server then sends neither a global nor an error — so an affirmative check
+    // is the only way to notice. `pending_sync` tracks whether the sync we
+    // issued is still outstanding; the watchdog below quits the loop when one
+    // goes unanswered, and `supervise` reconnects.
+    let pending_sync = Rc::new(Cell::new(false));
+    let handshook_for_done = handshook.clone();
+    let pending_for_done = pending_sync.clone();
+    let mainloop_for_error = mainloop.downgrade();
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, _seq| {
+            if id != PW_ID_CORE {
+                return;
+            }
+            pending_for_done.set(false);
+            if !handshook_for_done.replace(true) {
+                info!("volume: PipeWire core handshake complete");
+            }
+        })
+        .error(move |id, _seq, res, message| {
+            warn!("volume: PipeWire reported an error on object {id}: {message} ({res})");
+            // An error on a single proxy (a sink that vanished mid-bind) is the
+            // registry's problem; an error on the core is the connection's.
+            if id == PW_ID_CORE
+                && let Some(mainloop) = mainloop_for_error.upgrade()
+            {
+                mainloop.quit();
+            }
+        })
+        .register();
+
+    // Issue the first sync before the loop starts, so the watchdog's first fire
+    // at `CONNECT_TIMEOUT` already has something outstanding to find. Without
+    // this the never-handshaked case would take a full heartbeat longer to
+    // detect.
+    core.sync(PW_ID_CORE as i32)?;
+    pending_sync.set(true);
+
+    let core_for_watchdog = core.clone();
+    let mainloop_for_watchdog = mainloop.downgrade();
+    let pending_for_watchdog = pending_sync.clone();
+    let watchdog = mainloop.loop_().add_timer(move |_expirations| {
+        if pending_for_watchdog.get() {
+            warn!("volume: PipeWire did not answer a sync; dropping the connection");
+            if let Some(mainloop) = mainloop_for_watchdog.upgrade() {
+                mainloop.quit();
+            }
+            return;
+        }
+        match core_for_watchdog.sync(PW_ID_CORE as i32) {
+            Ok(_) => pending_for_watchdog.set(true),
+            Err(e) => {
+                warn!("volume: PipeWire sync failed: {e}; dropping the connection");
+                if let Some(mainloop) = mainloop_for_watchdog.upgrade() {
+                    mainloop.quit();
+                }
+            }
+        }
+    });
+    // First fire proves the handshake landed; later fires prove the server is
+    // still alive.
+    watchdog.update_timer(Some(CONNECT_TIMEOUT), Some(HEARTBEAT_INTERVAL));
 
     // The shared state: the active-sink candidate set, the configured
     // default sink name (set by the `default.audio.sink` metadata), and the
@@ -417,8 +712,21 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
     // before its `global_remove` is delivered, etc.). The timer is
     // driven by the PipeWire main loop's own event source, so the thread
     // stays parked between ticks.
+    let mainloop_for_timer = mainloop.downgrade();
     let timer = mainloop.loop_().add_timer(move |_expirations| {
-        on_tick(&state_for_timer, &tx_for_timer);
+        on_poll_tick(&state_for_timer, &tx_for_timer);
+        // Shutdown: once the render loop has dropped its receiver there is
+        // nothing left to feed, so end the session and let `supervise` return
+        // instead of reconnecting to a bar that is gone. A closed channel is
+        // only observable through a failed send, and `on_tick` sends only on a
+        // change — the [`RESYNC_TICKS`] re-emit is what bounds the detection to
+        // ~30s on an otherwise idle machine.
+        if tx_for_timer.is_closed()
+            && let Some(mainloop) = mainloop_for_timer.upgrade()
+        {
+            debug!("volume: render loop went away; ending the PipeWire session");
+            mainloop.quit();
+        }
     });
     timer.update_timer(Some(period), Some(period));
 
@@ -457,34 +765,68 @@ fn run_main_loop(tx: MsgSender, period: Duration) -> ProducerResult {
 
 /// The shared, mutable producer state: cached sinks, the configured default,
 /// and the most recent snapshot we emitted.
+///
+/// One instance per PipeWire session — a reconnect starts from
+/// [`State::default`], so `last_emitted` never gates a snapshot on a value the
+/// previous connection sent.
 #[derive(Default)]
 struct State {
     sinks: HashMap<u32, SinkEntry>,
     default_sink_name: Option<String>,
     last_emitted: Option<Option<Volume>>,
+    /// Poll ticks since the change-gate was last dropped; see [`RESYNC_TICKS`].
+    ticks_since_resync: u32,
+}
+
+/// Handle one safety-net poll tick.
+///
+/// Same as [`on_tick`], except that every [`RESYNC_TICKS`]th tick clears the
+/// change-gate first, so the current snapshot is re-sent even if it has not
+/// changed. Without this, a `Msg::Volume` that never reached the render loop
+/// leaves the widget blank until the volume physically changes, because
+/// `last_emitted` is written on send rather than on delivery.
+fn on_poll_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
+    {
+        let mut s = state.lock().expect("volume state poisoned");
+        s.ticks_since_resync += 1;
+        if s.ticks_since_resync >= RESYNC_TICKS {
+            s.ticks_since_resync = 0;
+            s.last_emitted = None;
+        }
+    }
+    on_tick(state, tx);
 }
 
 /// Compute the snapshot to emit on a tick and send it through the
-/// cross-thread `MsgSender` if (and only if) it differs from the last one.
+/// cross-thread [`Emitter`] if (and only if) it differs from the last one.
 ///
 /// A re-emit happens when the normalized [`Volume`] value changes (level,
 /// mute, or device kind) or when the source goes from absent to present (or
 /// vice versa). Identical snapshots are dropped, so a steady-state machine
 /// costs one PipeWire event and zero render-loop work per tick.
-fn on_tick(state: &Arc<Mutex<State>>, tx: &MsgSender) {
+fn on_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
     let snapshot = compute_snapshot(state);
     let changed = {
         let state = state.lock().expect("volume state poisoned");
         state.last_emitted.as_ref() != Some(&snapshot)
     };
     if changed {
-        {
+        let first = {
             let mut state = state.lock().expect("volume state poisoned");
+            // `None` (nothing sent yet) and `Some(None)` (sent "no source")
+            // both mean the widget is not showing a reading right now.
+            let first = !matches!(state.last_emitted, Some(Some(_)));
             state.last_emitted = Some(snapshot);
+            first
+        };
+        if let (true, Some(volume)) = (first, snapshot) {
+            info!(
+                "volume: active sink at {}%{}",
+                volume.level(),
+                if volume.muted() { " (muted)" } else { "" }
+            );
         }
-        if tx.send(Msg::Volume(snapshot)).is_err() {
-            debug!("volume: tx.send returned Closed");
-        }
+        tx.send(Msg::Volume(snapshot));
     }
 }
 
@@ -500,10 +842,12 @@ fn on_tick(state: &Arc<Mutex<State>>, tx: &MsgSender) {
 ///    most common reference point, regardless of whether audio is
 ///    playing.
 ///
-/// A sink that has not yet reported a Props POD (the `enum_params` round-
-/// trip is still in flight) reports the bar as "absent" until the first
-/// parsing succeeds, so a sink appearing in the registry does not flip
-/// the widget to `Vol 0%` and back once the real reading lands.
+/// A sink that has not yet reported a volume (the `enum_params` round-trip is
+/// still in flight) reports the bar as "absent" until the first parsing
+/// succeeds, so a sink appearing in the registry does not flip the widget to
+/// `Vol 0%` and back once the real reading lands. A sink that reported a volume
+/// but no mute flag yet renders as unmuted rather than staying invisible —
+/// PipeWire may push the two in separate PODs.
 fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
     let state = state.lock().expect("volume state poisoned");
     let sinks = &state.sinks;
@@ -541,8 +885,12 @@ fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
     let id = active?;
     let entry = sinks.get(&id)?;
 
-    let (level, muted) = entry.volume?;
-    Some(Volume::new(level, muted, entry.device))
+    let level = entry.volume?;
+    Some(Volume::new(
+        level,
+        entry.muted.unwrap_or(false),
+        entry.device,
+    ))
 }
 
 /// Install the registry listener that builds the cached [`SinkEntry`] map.
@@ -574,7 +922,7 @@ fn attach_registry_listener(
     state: Arc<Mutex<State>>,
     node_proxies: Rc<RefCell<Vec<Node>>>,
     node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
-    tx: MsgSender,
+    tx: Emitter,
 ) -> pipewire::registry::Listener {
     let registry_weak = registry.downgrade();
     let state_for_global = state.clone();
@@ -607,6 +955,7 @@ fn attach_registry_listener(
             };
             let id = obj.id;
             let name = props.get("node.name").unwrap_or("?").to_string();
+            debug!("volume: found audio sink {id} ({name})");
 
             // Seed the entry immediately with a placeholder device kind so
             // the tick can resolve a name even before the first `info`
@@ -621,6 +970,7 @@ fn attach_registry_listener(
                         device: DeviceKind::Other,
                         running: false,
                         volume: None,
+                        muted: None,
                     },
                 );
             }
@@ -670,17 +1020,26 @@ fn attach_registry_listener(
                     let Some(param) = param else {
                         return;
                     };
-                    let parsed = parse_props_pod(param.as_bytes());
-                    let Some((level, muted)) = parsed else {
-                        // A malformed POD is not a hard failure — just skip
-                        // this tick for the sink; the next param event will
-                        // retry.
+                    let Some(update) = parse_props_pod(param.as_bytes()) else {
+                        // Routine: a sink's `Props` also carry device metadata
+                        // (`device`, `deviceName`, `cardName`) with no volume in
+                        // sight. A malformed POD lands here too, and is equally
+                        // harmless — the next param event carries the state.
+                        debug!("volume: sink {id} sent a Props POD with no volume or mute");
                         return;
                     };
                     {
                         let mut s = state_for_param.lock().expect("volume state poisoned");
                         if let Some(entry) = s.sinks.get_mut(&id) {
-                            entry.volume = Some((level, muted));
+                            // Merge rather than replace: PipeWire may push the
+                            // volume and the mute flag in separate PODs, and
+                            // dropping a partial update would strand the entry.
+                            if let Some(volume) = update.volume {
+                                entry.volume = Some(volume);
+                            }
+                            if let Some(muted) = update.muted {
+                                entry.muted = Some(muted);
+                            }
                         }
                     }
                     // The volume or mute just changed — re-evaluate the
@@ -750,7 +1109,7 @@ fn attach_metadata_listener(
     state: Arc<Mutex<State>>,
     node_proxies: Rc<RefCell<Vec<pipewire::metadata::Metadata>>>,
     node_listeners: Rc<RefCell<Vec<Box<dyn Listener>>>>,
-    tx: MsgSender,
+    tx: Emitter,
 ) -> pipewire::registry::Listener {
     use pipewire::metadata::Metadata;
 
@@ -768,7 +1127,10 @@ fn attach_metadata_listener(
             };
             let metadata: Metadata = match registry.bind(obj) {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(err) => {
+                    debug!("volume: could not bind metadata global {}: {err}", obj.id);
+                    return;
+                }
             };
             let state_for_property = state.clone();
             let state_for_tick = state.clone();
@@ -783,6 +1145,10 @@ fn attach_metadata_listener(
                         return 0;
                     };
                     let name = parse_metadata_default_name(value);
+                    match &name {
+                        Some(name) => debug!("volume: default sink is {name}"),
+                        None => debug!("volume: default-sink metadata had no usable name: {value}"),
+                    }
                     {
                         let mut s = state_for_property.lock().expect("volume state poisoned");
                         s.default_sink_name = name;
@@ -1044,70 +1410,130 @@ mod tests {
 
     // ---- parse_props_pod ----
 
-    #[test]
-    fn parse_props_pod_round_trip_extracts_volume_and_mute() {
-        // Build a real `ParamType::Props` POD the same way wireplumber does,
-        // round-trip through the libspa serialize / deserialize machinery.
-        // A future bindgen / header drift that renumbers the property keys
-        // will fail this test loudly.
-        use pipewire::spa::pod::PropertyFlags;
-        use pipewire::spa::pod::serialize::{GenError, PodSerialize, PodSerializer};
-        use pipewire::spa::sys::{
-            SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props,
-        };
-        use std::io::Cursor;
+    /// The per-channel amplitudes and mute flag to serialize, each optional
+    /// so a test can build the partial PODs PipeWire is free to push.
+    struct TestProps {
+        /// The per-channel linear amplitudes. The user-volume percent
+        /// `pactl` reports is `cbrt(avg(channels)) * 100`; the tests store
+        /// `x^3` per channel so the expected `cbrt` is `x`.
+        channels: Option<Vec<f32>>,
+        muted: Option<bool>,
+    }
 
-        struct MyProps {
-            /// The per-channel linear amplitudes. The user-volume percent
-            /// `pactl` reports is `cbrt(avg(channels)) * 100`; this test
-            /// stores `0.5^3` per channel so the expected `cbrt` is 0.5.
-            channels: Vec<f32>,
-            muted: bool,
-        }
+    impl pipewire::spa::pod::serialize::PodSerialize for TestProps {
+        fn serialize<O: std::io::Write + std::io::Seek>(
+            &self,
+            serializer: pipewire::spa::pod::serialize::PodSerializer<O>,
+        ) -> Result<
+            pipewire::spa::pod::serialize::SerializeSuccess<O>,
+            pipewire::spa::pod::serialize::GenError,
+        > {
+            use pipewire::spa::pod::PropertyFlags;
+            use pipewire::spa::sys::{
+                SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props,
+            };
 
-        impl PodSerialize for MyProps {
-            fn serialize<O: std::io::Write + std::io::Seek>(
-                &self,
-                serializer: PodSerializer<O>,
-            ) -> Result<pipewire::spa::pod::serialize::SerializeSuccess<O>, GenError> {
-                let mut obj_serializer =
-                    serializer.serialize_object(SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
+            let mut obj_serializer =
+                serializer.serialize_object(SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
+            if let Some(channels) = &self.channels {
                 obj_serializer.serialize_property(
                     SPA_PROP_channelVolumes,
-                    self.channels.as_slice(),
+                    channels.as_slice(),
                     PropertyFlags::empty(),
                 )?;
-                obj_serializer.serialize_property(
-                    SPA_PROP_mute,
-                    &self.muted,
-                    PropertyFlags::empty(),
-                )?;
-                obj_serializer.end()
             }
+            if let Some(muted) = &self.muted {
+                obj_serializer.serialize_property(SPA_PROP_mute, muted, PropertyFlags::empty())?;
+            }
+            obj_serializer.end()
         }
+    }
 
+    /// Build a real `ParamType::Props` POD the same way wireplumber does,
+    /// round-tripping through the libspa serialize machinery so the tests
+    /// exercise the same deserialize path the producer uses.
+    fn serialize_props(props: &TestProps) -> Vec<u8> {
+        pipewire::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            props,
+        )
+        .expect("serialize props")
+        .0
+        .into_inner()
+    }
+
+    #[test]
+    fn spa_prop_keys_match_the_shipped_headers() {
         // Sanity: the constants the production code uses match the values
         // bindgen ships today. If a future libspa-sys bumps the header
         // version, the test catches it before the producer does.
+        use pipewire::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
         assert_eq!(
             SPA_PROP_channelVolumes, 65544,
             "SPA_PROP_channelVolumes drifted"
         );
         assert_eq!(SPA_PROP_mute, 65540, "SPA_PROP_mute drifted");
+    }
 
+    #[test]
+    fn parse_props_pod_round_trip_extracts_volume_and_mute() {
         // Wireplumber stores user-volume as `user^3` per channel; 0.5^3
         // = 0.125 per channel, average = 0.125, cbrt(0.125) = 0.5.
         let cubic = 0.5_f32.powi(3);
-        let props = MyProps {
-            channels: vec![cubic, cubic],
-            muted: true,
-        };
-        let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &props)
-            .unwrap()
-            .0
-            .into_inner();
-        let parsed = parse_props_pod(&bytes);
-        assert_eq!(parsed, Some((0.5, true)));
+        let bytes = serialize_props(&TestProps {
+            channels: Some(vec![cubic, cubic]),
+            muted: Some(true),
+        });
+        assert_eq!(
+            parse_props_pod(&bytes),
+            Some(PropsUpdate {
+                volume: Some(0.5),
+                muted: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_props_pod_accepts_a_volume_only_pod() {
+        // PipeWire is free to push either property alone. Dropping such a
+        // POD is what kept the pill invisible on a sink that had only
+        // announced its level, so the parse has to survive it.
+        let cubic = 0.3_f32.powi(3);
+        let bytes = serialize_props(&TestProps {
+            channels: Some(vec![cubic, cubic]),
+            muted: None,
+        });
+        let parsed = parse_props_pod(&bytes).expect("volume-only POD parses");
+        assert!((parsed.volume.expect("volume") - 0.3).abs() < 1e-5);
+        assert_eq!(parsed.muted, None);
+    }
+
+    #[test]
+    fn parse_props_pod_accepts_a_mute_only_pod() {
+        // The mirror case: a mute toggle with no channel volumes must
+        // update the mute flag and leave the stored level untouched.
+        let bytes = serialize_props(&TestProps {
+            channels: None,
+            muted: Some(true),
+        });
+        assert_eq!(
+            parse_props_pod(&bytes),
+            Some(PropsUpdate {
+                volume: None,
+                muted: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_props_pod_returns_none_when_neither_property_is_present() {
+        // A Props POD that carries neither key tells us nothing, so it is
+        // reported as unusable rather than merged as an empty update.
+        let bytes = serialize_props(&TestProps {
+            channels: None,
+            muted: None,
+        });
+        assert_eq!(parse_props_pod(&bytes), None);
     }
 
     #[test]
@@ -1163,7 +1589,8 @@ mod tests {
                 name: "headphones".to_string(),
                 device: DeviceKind::Headphones,
                 running: true,
-                volume: Some((0.5, false)),
+                volume: Some(0.5),
+                muted: Some(false),
             },
         );
         state.sinks.insert(
@@ -1172,7 +1599,8 @@ mod tests {
                 name: "speakers".to_string(),
                 device: DeviceKind::Speakers,
                 running: false,
-                volume: Some((0.3, true)),
+                volume: Some(0.3),
+                muted: Some(true),
             },
         );
         let state = Arc::new(Mutex::new(state));
@@ -1191,7 +1619,8 @@ mod tests {
                 name: "headphones".to_string(),
                 device: DeviceKind::Headphones,
                 running: false,
-                volume: Some((0.5, false)),
+                volume: Some(0.5),
+                muted: Some(false),
             },
         );
         state.sinks.insert(
@@ -1200,7 +1629,8 @@ mod tests {
                 name: "speakers".to_string(),
                 device: DeviceKind::Speakers,
                 running: false,
-                volume: Some((0.3, true)),
+                volume: Some(0.3),
+                muted: Some(true),
             },
         );
         state.default_sink_name = Some("speakers".to_string());
@@ -1223,9 +1653,32 @@ mod tests {
                 device: DeviceKind::Speakers,
                 running: true,
                 volume: None,
+                muted: None,
             },
         );
         let state = Arc::new(Mutex::new(state));
         assert!(compute_snapshot(&state).is_none());
+    }
+
+    #[test]
+    fn compute_snapshot_shows_a_sink_that_has_not_reported_mute_yet() {
+        // A level with no mute flag is worth showing: treating the missing
+        // flag as "not muted" beats hiding the pill until a mute POD
+        // happens to arrive.
+        let mut state = State::default();
+        state.sinks.insert(
+            1,
+            SinkEntry {
+                name: "speakers".to_string(),
+                device: DeviceKind::Speakers,
+                running: true,
+                volume: Some(0.42),
+                muted: None,
+            },
+        );
+        let state = Arc::new(Mutex::new(state));
+        let snap = compute_snapshot(&state).expect("snapshot");
+        assert_eq!(snap.level(), 42);
+        assert!(!snap.muted());
     }
 }
