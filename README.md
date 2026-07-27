@@ -113,8 +113,9 @@ RUST_LOG=info cargo run -p tablero
     "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
   - **Volume** — the active output sink's level (`Vol N%`) and mute state
     (`Mute`), read over the native PipeWire wire protocol. The icon is a
-    built-in speaker that follows the level — low / medium / high, or a
-    muted variant when muted — so the fill hints at the level at a glance.
+    built-in speaker that follows the level — one more wave per step from
+    low to high, and the muted speaker when muted or at 0% — so the icon
+    hints at the level at a glance.
     Switching the active sink still triggers a repaint. **Opt-in**: not in the default set;
     add `"volume"` to a zone to enable it. The widget reserves no slot
     when no PipeWire server is reachable (or no output sink exists),
@@ -556,8 +557,9 @@ surface placement and input need a live compositor. To verify on Hyprland:
  15. Verify the **volume widget** (opt-in: add `"volume"` to a zone). With
      a running PipeWire server (pipewire + wireplumber / pipewire-pulse)
      and at least one output sink configured:
-     - The widget appears with a built-in speaker icon whose fill follows the
-       level (low / medium / high) and a label of `Vol N%` (where `N` is the
+     - The widget appears with a built-in speaker icon whose waves follow the
+       level (bare speaker at 1-33%, one wave at 34-66%, two waves above; the
+       muted speaker at 0%) and a label of `Vol N%` (where `N` is the
        active sink's level). On a system with PipeWire but no output sink configured,
        the widget reserves no slot (matching the `network` / `system`
        pattern); on a system with no PipeWire running, the widget also
@@ -569,7 +571,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
        per-cent: `12%`, `13%`, …
      - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
        the label flips to `Mute` with the muted speaker icon; toggling
-       mute back restores `Vol N%` with the level-based icon.
+       mute back restores `Vol N%` with the level-based icon. Setting the
+       level to `0%` unmuted shows `Vol 0%` with the same muted icon.
      - With multiple sinks configured (e.g. headphones + monitor speakers),
        play audio through one and confirm the widget tracks *that* sink
        (active sink has its `NodeState` set to `Running`); switching

@@ -114,8 +114,11 @@ impl BuiltinIcon {
             BuiltinIcon::PowerProfilePerformance => "bolt-lightning-filled",
             BuiltinIcon::PowerProfileBalanced => "balance-filled",
             BuiltinIcon::PowerProfileSaver => "feather-filled",
-            BuiltinIcon::VolumeLow => "volume-down-filled",
-            BuiltinIcon::VolumeMedium => "volume-filled",
+            // The art is named for the source set's buttons, not for levels: the
+            // bare speaker is `volume-filled`, one wave is `volume-down-filled`,
+            // two waves is `volume-up-filled`. Order by wave count, not by name.
+            BuiltinIcon::VolumeLow => "volume-filled",
+            BuiltinIcon::VolumeMedium => "volume-down-filled",
             BuiltinIcon::VolumeHigh => "volume-up-filled",
             BuiltinIcon::VolumeMuted => "volume-x-filled",
         }
@@ -227,6 +230,22 @@ mod tests {
                 icon.stem()
             );
         }
+    }
+
+    #[test]
+    fn volume_art_gains_a_wave_per_level() {
+        // The source names ("volume-filled" is the bare speaker) do not follow the
+        // level ramp, so pin the thing the eye actually reads: each louder level
+        // draws one more sub-path than the last.
+        let waves = |icon: BuiltinIcon| icon.raw().expect("volume artwork").paths.len();
+        assert!(
+            waves(BuiltinIcon::VolumeLow) < waves(BuiltinIcon::VolumeMedium),
+            "low must be quieter-looking than medium"
+        );
+        assert!(
+            waves(BuiltinIcon::VolumeMedium) < waves(BuiltinIcon::VolumeHigh),
+            "medium must be quieter-looking than high"
+        );
     }
 
     #[test]
