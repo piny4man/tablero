@@ -160,6 +160,12 @@ RUST_LOG=info cargo run -p tablero
   dedicated OS thread (PipeWire's `MainLoop` is synchronous and
   file-descriptor-driven, unlike zbus), and reaches the Tokio runtime the
   same way — by sending `Msg::Volume`s through the cross-thread `MsgSender`.
+  That thread supervises its own connection: a `core.sync` heartbeat proves the
+  server is really there (connecting to a socket-activated `pipewire-0` before
+  the daemon exists otherwise *succeeds* and then never handshakes), and an
+  unanswered one reconnects on a 1s→30s backoff — so a bar started before its
+  audio server, or a daemon restarted under it, costs a couple of seconds
+  rather than the session.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
@@ -574,6 +580,13 @@ surface placement and input need a live compositor. To verify on Hyprland:
        configured process is spawned (no shell, direct exec). A missing
        or non-executable path is logged as an error and does not crash
        the bar.
+     - Restart the audio server under the running bar with `systemctl --user
+       restart pipewire.service` and confirm the widget briefly reserves no
+       slot and then comes back with the right level, instead of freezing or
+       disappearing for the rest of the session. Starting the bar *before*
+       PipeWire (the usual compositor-autostart race) is the same code path;
+       `RUST_LOG=tablero=debug` shows the reconnect and the
+       `PipeWire core handshake complete` that follows it.
  16. Verify the **notifications widget** (opt-in: add `"notifications"` to a
      zone). With swaync running as the session's notification daemon:
      - The widget appears as a bell glyph with no dot. With swaync not
