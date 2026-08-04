@@ -40,7 +40,7 @@ pub mod volume;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::blit::write_argb8888;
 use crate::clock::millis_until_next_minute;
@@ -230,24 +230,35 @@ impl Surface {
     }
 
     /// Rebuild layout and visuals from a new config (hot-reload).
-    fn apply_config(&mut self, config: Config, pool: &mut SlotPool) {
+    ///
+    /// `seed` is replayed into the fresh dashboard so widgets keep the last
+    /// producer snapshot instead of going blank until the next event.
+    fn apply_config(&mut self, config: Config, pool: &mut SlotPool, seed: &[Msg]) {
         let height = config.height;
-        if self.height != height {
+        let height_changed = self.height != height;
+        if height_changed {
             self.height = height;
             self.layer.set_size(0, height);
             self.layer.set_exclusive_zone(height as i32);
             // Size change requests a new configure; still repaint at the current
             // geometry so theme/widget changes appear immediately.
             self.layer.commit();
+            // Only drop SHM slots when geometry changes — dropping an attached
+            // buffer while the compositor still holds it can tear down the surface.
+            self.buffers = [None, None];
+            self.buffer_px = (0, 0);
         }
         self.config = config;
         let full = Bounds::new(0, 0, self.width.max(1), self.height.max(1));
         self.dashboard = self.config.build_dashboard(full, self.monitor.as_deref());
         self.ctx
             .set_settings(self.config.scaled_render_settings(self.scale));
-        // Drop cached SHM slots so a height change cannot reuse a wrong size.
-        self.buffers = [None, None];
-        self.buffer_px = (0, 0);
+        // Rebuild clears widget state; replay the last producer snapshots and
+        // a fresh clock tick so the bar does not go empty until the next event.
+        for msg in seed {
+            let _ = self.dashboard.update(msg);
+        }
+        let _ = self.dashboard.update(&Msg::tick_now());
         if self.configured {
             self.draw(pool);
         }
@@ -825,9 +836,73 @@ struct App {
     fonts: SharedFonts,
     /// Optional path watched for config hot-reload.
     config_path: Option<PathBuf>,
-    /// Last observed mtime of `config_path` (or `None` if missing).
+    /// Last successfully applied mtime of `config_path` (or `None` if missing).
     config_mtime: Option<SystemTime>,
+    /// mtime we are debouncing before applying (editor mid-save).
+    config_pending_mtime: Option<SystemTime>,
+    /// When `config_pending_mtime` was first observed.
+    config_pending_at: Option<Instant>,
+    /// Latest producer messages, replayed after a dashboard rebuild on reload.
+    producer_snapshot: ProducerSnapshot,
     exit: bool,
+}
+
+/// Latest producer payloads retained for config hot-reload reseeding.
+///
+/// Rebuilds replace every widget; without a snapshot the bar goes blank until
+/// each source next emits (workspace/title/volume can stay empty for a long
+/// time). Transient menu messages are not stored.
+#[derive(Default)]
+struct ProducerSnapshot {
+    messages: Vec<Msg>,
+}
+
+impl ProducerSnapshot {
+    fn note(&mut self, msg: &Msg) {
+        if matches!(
+            msg,
+            Msg::Tick(_) | Msg::TrayMenu(_) | Msg::TrayMenuUnavailable(_)
+        ) {
+            return;
+        }
+        let key = snapshot_key(msg);
+        if let Some(slot) = self
+            .messages
+            .iter_mut()
+            .find(|existing| snapshot_key(existing) == key)
+        {
+            *slot = msg.clone();
+        } else {
+            self.messages.push(msg.clone());
+        }
+    }
+
+    fn as_slice(&self) -> &[Msg] {
+        &self.messages
+    }
+}
+
+/// Stable key for the latest-message map. Active-window is per-monitor so a
+/// dual-head setup keeps both titles across reload.
+fn snapshot_key(msg: &Msg) -> String {
+    match msg {
+        Msg::Tick(_) => "tick".into(),
+        Msg::Workspaces(_) => "workspaces".into(),
+        Msg::Battery(_) => "battery".into(),
+        Msg::Backlight(_) => "backlight".into(),
+        Msg::System(_) => "system".into(),
+        Msg::Network(_) => "network".into(),
+        Msg::Bluetooth(_) => "bluetooth".into(),
+        Msg::Tray(_) => "tray".into(),
+        Msg::TrayMenu(_) => "tray-menu".into(),
+        Msg::TrayMenuUnavailable(_) => "tray-menu-unavail".into(),
+        Msg::ActiveWindow { monitor, .. } => format!("aw:{monitor}"),
+        Msg::Volume(_) => "volume".into(),
+        Msg::Notifications(_) => "notifications".into(),
+        Msg::PowerProfiles(_) => "power-profiles".into(),
+        Msg::Updates(_) => "updates".into(),
+        Msg::Hypridle(_) => "hypridle".into(),
+    }
 }
 
 impl App {
@@ -875,6 +950,7 @@ impl App {
         self.hide_tooltip();
         self.hide_tray_menu();
         let base = self.outputs.base().clone();
+        let seed: Vec<Msg> = self.producer_snapshot.as_slice().to_vec();
         let reloads: Vec<(OutputId, Config)> = self
             .outputs
             .values()
@@ -888,27 +964,54 @@ impl App {
             .collect();
         for (id, resolved) in reloads {
             if let Some(surface) = self.outputs.get_mut(id) {
-                surface.apply_config(resolved, &mut self.pool);
+                surface.apply_config(resolved, &mut self.pool, &seed);
             }
         }
         info!("config reloaded");
     }
 
     /// Poll the config file mtime and reload when it changes.
+    ///
+    /// Debounces ~400ms so editors that truncate-then-write do not apply an
+    /// empty mid-save document (which would parse as defaults and wipe the bar).
     fn poll_config_reload(&mut self) {
         let Some(path) = self.config_path.clone() else {
             return;
         };
         let mtime = file_mtime(&path);
         if mtime == self.config_mtime {
+            self.config_pending_mtime = None;
+            self.config_pending_at = None;
             return;
         }
-        // First observation of a missing→present or present→missing file also
-        // reloads so create/delete of the config takes effect.
-        self.config_mtime = mtime;
-        match Config::load_from_path(&path) {
-            Ok(config) => self.reload_config(config),
-            Err(error) => warn!("config reload ignored: {error}"),
+
+        // New or updated mtime: (re)start the settle timer.
+        if self.config_pending_mtime != mtime {
+            self.config_pending_mtime = mtime;
+            self.config_pending_at = Some(Instant::now());
+            return;
+        }
+        let Some(started) = self.config_pending_at else {
+            return;
+        };
+        if started.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+
+        match Config::load_for_reload(&path) {
+            Ok(config) => {
+                self.config_mtime = mtime;
+                self.config_pending_mtime = None;
+                self.config_pending_at = None;
+                self.reload_config(config);
+            }
+            Err(error) => {
+                warn!("config reload ignored: {error}");
+                // Stop retrying this mtime until the user saves again.
+                self.config_mtime = mtime;
+                self.config_pending_mtime = None;
+                self.config_pending_at = None;
+            }
         }
     }
 
@@ -932,6 +1035,7 @@ impl App {
     /// Fan a message out to every output's dashboard, redrawing the ones that
     /// changed. The clock timer and every producer reach all bars this way.
     fn handle_all(&mut self, msg: &Msg) {
+        self.producer_snapshot.note(msg);
         let App { pool, outputs, .. } = self;
         let mut changed = false;
         for surface in outputs.values_mut() {
@@ -1309,6 +1413,9 @@ pub fn run_with_producers(
         fonts,
         config_path,
         config_mtime,
+        config_pending_mtime: None,
+        config_pending_at: None,
+        producer_snapshot: ProducerSnapshot::default(),
         exit: false,
     };
 

@@ -863,24 +863,46 @@ impl Config {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         let path = path.as_ref();
         match fs::read_to_string(path) {
-            Ok(text) => {
-                let config: Config =
-                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                        path: Some(path.to_path_buf()),
-                        source,
-                    })?;
-                config.validate().map_err(|message| ConfigError::Invalid {
-                    path: Some(path.to_path_buf()),
-                    message,
-                })?;
-                Ok(config)
-            }
+            Ok(text) => Self::parse_file_text(path, &text),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
             Err(source) => Err(ConfigError::Read {
                 path: path.to_path_buf(),
                 source,
             }),
         }
+    }
+
+    /// Load a config for **hot-reload**: never invents defaults.
+    ///
+    /// Unlike [`load_from_path`], a missing file, an empty/whitespace-only
+    /// document (common mid-save when an editor truncates), or a parse error
+    /// is always an error so the running bar keeps its previous config instead
+    /// of flashing to built-in defaults.
+    pub fn load_for_reload(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if text.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                path: Some(path.to_path_buf()),
+                message: "config file is empty (save may still be in progress)".to_string(),
+            });
+        }
+        Self::parse_file_text(path, &text)
+    }
+
+    fn parse_file_text(path: &Path, text: &str) -> Result<Config, ConfigError> {
+        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        config.validate().map_err(|message| ConfigError::Invalid {
+            path: Some(path.to_path_buf()),
+            message,
+        })?;
+        Ok(config)
     }
 
     /// Validate the resolved values, rejecting ones that deserialize fine but
@@ -1438,6 +1460,23 @@ mod tests {
                 .ends_with("tablero/config.toml")
         );
         assert_eq!(config_file_path_from(None, None), None);
+    }
+
+    #[test]
+    fn load_for_reload_rejects_empty_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert!(Config::load_for_reload(&missing).is_err());
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "   \n").unwrap();
+        let err = Config::load_for_reload(&empty).unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "height = 40\n").unwrap();
+        let config = Config::load_for_reload(&ok).unwrap();
+        assert_eq!(config.height, 40);
     }
 
     #[test]
