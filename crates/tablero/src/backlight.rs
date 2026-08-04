@@ -251,6 +251,15 @@ pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> 
     Ok(())
 }
 
+/// True when `name` is a single sysfs device segment (no `/`, `.`, or `..`).
+///
+/// Device names come from our own enumeration in the normal path; this guard
+/// still rejects traversal if a future caller ever threaded a free-form string
+/// into [`adjust_device`].
+pub fn is_safe_backlight_device(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
 async fn adjust_device(
     connection: &Connection,
     root: &Path,
@@ -258,6 +267,9 @@ async fn adjust_device(
     direction: ScrollDirection,
     step: f64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_safe_backlight_device(device) {
+        return Err(format!("invalid backlight device name: {device:?}").into());
+    }
     let path = root.join(device);
     let current = read_u32(&path.join("brightness")).await?;
     let maximum = read_u32(&path.join("max_brightness")).await?;
@@ -365,5 +377,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let producer = BacklightProducer::at(temp.path().to_path_buf(), Duration::from_millis(1));
         assert_eq!(producer.name(), "linux-backlight");
+    }
+
+    #[test]
+    fn device_names_reject_path_traversal() {
+        assert!(is_safe_backlight_device("intel_backlight"));
+        assert!(is_safe_backlight_device("amdgpu_bl1"));
+        assert!(!is_safe_backlight_device(""));
+        assert!(!is_safe_backlight_device("."));
+        assert!(!is_safe_backlight_device(".."));
+        assert!(!is_safe_backlight_device("../brightness"));
+        assert!(!is_safe_backlight_device("foo/bar"));
+        assert!(!is_safe_backlight_device("foo\0bar"));
     }
 }

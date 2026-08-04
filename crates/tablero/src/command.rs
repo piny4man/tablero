@@ -159,12 +159,24 @@ pub fn resolve_program(program: &Path) -> PathBuf {
     find_in_path(&expanded).unwrap_or(expanded)
 }
 
+/// True when `path` contains a `..` component (path traversal).
+pub fn path_has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Soft preflight for on-click program paths before spawn.
 ///
-/// Absolute paths (including PATH-resolved and tilde-expanded scripts) get a
-/// clearer error when the file is missing or not executable. Bare names that
-/// were not resolved should be rejected by the caller before this runs.
+/// Rejects `..` components, then for absolute paths checks existence and the
+/// execute bit. Bare names that were not resolved should be rejected by the
+/// caller before this runs.
 pub fn preflight_on_click(path: &Path) -> Result<(), String> {
+    if path_has_parent_component(path) {
+        return Err(format!(
+            "{} must not contain '..' path components",
+            path.display()
+        ));
+    }
     if !path.is_absolute() {
         // Relative multi-component paths still go through spawn; the kernel
         // reports the failure. Absolute-only preflight keeps bare-name PATH
@@ -402,6 +414,14 @@ mod tests {
         let err = preflight_on_click(Path::new("/this/path/definitely/does/not/exist"))
             .expect_err("missing file");
         assert!(err.contains("does/not/exist"), "{err}");
+    }
+
+    #[test]
+    fn preflight_rejects_parent_dir_components() {
+        let err = preflight_on_click(Path::new("/tmp/../etc/passwd")).expect_err("parent");
+        assert!(err.contains(".."), "{err}");
+        let err = preflight_on_click(Path::new("../bin/evil")).expect_err("relative parent");
+        assert!(err.contains(".."), "{err}");
     }
 
     #[test]

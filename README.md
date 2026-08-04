@@ -155,18 +155,21 @@ RUST_LOG=info cargo run -p tablero
   Hyprland setups render at the next integer scale and the compositor downscales,
   which stays sharp in practice.
 - Pulls live data from **async producers** (Hyprland IPC, UPower, procfs,
-  NetworkManager over DBus) running on an off-thread Tokio runtime; they reach
-  the synchronous render loop only by sending messages through a `calloop`
-  channel. The PipeWire volume source is the one exception: it runs on a
-  dedicated OS thread (PipeWire's `MainLoop` is synchronous and
-  file-descriptor-driven, unlike zbus), and reaches the Tokio runtime the
-  same way — by sending `Msg::Volume`s through the cross-thread `MsgSender`.
-  That thread supervises its own connection: a `core.sync` heartbeat proves the
-  server is really there (connecting to a socket-activated `pipewire-0` before
-  the daemon exists otherwise *succeeds* and then never handshakes), and an
-  unanswered one reconnects on a 1s→30s backoff — so a bar started before its
-  audio server, or a daemon restarted under it, costs a couple of seconds
-  rather than the session.
+  NetworkManager over DBus, and peers) on an off-thread Tokio runtime; they
+  reach the synchronous render loop only by sending messages through a
+  `calloop` channel. **Each producer starts only when some bar layout includes
+  its widget** (Hyprland always runs for workspaces/title), so a minimal config
+  does not open PipeWire, host a StatusNotifierWatcher, or poll backlight
+  sysfs. The PipeWire volume source is the one exception to the Tokio-worker
+  pattern: it runs on a dedicated OS thread (PipeWire's `MainLoop` is
+  synchronous and file-descriptor-driven, unlike zbus), and reaches the Tokio
+  runtime the same way — by sending `Msg::Volume`s through the cross-thread
+  `MsgSender`. That thread supervises its own connection: a `core.sync`
+  heartbeat proves the server is really there (connecting to a socket-activated
+  `pipewire-0` before the daemon exists otherwise *succeeds* and then never
+  handshakes), and an unanswered one reconnects on a 1s→30s backoff — so a bar
+  started before its audio server, or a daemon restarted under it, costs a
+  couple of seconds rather than the session.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.

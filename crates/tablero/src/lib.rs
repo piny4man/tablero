@@ -1049,41 +1049,45 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// Open the bar and run its event loop until the compositor closes the surface.
 ///
 /// The bar's height, theme, font, spacing, and widget order all come from
-/// `config` (see [`crate::config::Config`]). Wires the default producer
-/// set — the Hyprland workspace source, the UPower battery source, the procfs
-/// system-stats source, the NetworkManager connectivity source, the BlueZ
-/// bluetooth source, the native PipeWire volume source, the
-/// StatusNotifierItem tray host, swaync notification source, and optional Arch
-/// package-update and Hypridle process pollers — so the
-/// bar shows live workspaces, battery, CPU/memory load, network state,
-/// Bluetooth adapter state, the active output sink's volume, tray icons, and
-/// the notification indicator alongside the clock. The bluetooth, volume,
-/// tray, and notifications producers run even when their widgets are not in
-/// any zone; the widget only appears when the user adds `"bluetooth"`,
-/// `"volume"`, `"tray"`, or `"notifications"` to a zone. The update poller is
-/// the exception: it starts only when `"updates"` is configured, avoiding
-/// needless subprocess and network work. Hypridle process polling is likewise
-/// enabled only when `"hypridle"` is configured. The volume source runs on a dedicated
-/// OS thread —
-/// PipeWire's main loop is synchronous, unlike the other producers' zbus
-/// backends. The clock itself is still driven by the synchronous tick timer;
-/// see [`run_with_producers`] to supply a custom producer set.
+/// `config` (see [`crate::config::Config`]). Wires producers for the widgets
+/// that appear in the global layout or any per-monitor override
+/// ([`Config::uses_widget`]): Hyprland always runs (workspaces / title);
+/// UPower, sysmon, NetworkManager, BlueZ, PipeWire volume, the SNI tray host,
+/// swaync, power-profiles-daemon, backlight, Arch updates, and Hypridle start
+/// only when their module is configured. The volume source uses a dedicated OS
+/// thread (PipeWire's main loop is synchronous). The clock is driven by the
+/// synchronous tick timer. See [`run_with_producers`] to supply a custom set.
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    let mut producers: Vec<Box<dyn Producer>> = vec![
-        Box::new(HyprlandProducer::new()),
-        Box::new(UPowerProducer::new()),
-        Box::new(BacklightProducer::new()),
-        Box::new(SystemProducer::new()),
-        Box::new(NetworkProducer::new()),
-        Box::new(BluetoothProducer::new()),
-        Box::new(VolumeProducer::new()),
-        Box::new(SniHostProducer::new()),
-        Box::new(NotificationsProducer::new()),
-        Box::new(PowerProfilesProducer::new()),
-    ];
-    // Unlike DBus subscriptions, checking package repositories performs network
-    // and subprocess work, so keep this producer dormant unless some output uses
-    // the opt-in module.
+    let mut producers: Vec<Box<dyn Producer>> = vec![Box::new(HyprlandProducer::new())];
+    // Gate non-Hyprland sources so a minimal bar does not open PipeWire, host a
+    // StatusNotifierWatcher, or poll sysfs/backlight unnecessarily.
+    if config.uses_widget(WidgetKind::Battery) {
+        producers.push(Box::new(UPowerProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Backlight) {
+        producers.push(Box::new(BacklightProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::System) {
+        producers.push(Box::new(SystemProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Network) {
+        producers.push(Box::new(NetworkProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Bluetooth) {
+        producers.push(Box::new(BluetoothProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Volume) {
+        producers.push(Box::new(VolumeProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Tray) {
+        producers.push(Box::new(SniHostProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Notifications) {
+        producers.push(Box::new(NotificationsProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::PowerProfilesDaemon) {
+        producers.push(Box::new(PowerProfilesProducer::new()));
+    }
     if config.uses_widget(WidgetKind::Updates) {
         producers.push(Box::new(UpdatesProducer::new()));
     }

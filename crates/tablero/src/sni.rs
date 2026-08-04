@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +48,13 @@ const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 /// The default object path of an item registered by bus name alone.
 const DEFAULT_ITEM_PATH: &str = "/StatusNotifierItem";
+/// Upper bound on themed PNG icon file size read from disk.
+///
+/// Tray icons are small; a multi-megabyte "icon" is almost always a hostile or
+/// misconfigured path. Cap the read so one StatusNotifierItem cannot force the
+/// bar to mmap a huge user-readable file into memory.
+const MAX_ICON_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// The upper bound on any single DBus call to an item or menu. zbus applies no
 /// call timeout of its own, so an unanswered call parks the awaiting task
 /// forever — seen at session start, when items register before they are ready
@@ -154,27 +161,118 @@ pub fn select_pixmap(pixmaps: &[RawPixmap]) -> Option<TrayIcon> {
         .and_then(|(w, h, bytes)| TrayIcon::from_argb32(*w as u32, *h as u32, bytes))
 }
 
+/// True when `path` has no `..` components.
+pub fn path_is_lexically_safe(path: &Path) -> bool {
+    !path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+/// True when a non-absolute icon *name* is safe to join under a theme directory.
+///
+/// Rejects empty names, absolute paths (handled separately), path separators,
+/// and `..` so a malicious `IconName` cannot escape `dirs` via `../`.
+pub fn is_safe_icon_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.contains('\0') {
+        return false;
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return false;
+    }
+    path_is_lexically_safe(path)
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+}
+
+/// True when an absolute icon path is under a known icon/pixmap root.
+///
+/// StatusNotifierItems sometimes set `IconName` to a full path. Allow only
+/// conventional icon locations (system + user XDG data) so a tray app cannot
+/// make the bar open arbitrary user-readable files.
+pub fn absolute_icon_path_allowed(path: &Path) -> bool {
+    if !path.is_absolute() || !path_is_lexically_safe(path) {
+        return false;
+    }
+    let Ok(canon_hint) = path.canonicalize() else {
+        // Fall back to prefix checks on the unresolved path when the file is
+        // missing or unreadable; the caller still verifies `is_file()`.
+        return absolute_icon_prefix_ok(path);
+    };
+    absolute_icon_prefix_ok(&canon_hint)
+}
+
+fn absolute_icon_prefix_ok(path: &Path) -> bool {
+    const SYSTEM: &[&str] = &[
+        "/usr/share/icons",
+        "/usr/local/share/icons",
+        "/usr/share/pixmaps",
+        "/usr/local/share/pixmaps",
+        "/var/lib/app-info/icons",
+    ];
+    if SYSTEM.iter().any(|root| path.starts_with(root)) {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if path.starts_with(home.join(".local/share/icons"))
+            || path.starts_with(home.join(".icons"))
+        {
+            return true;
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        && path.starts_with(Path::new(&xdg).join("icons"))
+    {
+        return true;
+    }
+    false
+}
+
 /// Locate the PNG file backing an icon `name` within `dirs`.
 ///
-/// An absolute path that points at a file is used directly (some items set
-/// `IconName` to a full path). Otherwise each directory is probed for
-/// `<name>.png`, and the first hit wins. Returns `None` when nothing matches, so
-/// a name the theme cannot satisfy degrades to no icon rather than an error. The
-/// directory list is supplied by the caller, which keeps the lookup a pure,
-/// testable function of the filesystem.
+/// An absolute path that points at a file is used only when it lies under a
+/// known icon root (see [`absolute_icon_path_allowed`]). Otherwise each
+/// directory is probed for `<name>.png`, and the first hit wins. Names with
+/// path separators or `..` are rejected. Returns `None` when nothing matches,
+/// so a name the theme cannot satisfy degrades to no icon rather than an error.
 pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
     let direct = Path::new(name);
-    if direct.is_absolute() && direct.is_file() {
-        return Some(direct.to_path_buf());
+    if direct.is_absolute() {
+        if absolute_icon_path_allowed(direct) && direct.is_file() {
+            return Some(direct.to_path_buf());
+        }
+        return None;
+    }
+    if !is_safe_icon_name(name) {
+        return None;
     }
     let file_name = format!("{name}.png");
     dirs.iter()
+        .filter(|dir| path_is_lexically_safe(dir))
         .map(|dir| dir.join(&file_name))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| path_is_lexically_safe(candidate) && candidate.is_file())
+}
+
+/// Read an icon file if it exists and stays under [`MAX_ICON_FILE_BYTES`].
+async fn read_icon_file(path: &Path) -> Option<Vec<u8>> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_ICON_FILE_BYTES {
+        if meta.len() > MAX_ICON_FILE_BYTES {
+            warn!(
+                "sni: rejecting oversized icon {} ({} bytes)",
+                path.display(),
+                meta.len()
+            );
+        }
+        return None;
+    }
+    tokio::fs::read(path).await.ok()
 }
 
 /// Fold raw StatusNotifierItem properties into a normalized [`TrayItem`].
@@ -240,7 +338,7 @@ async fn resolve_icon(
 async fn resolve_themed_icon(icon_name: &str, theme_path: &str) -> Option<TrayIcon> {
     let dirs = icon_search_dirs(theme_path);
     let file = find_icon_file(icon_name, &dirs)?;
-    let bytes = tokio::fs::read(file).await.ok()?;
+    let bytes = read_icon_file(&file).await?;
     TrayIcon::from_png_bytes(&bytes).ok()
 }
 
@@ -274,8 +372,14 @@ fn icon_area(icon: &TrayIcon) -> u64 {
 /// `hicolor` application sizes and `pixmaps` cover the apps a bar typically sees.
 fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if !theme_path.trim().is_empty() {
-        dirs.push(PathBuf::from(theme_path));
+    let theme = theme_path.trim();
+    if !theme.is_empty() {
+        let theme_path = PathBuf::from(theme);
+        // App-supplied IconThemePath is only trusted when it is absolute and
+        // has no `..` components — relative paths would resolve against cwd.
+        if theme_path.is_absolute() && path_is_lexically_safe(&theme_path) {
+            dirs.push(theme_path);
+        }
     }
     const SIZES: [&str; 8] = [
         "256x256", "128x128", "64x64", "48x48", "32x32", "24x24", "22x22", "16x16",
@@ -1491,12 +1595,28 @@ mod tests {
     }
 
     #[test]
-    fn find_icon_file_accepts_an_absolute_file_path() {
+    fn find_icon_file_accepts_an_absolute_path_under_an_icon_root() {
+        // Absolute IconName is only honored under known icon prefixes. A
+        // tempfile under /tmp must not be opened as a tray icon.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("icon.png");
         std::fs::write(&file, b"x").unwrap();
         let name = file.to_string_lossy().into_owned();
-        assert_eq!(find_icon_file(&name, &[]), Some(file));
+        assert_eq!(find_icon_file(&name, &[]), None);
+
+        // Lexical safety: parent-dir components are always rejected.
+        assert_eq!(
+            find_icon_file("/usr/share/icons/../../etc/passwd", &[]),
+            None
+        );
+        assert_eq!(find_icon_file("../escape", &[]), None);
+        assert_eq!(find_icon_file("foo/bar", &[]), None);
+        assert!(is_safe_icon_name("discord"));
+        assert!(!is_safe_icon_name(".."));
+        assert!(!absolute_icon_path_allowed(Path::new("/etc/passwd")));
+        assert!(absolute_icon_path_allowed(Path::new(
+            "/usr/share/icons/hicolor/48x48/apps/foo.png"
+        )));
     }
 
     #[test]
