@@ -297,13 +297,23 @@ built-in art for that state.
 
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget
-spawns the file directly (no shell) — typical use is
-`[widget.bluetooth] on-click = "/path/to/blueman-manager"` or
-`[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
-a leading `~` for the user's home, expanded at click time. Bare executable names
-are resolved through `PATH`; arguments and shell syntax are not supported. Today
-the bluetooth, volume, updates, and power widgets honor `on-click`. The power
-widget also accepts `on-click-right` with the same direct-spawn semantics:
+spawns the file directly (**no shell**) — typical use is
+`[widget.bluetooth] on-click = "/usr/bin/blueman-manager"` or
+`[widget.volume] on-click = "/usr/bin/pavucontrol"`. Rules:
+
+- Prefer **absolute paths** (`/usr/bin/…` or `~/scripts/…`). A leading `~` is
+  expanded at click time; absolute paths are preflighted (must exist and be
+  executable).
+- Bare names (`pavucontrol`, `wlogout`) are resolved through the bar process's
+  `PATH` (whatever Hyprland or your autostart gave `tablero`).
+- **No** arguments, pipes, `&&`, env vars, or shell globs — one executable path
+  only. Wrap multi-step logic in a small `#!/bin/sh` script with `chmod +x`.
+- Today bluetooth, volume, updates, network, clock, and power honor `on-click`.
+  Power (and network/clock) also accept `on-click-right` with the same semantics.
+- If a click shows the hand cursor but nothing happens, run with
+  `RUST_LOG=tablero::command=info` (or `warn`): spawn failures and non-zero
+  child exits are logged with the resolved path. Child stderr is inherited, so
+  script errors also appear next to tablero's logs.
 
 ```toml
 [bar]
@@ -314,8 +324,18 @@ foreground = "#ff4a4d" # inactive
 accent = "#7decff"     # active
 
 [widget.power]
-on-click = "wlogout"
-on-click-right = "hyprlock"
+on-click = "/usr/bin/wlogout"
+on-click-right = "/usr/bin/hyprlock"
+
+[widget.volume]
+on-click = "/usr/bin/pavucontrol"
+
+[widget.network]
+on-click = "~/.config/hypr/scripts/networkmanager.sh"
+
+[widget.clock]
+# Desktop apps: absolute path is more reliable than a bare name when PATH is thin.
+on-click = "/usr/bin/gnome-calendar"
 ```
 
 The Arch package-updates module requires `checkupdates` from the official

@@ -154,6 +154,7 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+# Direct spawn, no shell — prefer absolute paths for reliability.
 # on-click = "/usr/bin/pavucontrol"
 
 [widget.network]
@@ -163,6 +164,8 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+# Script must be executable (chmod +x). Tilde is expanded; no shell args.
+# on-click = "~/.config/hypr/scripts/networkmanager.sh"
 
 [widget.system]
 background = "#1c0e1ee8"
@@ -179,6 +182,7 @@ border = "#7decff"
 border-width = 1
 radius = 2
 padding = 10
+# on-click = "/usr/bin/gnome-calendar"
 
 [widget.power-profiles-daemon]
 background = "#1c0e1ee8"
@@ -206,7 +210,8 @@ border-width = 1
 radius = 2
 padding = 10
 
-# Direct executable launches: left opens the logout menu, right locks now.
+# Direct executable launches (no shell): left opens the logout menu, right locks.
+# Absolute paths avoid PATH surprises when tablero is started from autostart.
 [widget.power]
 background = "#f7080b20"
 foreground = "#ff4a4d"
@@ -214,8 +219,8 @@ border = "#f7080b"
 border-width = 1
 radius = 2
 padding = 10
-on-click = "wlogout"
-on-click-right = "hyprlock"
+on-click = "/usr/bin/wlogout"
+on-click-right = "/usr/bin/hyprlock"
 
 # Per-monitor overrides remain available. For example, this keeps a laptop bar
 # shorter while adding controls useful away from a desk:
