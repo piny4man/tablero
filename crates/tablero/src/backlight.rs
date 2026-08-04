@@ -255,7 +255,7 @@ pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> 
 ///
 /// Device names come from our own enumeration in the normal path; this guard
 /// still rejects traversal if a future caller ever threaded a free-form string
-/// into [`adjust_device`].
+/// into the logind brightness adjust path.
 pub fn is_safe_backlight_device(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }

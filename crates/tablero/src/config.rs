@@ -874,7 +874,7 @@ impl Config {
 
     /// Load a config for **hot-reload**: never invents defaults.
     ///
-    /// Unlike [`load_from_path`], a missing file, an empty/whitespace-only
+    /// Unlike [`Config::load_from_path`], a missing file, an empty/whitespace-only
     /// document (common mid-save when an editor truncates), or a parse error
     /// is always an error so the running bar keeps its previous config instead
     /// of flashing to built-in defaults.
