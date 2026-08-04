@@ -183,6 +183,8 @@ border-width = 1
 radius = 2
 padding = 10
 # on-click = "/usr/bin/gnome-calendar"
+# Or with args (no shell): on-click = "gtk-launch org.gnome.Calendar"
+# on-click = ["gtk-launch", "org.gnome.Calendar"]
 
 [widget.power-profiles-daemon]
 background = "#1c0e1ee8"

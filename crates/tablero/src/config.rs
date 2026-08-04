@@ -72,10 +72,11 @@ use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HypridleWidget,
-    IconSetting, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget, StateColors,
-    SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget, WidgetStyle,
-    WorkspaceWidget, backlight::validate_backlight_format, battery::validate_battery_format,
-    power_profiles::validate_power_profiles_format, updates::validate_updates_format,
+    IconSetting, LaunchSpec, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget,
+    StateColors, SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget,
+    WidgetStyle, WorkspaceWidget, backlight::validate_backlight_format,
+    battery::validate_battery_format, power_profiles::validate_power_profiles_format,
+    updates::validate_updates_format,
 };
 
 /// Default bar height in pixels.
@@ -365,23 +366,25 @@ pub struct WidgetStyleConfig {
     pub attention: StateColorConfig,
     /// Colors used while a battery is charging.
     pub charging: StateColorConfig,
-    /// Executable path run when the widget is clicked.
+    /// Program (and optional args) run when the widget is clicked.
     ///
     /// When `Some`, a click inside the widget's bounds emits a
     /// [`Command::RunProgram`](crate::widget::Command::RunProgram) the host
-    /// executor spawns directly (no shell). When `None`, the widget is
-    /// display-only and clicks yield nothing. The path is taken verbatim and
-    /// may use a leading `~` for the user's home, which the executor expands
-    /// at click time. Available on every widget kind for forward
-    /// compatibility; today bluetooth, volume, and updates honor it.
+    /// executor spawns directly (no shell). Accepts a string (`"pavucontrol"`
+    /// or `"gtk-launch org.gnome.Calendar"`, split on whitespace) or a string
+    /// list (`["gtk-launch", "org.gnome.Calendar"]`). A leading `~` on the
+    /// program is expanded at click time; bare names are resolved via `PATH`.
+    /// When `None`, the widget is display-only. Available on every widget kind
+    /// for forward compatibility; today bluetooth, volume, updates, network,
+    /// clock, and power honor it.
     #[serde(rename = "on-click")]
-    pub on_click: Option<std::path::PathBuf>,
-    /// Executable path run when the widget is right-clicked.
+    pub on_click: Option<LaunchSpec>,
+    /// Program (and optional args) run when the widget is right-clicked.
     ///
     /// Uses the same direct-spawn semantics as [`on_click`](Self::on_click).
-    /// Currently honored by the power widget.
+    /// Honored by power, network, and clock.
     #[serde(rename = "on-click-right")]
-    pub on_click_right: Option<std::path::PathBuf>,
+    pub on_click_right: Option<LaunchSpec>,
     /// Widget label format. Supported placeholders depend on the widget.
     pub format: Option<String>,
     /// Widget-specific icon configuration: a backlight ramp or named profile map.
@@ -1138,7 +1141,7 @@ impl WidgetKind {
         bounds: Bounds,
         style: WidgetStyle,
         monitor: Option<&str>,
-        on_click: Option<std::path::PathBuf>,
+        on_click: Option<LaunchSpec>,
     ) -> Box<dyn Widget> {
         match self {
             WidgetKind::Workspaces => match monitor {
@@ -1477,12 +1480,22 @@ mod tests {
         );
         assert_eq!(parsed.widget.updates.padding, Some(6));
         assert_eq!(
-            parsed.widget.power.on_click.as_deref(),
-            Some(std::path::Path::new("wlogout"))
+            parsed
+                .widget
+                .power
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
+            Some(std::path::Path::new("/usr/bin/wlogout"))
         );
         assert_eq!(
-            parsed.widget.power.on_click_right.as_deref(),
-            Some(std::path::Path::new("hyprlock"))
+            parsed
+                .widget
+                .power
+                .on_click_right
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
+            Some(std::path::Path::new("/usr/bin/hyprlock"))
         );
         assert_eq!(
             parsed.widget.battery.format.as_deref(),
@@ -1689,7 +1702,12 @@ mod tests {
             Some("{count} {icon}")
         );
         assert_eq!(
-            config.widget.updates.on_click.as_deref(),
+            config
+                .widget
+                .updates
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/local/bin/update-system"))
         );
     }
@@ -1737,7 +1755,12 @@ mod tests {
             vec![WidgetKind::Hypridle, WidgetKind::Power, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.power.on_click_right.as_deref(),
+            config
+                .widget
+                .power
+                .on_click_right
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("hyprlock"))
         );
         assert!(config.uses_widget(WidgetKind::Hypridle));
@@ -1794,7 +1817,8 @@ mod tests {
                 .widget
                 .power
                 .on_click_right
-                .as_deref(),
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("monitor-lock"))
         );
         assert_eq!(
@@ -1803,7 +1827,8 @@ mod tests {
                 .widget
                 .power
                 .on_click_right
-                .as_deref(),
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("global-lock"))
         );
     }
@@ -1849,7 +1874,12 @@ mod tests {
             vec![WidgetKind::Bluetooth, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.bluetooth.on_click.as_deref(),
+            config
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/bin/blueman-manager"))
         );
 
@@ -1865,7 +1895,7 @@ mod tests {
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
-                std::path::PathBuf::from("/usr/bin/blueman-manager")
+                crate::widget::LaunchSpec::program_only("/usr/bin/blueman-manager")
             ))
         );
     }
@@ -1900,21 +1930,36 @@ mod tests {
         .unwrap();
         // The global path stays where it was.
         assert_eq!(
-            config.widget.bluetooth.on_click.as_deref(),
+            config
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
 
         // The resolved config for DP-1 sees the per-monitor override.
         let resolved = config.resolve_for_output(Some("DP-1"));
         assert_eq!(
-            resolved.widget.bluetooth.on_click.as_deref(),
+            resolved
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/per-monitor/launcher.sh"))
         );
 
         // An output with no matching monitor keeps the global on-click.
         let other = config.resolve_for_output(Some("HDMI-A-1"));
         assert_eq!(
-            other.widget.bluetooth.on_click.as_deref(),
+            other
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
     }
@@ -1948,7 +1993,12 @@ mod tests {
             vec![WidgetKind::Volume, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.volume.on_click.as_deref(),
+            config
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/bin/pavucontrol"))
         );
 
@@ -1964,7 +2014,7 @@ mod tests {
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
-                std::path::PathBuf::from("/usr/bin/pavucontrol")
+                crate::widget::LaunchSpec::program_only("/usr/bin/pavucontrol")
             ))
         );
     }
@@ -1999,21 +2049,36 @@ mod tests {
         .unwrap();
         // The global path stays where it was.
         assert_eq!(
-            config.widget.volume.on_click.as_deref(),
+            config
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
 
         // The resolved config for DP-1 sees the per-monitor override.
         let resolved = config.resolve_for_output(Some("DP-1"));
         assert_eq!(
-            resolved.widget.volume.on_click.as_deref(),
+            resolved
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/per-monitor/launcher.sh"))
         );
 
         // An output with no matching monitor keeps the global on-click.
         let other = config.resolve_for_output(Some("HDMI-A-1"));
         assert_eq!(
-            other.widget.volume.on_click.as_deref(),
+            other
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
     }

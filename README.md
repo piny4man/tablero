@@ -301,13 +301,16 @@ spawns the file directly (**no shell**) — typical use is
 `[widget.bluetooth] on-click = "/usr/bin/blueman-manager"` or
 `[widget.volume] on-click = "/usr/bin/pavucontrol"`. Rules:
 
-- Prefer **absolute paths** (`/usr/bin/…` or `~/scripts/…`). A leading `~` is
-  expanded at click time; absolute paths are preflighted (must exist and be
-  executable).
+- Prefer **absolute paths** (`/usr/bin/…` or `~/scripts/…`). A leading `~` on
+  the program is expanded at click time; absolute paths are preflighted (must
+  exist and be executable).
 - Bare names (`pavucontrol`, `wlogout`) are resolved through the bar process's
-  `PATH` (whatever Hyprland or your autostart gave `tablero`).
-- **No** arguments, pipes, `&&`, env vars, or shell globs — one executable path
-  only. Wrap multi-step logic in a small `#!/bin/sh` script with `chmod +x`.
+  `PATH` (whatever Hyprland or your autostart gave `tablero`). Missing bare
+  names fail with a clear `not found in PATH` log line.
+- **No shell**: no pipes, `&&`, env vars, or globs. You *may* pass arguments by
+  whitespace (`on-click = "gtk-launch org.gnome.Calendar"`) or as a TOML list
+  (`on-click = ["gtk-launch", "org.gnome.Calendar"]`). Multi-step logic still
+  belongs in a small `#!/bin/sh` script with `chmod +x`.
 - Today bluetooth, volume, updates, network, clock, and power honor `on-click`.
   Power (and network/clock) also accept `on-click-right` with the same semantics.
 - If a click shows the hand cursor but nothing happens, run with

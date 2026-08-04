@@ -1,13 +1,11 @@
 //! Configurable session power launcher.
 
-use std::path::PathBuf;
-
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
-    measure_icon_content,
+    ClickButton, Command, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
+    draw_icon_content, measure_icon_content,
 };
 
 const DEFAULT_TOOLTIP_FORMAT: &str = "Power menu";
@@ -16,8 +14,8 @@ const DEFAULT_TOOLTIP_FORMAT: &str = "Power menu";
 pub struct PowerWidget {
     bounds: Bounds,
     style: WidgetStyle,
-    on_click: Option<PathBuf>,
-    on_click_right: Option<PathBuf>,
+    on_click: Option<LaunchSpec>,
+    on_click_right: Option<LaunchSpec>,
     tooltip: bool,
     tooltip_format: String,
 }
@@ -42,13 +40,13 @@ impl PowerWidget {
     }
 
     /// Set the executable run on a primary click.
-    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+    pub fn with_on_click(mut self, path: Option<LaunchSpec>) -> Self {
         self.on_click = path;
         self
     }
 
     /// Set the executable run on a secondary click.
-    pub fn with_on_click_right(mut self, path: Option<PathBuf>) -> Self {
+    pub fn with_on_click_right(mut self, path: Option<LaunchSpec>) -> Self {
         self.on_click_right = path;
         self
     }
@@ -141,10 +139,8 @@ impl Widget for PowerWidget {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use crate::render::{Bounds, RenderContext};
-    use crate::widget::{ClickButton, Command, Widget};
+    use crate::widget::{ClickButton, Command, LaunchSpec, Widget};
 
     use super::PowerWidget;
 
@@ -157,8 +153,8 @@ mod tests {
 
     #[test]
     fn left_and_right_clicks_run_their_configured_programs() {
-        let left = PathBuf::from("wlogout");
-        let right = PathBuf::from("hyprlock");
+        let left = LaunchSpec::program_only("wlogout");
+        let right = LaunchSpec::program_only("hyprlock");
         let widget = PowerWidget::new(Bounds::new(10, 0, 32, 32))
             .with_on_click(Some(left.clone()))
             .with_on_click_right(Some(right.clone()));
@@ -177,7 +173,7 @@ mod tests {
         let widget = PowerWidget::new(Bounds::new(10, 0, 32, 32));
         assert_eq!(widget.on_click(20, 10, ClickButton::Left), None);
 
-        let widget = widget.with_on_click(Some(PathBuf::from("wlogout")));
+        let widget = widget.with_on_click(Some(LaunchSpec::program_only("wlogout")));
         assert_eq!(widget.on_click(42, 10, ClickButton::Left), None);
     }
 
