@@ -814,6 +814,31 @@ impl Default for Config {
     }
 }
 
+/// Resolve the user config path from the environment.
+///
+/// Prefers `$XDG_CONFIG_HOME/tablero/config.toml`; falls back to
+/// `$HOME/.config/tablero/config.toml`. Returns `None` when neither home is set.
+pub fn config_file_path() -> Option<PathBuf> {
+    config_file_path_from(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure resolver behind [`config_file_path`].
+pub fn config_file_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|s| !s.is_empty()) {
+        return Some(Path::new(xdg).join("tablero").join("config.toml"));
+    }
+    let home = home.filter(|s| !s.is_empty())?;
+    Some(
+        Path::new(home)
+            .join(".config")
+            .join("tablero")
+            .join("config.toml"),
+    )
+}
+
 impl Config {
     /// Parse a configuration from a TOML document.
     ///
@@ -1396,6 +1421,24 @@ mod tests {
     use super::*;
     use crate::render::RenderContext;
     use crate::widget::ClickButton;
+
+    #[test]
+    fn config_file_path_from_prefers_xdg() {
+        assert_eq!(
+            config_file_path_from(Some("/cfg"), Some("/home/u")),
+            Some(PathBuf::from("/cfg/tablero/config.toml"))
+        );
+        assert_eq!(
+            config_file_path_from(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.config/tablero/config.toml"))
+        );
+        assert!(
+            config_file_path_from(Some(""), Some("/home/u"))
+                .unwrap()
+                .ends_with("tablero/config.toml")
+        );
+        assert_eq!(config_file_path_from(None, None), None);
+    }
 
     #[test]
     fn default_is_the_documented_baseline() {

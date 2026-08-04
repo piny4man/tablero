@@ -179,7 +179,11 @@ RUST_LOG=info cargo run -p tablero
 tablero reads an optional TOML file from
 `$XDG_CONFIG_HOME/tablero/config.toml` (falling back to
 `$HOME/.config/tablero/config.toml`). **The file is optional**: when it is
-absent the bar runs on the documented defaults below. The document may be
+absent the bar runs on the documented defaults below. While the bar is running
+it **hot-reloads** that path (mtime poll ~2×/s): theme, layout, and widget
+options update without restart. Producers already started for the original
+widget set keep running; adding a brand-new module (e.g. first-time `"tray"`)
+still needs a restart so its producer can start. The document may be
 partial — any field you omit falls back to its default, so you only specify what
 you want to change.
 
