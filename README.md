@@ -155,28 +155,43 @@ RUST_LOG=info cargo run -p tablero
   Hyprland setups render at the next integer scale and the compositor downscales,
   which stays sharp in practice.
 - Pulls live data from **async producers** (Hyprland IPC, UPower, procfs,
-  NetworkManager over DBus) running on an off-thread Tokio runtime; they reach
-  the synchronous render loop only by sending messages through a `calloop`
-  channel. The PipeWire volume source is the one exception: it runs on a
-  dedicated OS thread (PipeWire's `MainLoop` is synchronous and
-  file-descriptor-driven, unlike zbus), and reaches the Tokio runtime the
-  same way — by sending `Msg::Volume`s through the cross-thread `MsgSender`.
-  That thread supervises its own connection: a `core.sync` heartbeat proves the
-  server is really there (connecting to a socket-activated `pipewire-0` before
-  the daemon exists otherwise *succeeds* and then never handshakes), and an
-  unanswered one reconnects on a 1s→30s backoff — so a bar started before its
-  audio server, or a daemon restarted under it, costs a couple of seconds
-  rather than the session.
+  NetworkManager over DBus, and peers) on an off-thread Tokio runtime; they
+  reach the synchronous render loop only by sending messages through a
+  `calloop` channel. **Each producer starts only when some bar layout includes
+  its widget** (Hyprland always runs for workspaces/title), so a minimal config
+  does not open PipeWire, host a StatusNotifierWatcher, or poll backlight
+  sysfs. The PipeWire volume source is the one exception to the Tokio-worker
+  pattern: it runs on a dedicated OS thread (PipeWire's `MainLoop` is
+  synchronous and file-descriptor-driven, unlike zbus), and reaches the Tokio
+  runtime the same way — by sending `Msg::Volume`s through the cross-thread
+  `MsgSender`. That thread supervises its own connection: a `core.sync`
+  heartbeat proves the server is really there (connecting to a socket-activated
+  `pipewire-0` before the daemon exists otherwise *succeeds* and then never
+  handshakes), and an unanswered one reconnects on a 1s→30s backoff — so a bar
+  started before its audio server, or a daemon restarted under it, costs a
+  couple of seconds rather than the session.
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
+- **Hot-reloads** `$XDG_CONFIG_HOME/tablero/config.toml` while running: theme,
+  layout, and widget options apply within about half a second of a save (mid-save
+  empty files are ignored). Live widget readings are kept across the reload.
+  Adding a module that was not in the layout at startup (e.g. first-time
+  `"tray"`) still needs a process restart so its producer can start — see
+  [Configuration](#configuration).
 
 ## Configuration
 
 tablero reads an optional TOML file from
 `$XDG_CONFIG_HOME/tablero/config.toml` (falling back to
 `$HOME/.config/tablero/config.toml`). **The file is optional**: when it is
-absent the bar runs on the documented defaults below. The document may be
+absent the bar runs on the documented defaults below. While the bar is running
+it **hot-reloads** that path (mtime poll ~2×/s, ~400ms settle so mid-save
+empty files are ignored): theme, layout, and widget options update without
+restart, and the last producer readings are re-applied so the bar does not go
+blank. Producers already started for the original widget set keep running;
+adding a brand-new module (e.g. first-time `"tray"`) still needs a restart so
+its producer can start. The document may be
 partial — any field you omit falls back to its default, so you only specify what
 you want to change.
 
@@ -297,13 +312,26 @@ built-in art for that state.
 
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget
-spawns the file directly (no shell) — typical use is
-`[widget.bluetooth] on-click = "/path/to/blueman-manager"` or
-`[widget.volume] on-click = "/usr/bin/pavucontrol"`. The path may use
-a leading `~` for the user's home, expanded at click time. Bare executable names
-are resolved through `PATH`; arguments and shell syntax are not supported. Today
-the bluetooth, volume, updates, and power widgets honor `on-click`. The power
-widget also accepts `on-click-right` with the same direct-spawn semantics:
+spawns the file directly (**no shell**) — typical use is
+`[widget.bluetooth] on-click = "/usr/bin/blueman-manager"` or
+`[widget.volume] on-click = "/usr/bin/pavucontrol"`. Rules:
+
+- Prefer **absolute paths** (`/usr/bin/…` or `~/scripts/…`). A leading `~` on
+  the program is expanded at click time; absolute paths are preflighted (must
+  exist and be executable).
+- Bare names (`pavucontrol`, `wlogout`) are resolved through the bar process's
+  `PATH` (whatever Hyprland or your autostart gave `tablero`). Missing bare
+  names fail with a clear `not found in PATH` log line.
+- **No shell**: no pipes, `&&`, env vars, or globs. You *may* pass arguments by
+  whitespace (`on-click = "gtk-launch org.gnome.Calendar"`) or as a TOML list
+  (`on-click = ["gtk-launch", "org.gnome.Calendar"]`). Multi-step logic still
+  belongs in a small `#!/bin/sh` script with `chmod +x`.
+- Today bluetooth, volume, updates, network, clock, and power honor `on-click`.
+  Power (and network/clock) also accept `on-click-right` with the same semantics.
+- If a click shows the hand cursor but nothing happens, run with
+  `RUST_LOG=tablero::command=info` (or `warn`): spawn failures and non-zero
+  child exits are logged with the resolved path. Child stderr is inherited, so
+  script errors also appear next to tablero's logs.
 
 ```toml
 [bar]
@@ -314,8 +342,18 @@ foreground = "#ff4a4d" # inactive
 accent = "#7decff"     # active
 
 [widget.power]
-on-click = "wlogout"
-on-click-right = "hyprlock"
+on-click = "/usr/bin/wlogout"
+on-click-right = "/usr/bin/hyprlock"
+
+[widget.volume]
+on-click = "/usr/bin/pavucontrol"
+
+[widget.network]
+on-click = "~/.config/hypr/scripts/networkmanager.sh"
+
+[widget.clock]
+# Desktop apps: absolute path is more reliable than a bare name when PATH is thin.
+on-click = "/usr/bin/gnome-calendar"
 ```
 
 The Arch package-updates module requires `checkupdates` from the official

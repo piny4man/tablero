@@ -15,9 +15,11 @@
 //! See [`Widget`] for the per-widget contract and [`clock::ClockWidget`] for the
 //! reference implementation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
+use serde::Deserialize;
+use serde::de::{Deserializer, Error as DeError};
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, FG, RenderContext};
@@ -48,6 +50,7 @@ pub use notifications::{Notifications, NotificationsWidget};
 pub use power::PowerWidget;
 pub use power_profiles::{PowerProfile, PowerProfilesState, PowerProfilesWidget};
 pub use system::{SystemStats, SystemWidget};
+// LaunchSpec is defined below with Command; re-exported for config and widgets.
 pub use title::{ActiveWindow, TitleWidget};
 pub use tray::{
     TrayIcon, TrayItem, TrayMenu, TrayMenuItem, TrayMenuMode, TrayMenuToggle, TrayMenuToggleKind,
@@ -204,11 +207,12 @@ pub enum Command {
         /// DBusMenu item id.
         id: i32,
     },
-    /// Spawn the executable at this path as a child process directly (no
-    /// shell), used to wire a per-widget `on-click` action (e.g. a Bluetooth
-    /// manager launcher). The host executor resolves a leading `~` to the
-    /// user's home before spawning.
-    RunProgram(PathBuf),
+    /// Spawn a configured program directly (no shell), used to wire a
+    /// per-widget `on-click` action (e.g. a Bluetooth manager launcher). The
+    /// host executor expands a leading `~`, resolves bare names via `PATH`,
+    /// and passes any arguments without shell expansion.
+    RunProgram(LaunchSpec),
+
     /// Toggle the notification daemon's control-center panel (swaync
     /// `ToggleVisibility` — the notifications widget's primary click).
     ToggleNotificationPanel,
@@ -237,6 +241,122 @@ pub enum ScrollDirection {
     Increase,
     /// Decrease the widget's controlled value.
     Decrease,
+}
+
+/// Program + args for a direct (no shell) on-click launch.
+///
+/// Built from config as either a single string (`"pavucontrol"` or
+/// `"gtk-launch org.gnome.Calendar"`, split on whitespace) or a string list
+/// (`["gtk-launch", "org.gnome.Calendar"]`). The first token is the program;
+/// the rest are argv. No quoting, pipes, or env expansion — wrap multi-step
+/// logic in a script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSpec {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+impl LaunchSpec {
+    /// A program with no arguments.
+    pub fn program_only(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// A program with explicit arguments.
+    pub fn with_args(program: impl Into<PathBuf>, args: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().collect(),
+        }
+    }
+
+    /// Parse a single config string into program + args by splitting on ASCII
+    /// whitespace. Empty / whitespace-only input is an error.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut tokens = s.split_whitespace();
+        let Some(program) = tokens.next() else {
+            return Err("on-click is empty".to_string());
+        };
+        Ok(Self {
+            program: PathBuf::from(program),
+            args: tokens.map(str::to_owned).collect(),
+        })
+    }
+
+    /// Build from an argv list (first element is the program).
+    pub fn from_argv(argv: Vec<String>) -> Result<Self, String> {
+        let mut iter = argv.into_iter();
+        let Some(program) = iter.next() else {
+            return Err("on-click list is empty".to_string());
+        };
+        if program.is_empty() {
+            return Err("on-click program is empty".to_string());
+        }
+        Ok(Self {
+            program: PathBuf::from(program),
+            args: iter.collect(),
+        })
+    }
+
+    /// The executable path or bare name.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Arguments after the program (never includes argv0).
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Human-readable form for logs: `program arg1 arg2`.
+    pub fn display(&self) -> String {
+        if self.args.is_empty() {
+            self.program.display().to_string()
+        } else {
+            let mut out = self.program.display().to_string();
+            for arg in &self.args {
+                out.push(' ');
+                out.push_str(arg);
+            }
+            out
+        }
+    }
+}
+
+impl From<PathBuf> for LaunchSpec {
+    fn from(program: PathBuf) -> Self {
+        Self::program_only(program)
+    }
+}
+
+impl From<&str> for LaunchSpec {
+    fn from(s: &str) -> Self {
+        Self::parse(s).unwrap_or_else(|_| Self::program_only(PathBuf::from(s)))
+    }
+}
+
+impl From<String> for LaunchSpec {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LaunchSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            String(String),
+            List(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::String(s) => Self::parse(&s).map_err(DeError::custom),
+            Raw::List(list) => Self::from_argv(list).map_err(DeError::custom),
+        }
+    }
 }
 
 /// Which pointer button produced a click, normalized from the compositor's

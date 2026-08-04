@@ -16,17 +16,18 @@
 //! the render loop. The executor end is spawned on the producer bridge; see
 //! [`hyprland::run_commands`](crate::hyprland::run_commands).
 
+use std::env;
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::widget::Command;
-
 use crate::producer::ProducerResult;
+use crate::widget::{Command, LaunchSpec};
 
 /// The receiving end of the command channel, drained by the executor task.
 pub type CommandReceiver = UnboundedReceiver<Command>;
@@ -85,7 +86,7 @@ impl Error for Closed {}
 /// the original `PathBuf` unchanged when `$HOME` is unset keeps the executor
 /// deterministic in headless environments where the user still wants a
 /// literal path to be tried as-is.
-pub fn expand_tilde(path: &std::path::Path) -> PathBuf {
+pub fn expand_tilde(path: &Path) -> PathBuf {
     let Some(s) = path.to_str() else {
         return path.to_path_buf();
     };
@@ -106,27 +107,198 @@ pub fn expand_tilde(path: &std::path::Path) -> PathBuf {
     expanded
 }
 
+/// Whether `path` is a single path component with no directory separators.
+///
+/// Bare names (`pavucontrol`) are looked up in `$PATH`. Paths with a slash
+/// (`./script`, `bin/foo`) or after tilde expansion stay as-is.
+pub fn is_bare_name(path: &Path) -> bool {
+    path.components().count() == 1 && path.file_name().is_some_and(|name| Path::new(name) == path)
+}
+
+/// Search `$PATH` for an executable named `name` (a single file name).
+pub fn find_in_path(name: &Path) -> Option<PathBuf> {
+    let name = name.as_os_str();
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Expand `~`, then resolve a bare program name via `$PATH` when possible.
+///
+/// Absolute and multi-component relative paths are only tilde-expanded.
+/// Unresolved bare names are returned unchanged so the caller can report a
+/// clear "not found in PATH" error.
+pub fn resolve_program(program: &Path) -> PathBuf {
+    let expanded = expand_tilde(program);
+    if expanded.is_absolute() || !is_bare_name(&expanded) {
+        return expanded;
+    }
+    find_in_path(&expanded).unwrap_or(expanded)
+}
+
+/// True when `path` contains a `..` component (path traversal).
+pub fn path_has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Soft preflight for on-click program paths before spawn.
+///
+/// Rejects `..` components, then for absolute paths checks existence and the
+/// execute bit. Bare names that were not resolved should be rejected by the
+/// caller before this runs.
+pub fn preflight_on_click(path: &Path) -> Result<(), String> {
+    if path_has_parent_component(path) {
+        return Err(format!(
+            "{} must not contain '..' path components",
+            path.display()
+        ));
+    }
+    if !path.is_absolute() {
+        // Relative multi-component paths still go through spawn; the kernel
+        // reports the failure. Absolute-only preflight keeps bare-name PATH
+        // resolution as the dedicated failure path above.
+        return Ok(());
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return Err(format!("{} is a directory", path.display()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Any execute bit is enough; the kernel still enforces the real
+                // check at exec time for the running uid.
+                if meta.permissions().mode() & 0o111 == 0 {
+                    return Err(format!("{} is not executable (chmod +x)", path.display()));
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Format a finished child for logs: exit code or signal termination.
+pub fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("exit status {code}")
+    } else {
+        format!("terminated by signal ({status})")
+    }
+}
+
+/// Spawn one on-click program: expand `~`, resolve bare names via `$PATH`,
+/// preflight absolute paths, pass args, detach stdio, and wait for exit on a
+/// background task so failures surface in logs.
+///
+/// Returns `Ok(())` when the process was started (the waiter owns the rest).
+/// Returns `Err` with a user-facing reason when spawn never starts.
+pub async fn spawn_run_program(spec: LaunchSpec) -> Result<(), String> {
+    let program = resolve_program(spec.program());
+    if is_bare_name(spec.program()) && !program.is_absolute() {
+        return Err(format!(
+            "{:?} not found in PATH (use an absolute path or fix PATH)",
+            spec.program()
+        ));
+    }
+    preflight_on_click(&program)?;
+
+    let display = if spec.args().is_empty() {
+        program.display().to_string()
+    } else {
+        // Log the resolved program with the original args for diagnosis.
+        let mut out = program.display().to_string();
+        for arg in spec.args() {
+            out.push(' ');
+            out.push_str(arg);
+        }
+        out
+    };
+
+    // Desktop-launcher hygiene: no stdin (scripts never hang on a closed tty),
+    // discarded stdout (GUI noise), inherited stderr so short-lived script
+    // errors land next to tablero's own logs when the bar is journaled or run
+    // from a terminal. kill_on_drop is off so dropping a waiter handle never
+    // kills a long-lived mixer or calendar.
+    let mut command = TokioCommand::new(&program);
+    command
+        .args(spec.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(false);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn {display:?}: {error}"))?;
+
+    info!("spawned on-click program: {display}");
+
+    // Reap the child and log non-success exits. GUI apps that stay up for the
+    // whole session only emit a debug line when they finally quit; scripts that
+    // die immediately with a non-zero status are the flaky-click case we care
+    // about and land at warn.
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                debug!("on-click program {display:?} finished successfully");
+            }
+            Ok(status) => {
+                warn!(
+                    "on-click program {display:?} failed: {}",
+                    format_exit_status(status)
+                );
+            }
+            Err(error) => {
+                warn!("on-click program {display:?}: wait failed: {error}");
+            }
+        }
+    });
+
+    Ok(())
+}
+
 /// Drain a [`CommandReceiver`] for as long as the render loop sends.
 ///
 /// Each [`Command::RunProgram`] is spawned directly via
 /// `tokio::process::Command` — no shell, no argument expansion beyond the
-/// leading-`~` home expansion in [`expand_tilde`]. Other command variants are
-/// silently ignored: those have
-/// their own executors, and every [`CommandSender`] is fanned out to every
-/// executor, so the routing is by `match` arm here. A spawn failure
-/// (missing file, non-executable, …) is logged at warn level and does not
-/// end the loop — a bad click should never take the bar down.
+/// leading-`~` home expansion and bare-name `PATH` lookup. Other command
+/// variants are silently ignored: those have their own executors, and every
+/// [`CommandSender`] is fanned out to every executor, so the routing is by
+/// `match` arm here. A spawn failure (missing file, non-executable, …) is
+/// logged at warn level and does not end the loop — a bad click should never
+/// take the bar down.
 pub async fn run_commands(mut rx: CommandReceiver) -> ProducerResult {
     while let Some(command) = rx.recv().await {
-        if let Command::RunProgram(path) = command {
-            let resolved = expand_tilde(&path);
-            let display = resolved.display().to_string();
-            match TokioCommand::new(&resolved).spawn() {
-                Ok(_) => debug!("spawned on-click program: {display}"),
-                Err(e) => {
-                    warn!("failed to spawn on-click program {display:?}: {e}")
-                }
-            }
+        if let Command::RunProgram(spec) = command
+            && let Err(reason) = spawn_run_program(spec).await
+        {
+            warn!("on-click: {reason}");
         }
     }
     Ok(())
@@ -135,6 +307,16 @@ pub async fn run_commands(mut rx: CommandReceiver) -> ProducerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        // Multi-thread so `tokio::spawn` waiters inside `spawn_run_program` are
+        // actually polled after the executor returns.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn send_delivers_a_command_to_the_receiver() {
@@ -196,13 +378,83 @@ mod tests {
     }
 
     #[test]
+    fn preflight_allows_bare_path_names() {
+        // Bare names are rejected before preflight after PATH resolution fails;
+        // preflight itself still skips non-absolute paths.
+        assert!(preflight_on_click(Path::new("pavucontrol")).is_ok());
+        assert!(preflight_on_click(Path::new("gnome-calendar")).is_ok());
+    }
+
+    #[test]
+    fn is_bare_name_detects_single_components() {
+        assert!(is_bare_name(Path::new("pavucontrol")));
+        assert!(!is_bare_name(Path::new("/usr/bin/pavucontrol")));
+        assert!(!is_bare_name(Path::new("bin/pavucontrol")));
+        assert!(!is_bare_name(Path::new("./pavucontrol")));
+    }
+
+    #[test]
+    fn find_in_path_locates_true() {
+        // `true` is on PATH on every Linux/CI host we care about.
+        let found = find_in_path(Path::new("true")).expect("true in PATH");
+        assert!(found.is_absolute());
+        assert!(found.ends_with("true") || found.file_name() == Some("true".as_ref()));
+    }
+
+    #[test]
+    fn resolve_program_leaves_absolute_paths() {
+        assert_eq!(
+            resolve_program(Path::new("/usr/bin/pavucontrol")),
+            PathBuf::from("/usr/bin/pavucontrol")
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_missing_absolute_paths() {
+        let err = preflight_on_click(Path::new("/this/path/definitely/does/not/exist"))
+            .expect_err("missing file");
+        assert!(err.contains("does/not/exist"), "{err}");
+    }
+
+    #[test]
+    fn preflight_rejects_parent_dir_components() {
+        let err = preflight_on_click(Path::new("/tmp/../etc/passwd")).expect_err("parent");
+        assert!(err.contains(".."), "{err}");
+        let err = preflight_on_click(Path::new("../bin/evil")).expect_err("relative parent");
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[test]
+    fn preflight_rejects_non_executable_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("no-exec.sh");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+
+        let err = preflight_on_click(&script).expect_err("not executable");
+        assert!(err.contains("not executable"), "{err}");
+    }
+
+    #[test]
+    fn format_exit_status_reports_codes() {
+        // We cannot synthesize a signal status portably; codes are enough for
+        // the log path unit test.
+        let status = std::process::Command::new("true").status().expect("true");
+        assert_eq!(format_exit_status(status), "exit status 0");
+
+        let status = std::process::Command::new("false").status().expect("false");
+        assert_eq!(format_exit_status(status), "exit status 1");
+    }
+
+    #[test]
     fn run_commands_ignores_non_run_program_commands() {
         // Commands with dedicated executors are filtered; this one only acts on
         // RunProgram.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = test_runtime();
         let (tx, rx) = command_channel();
         tx.send(Command::SwitchWorkspace(1)).unwrap();
         tx.send(Command::ActivateTrayItem {
@@ -235,12 +487,12 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod");
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = test_runtime();
         let (tx, rx) = command_channel();
-        tx.send(Command::RunProgram(script.clone())).unwrap();
+        tx.send(Command::RunProgram(LaunchSpec::program_only(
+            script.clone(),
+        )))
+        .unwrap();
         drop(tx);
         rt.block_on(run_commands(rx)).unwrap();
 
@@ -264,17 +516,119 @@ mod tests {
         // A bogus path must not crash the executor: the warn is logged, the
         // loop continues, and a subsequent valid RunProgram is still
         // processed.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = test_runtime();
         let (tx, rx) = command_channel();
-        tx.send(Command::RunProgram(PathBuf::from(
-            "/this/path/definitely/does/not/exist",
+        tx.send(Command::RunProgram(LaunchSpec::program_only(
+            PathBuf::from("/this/path/definitely/does/not/exist"),
         )))
         .unwrap();
         tx.send(Command::SwitchWorkspace(2)).unwrap();
         drop(tx);
         rt.block_on(run_commands(rx)).unwrap();
+    }
+
+    #[test]
+    fn spawn_run_program_fails_preflight_for_missing_absolute_path() {
+        let rt = test_runtime();
+        let err = rt
+            .block_on(spawn_run_program(LaunchSpec::program_only(PathBuf::from(
+                "/this/path/definitely/does/not/exist",
+            ))))
+            .expect_err("preflight");
+        assert!(err.contains("does/not/exist"), "{err}");
+    }
+
+    #[test]
+    fn spawn_run_program_rejects_unknown_bare_names() {
+        let rt = test_runtime();
+        let err = rt
+            .block_on(spawn_run_program(LaunchSpec::program_only(
+                "tablero-definitely-not-on-path-xyz",
+            )))
+            .expect_err("missing bare name");
+        assert!(err.contains("not found in PATH"), "{err}");
+    }
+
+    #[test]
+    fn spawn_run_program_passes_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("arg.marker");
+        let script = dir.path().join("with-arg.sh");
+        // argv[1] is written to the marker so we prove args reach the child.
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s' \"$1\" > {}\n", marker.display()),
+        )
+        .expect("write");
+        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+
+        let rt = test_runtime();
+        let spec = LaunchSpec::with_args(script, vec!["hello-arg".into()]);
+        rt.block_on(spawn_run_program(spec)).expect("spawn");
+
+        let mut waited = std::time::Duration::ZERO;
+        let step = std::time::Duration::from_millis(20);
+        while !marker.exists() && waited < std::time::Duration::from_secs(2) {
+            std::thread::sleep(step);
+            waited += step;
+        }
+        assert_eq!(std::fs::read_to_string(&marker).expect("read"), "hello-arg");
+    }
+
+    #[test]
+    fn spawn_run_program_reaps_a_failing_script() {
+        // A script that exits non-zero must still be waitable (no hang) and
+        // report Ok from spawn — the failure is the child's exit, logged by
+        // the background waiter.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 42\n").expect("write");
+        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+
+        let rt = test_runtime();
+        rt.block_on(spawn_run_program(LaunchSpec::program_only(script)))
+            .expect("spawn starts");
+        // Give the waiter task time to reap the child.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn spawn_run_program_expands_tilde_before_preflight() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::var_os("HOME").expect("HOME");
+        let dir = tempfile::tempdir_in(&home).expect("tempdir in home");
+        // Build a ~/… relative path from the tempdir under $HOME.
+        let rel = dir
+            .path()
+            .strip_prefix(&home)
+            .expect("tempdir under HOME")
+            .join("tilde.sh");
+        let tilde_path = PathBuf::from(format!("~/{}", rel.display()));
+        let absolute = expand_tilde(&tilde_path);
+        std::fs::write(&absolute, "#!/bin/sh\nexit 0\n").expect("write");
+        let mut perms = std::fs::metadata(&absolute).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&absolute, perms).expect("chmod");
+
+        let rt = test_runtime();
+        rt.block_on(spawn_run_program(LaunchSpec::program_only(tilde_path)))
+            .expect("tilde path resolves and spawns");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn launch_spec_parse_splits_whitespace() {
+        let spec = LaunchSpec::parse("gtk-launch org.gnome.Calendar").unwrap();
+        assert_eq!(spec.program(), Path::new("gtk-launch"));
+        assert_eq!(spec.args(), &["org.gnome.Calendar".to_string()]);
     }
 }

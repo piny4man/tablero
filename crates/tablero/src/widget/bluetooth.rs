@@ -13,12 +13,12 @@
 //! (powered off, or no adapter) and so a configured on-click still has a
 //! target.
 
-use std::path::PathBuf;
-
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
+use super::{
+    LaunchSpec, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
+};
 
 /// The power state of the local Bluetooth adapter, normalized from BlueZ.
 ///
@@ -127,7 +127,7 @@ pub struct BluetoothWidget {
     bounds: Bounds,
     state: Bluetooth,
     style: WidgetStyle,
-    on_click: Option<PathBuf>,
+    on_click: Option<LaunchSpec>,
 }
 
 impl BluetoothWidget {
@@ -158,7 +158,7 @@ impl BluetoothWidget {
     /// a [`Command::RunProgram`](super::Command::RunProgram) the host executor
     /// spawns directly (no shell). Consuming and returning `self` chains off
     /// [`new`](BluetoothWidget::new) at build time.
-    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+    pub fn with_on_click(mut self, path: Option<LaunchSpec>) -> Self {
         self.on_click = path;
         self
     }
@@ -378,10 +378,10 @@ mod tests {
     #[test]
     fn with_on_click_a_click_inside_bounds_runs_the_program() {
         let widget = BluetoothWidget::new(Bounds::new(0, 0, 200, 32))
-            .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
+            .with_on_click(Some(LaunchSpec::program_only("/usr/bin/blueman-manager")));
         assert_eq!(
             widget.on_click(10, 10, ClickButton::Left),
-            Some(super::super::Command::RunProgram(PathBuf::from(
+            Some(super::super::Command::RunProgram(LaunchSpec::program_only(
                 "/usr/bin/blueman-manager"
             )))
         );
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn on_click_outside_bounds_is_ignored_even_when_configured() {
         let widget = BluetoothWidget::new(Bounds::new(10, 0, 200, 32))
-            .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
+            .with_on_click(Some(LaunchSpec::program_only("/usr/bin/blueman-manager")));
         // x=0 is left of bounds.x=10; click is outside the pill.
         assert_eq!(widget.on_click(0, 10, ClickButton::Left), None);
         // x=210 is at/past the right edge (x + width = 210), outside.

@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use tiny_skia::{
     FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapPaint, PixmapRef, Rect,
@@ -5,6 +8,41 @@ use tiny_skia::{
 };
 
 use crate::icon::BuiltinIcon;
+
+/// Shared font machinery for every bar surface and popup on the render thread.
+///
+/// Loading a [`FontSystem`] scans the system font set once; sharing one instance
+/// (plus its [`SwashCache`]) across all [`RenderContext`]s avoids repeating that
+/// work per monitor and per tooltip/tray popup. Rendered on the calloop thread
+/// only — not `Send`/`Sync`.
+pub struct FontResources {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+}
+
+impl FontResources {
+    /// Load system fonts and build an empty glyph cache.
+    pub fn new() -> Self {
+        Self {
+            font_system: FontSystem::new(),
+            swash_cache: SwashCache::new(),
+        }
+    }
+}
+
+impl Default for FontResources {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reference-counted font machinery shared by every [`RenderContext`].
+pub type SharedFonts = Rc<RefCell<FontResources>>;
+
+/// Build a new shared font set for one bar process.
+pub fn shared_fonts() -> SharedFonts {
+    Rc::new(RefCell::new(FontResources::new()))
+}
 
 /// Opaque dark background color (R, G, B, A).
 pub const BG: (u8, u8, u8, u8) = (0x18, 0x18, 0x18, 0xFF);
@@ -114,32 +152,44 @@ fn rounded_rect_path(bounds: Bounds, radius: f32, inset: f32) -> Option<Path> {
 
 /// A reusable software-render target shared across widgets within one frame.
 ///
-/// Owns the expensive font machinery (`FontSystem`, `SwashCache`) and the
+/// Holds a [`SharedFonts`] handle (system font set + swash cache) and a
 /// destination `Pixmap` so a redraw does not reallocate them every tick.
 /// Widgets clear the background once, then each draws its text into its own
 /// [`Bounds`]; the finished frame is read back as premultiplied RGBA8888 via
 /// [`pixels`](RenderContext::pixels).
 pub struct RenderContext {
-    font_system: FontSystem,
-    swash_cache: SwashCache,
+    fonts: SharedFonts,
     pixmap: Pixmap,
     settings: RenderSettings,
 }
 
 impl RenderContext {
     /// Create a context targeting a `width * height` pixel surface, using the
-    /// built-in theme ([`RenderSettings::default`]).
+    /// built-in theme ([`RenderSettings::default`]) and a private font set.
+    ///
+    /// Prefer [`with_fonts`](Self::with_fonts) in the live bar so every surface
+    /// shares one [`FontSystem`].
     pub fn new(width: u32, height: u32) -> Self {
         Self::with_settings(width, height, RenderSettings::default())
     }
 
     /// Create a context targeting a `width * height` pixel surface, painting with
-    /// the supplied [`RenderSettings`].
+    /// the supplied [`RenderSettings`] and a private font set.
     pub fn with_settings(width: u32, height: u32, settings: RenderSettings) -> Self {
+        Self::with_fonts(width, height, settings, shared_fonts())
+    }
+
+    /// Create a context that paints with `settings` and the process-wide
+    /// [`SharedFonts`] (one font load for every monitor and popup).
+    pub fn with_fonts(
+        width: u32,
+        height: u32,
+        settings: RenderSettings,
+        fonts: SharedFonts,
+    ) -> Self {
         let pixmap = Pixmap::new(width.max(1), height.max(1)).expect("non-zero pixmap dimensions");
         Self {
-            font_system: FontSystem::new(),
-            swash_cache: SwashCache::new(),
+            fonts,
             pixmap,
             settings,
         }
@@ -163,10 +213,15 @@ impl RenderContext {
     /// Replace the settings this context paints with.
     ///
     /// Used when the output scale changes and the resolved physical font size
-    /// must follow it. Cheap: the font machinery (`FontSystem`, `SwashCache`) is
-    /// retained, only the visual settings are swapped.
+    /// must follow it. Cheap: the shared font machinery is retained, only the
+    /// visual settings are swapped.
     pub fn set_settings(&mut self, settings: RenderSettings) {
         self.settings = settings;
+    }
+
+    /// The shared font resources this context paints with.
+    pub fn fonts(&self) -> &SharedFonts {
+        &self.fonts
     }
 
     /// Current target width in pixels.
@@ -283,12 +338,12 @@ impl RenderContext {
             return;
         }
 
-        let RenderContext {
+        let mut fonts = self.fonts.borrow_mut();
+        let FontResources {
             font_system,
             swash_cache,
-            pixmap,
-            settings,
-        } = self;
+        } = &mut *fonts;
+        let settings = &self.settings;
 
         let metrics = Metrics::new(settings.font_size, bounds.height as f32);
         let mut buffer = Buffer::new(font_system, metrics);
@@ -304,7 +359,7 @@ impl RenderContext {
 
         let text_color = Color::rgba(color.0, color.1, color.2, color.3);
         let (ox, oy) = (bounds.x as f32, bounds.y as f32);
-        let mut dst = pixmap.as_mut();
+        let mut dst = self.pixmap.as_mut();
         buffer.draw(font_system, swash_cache, text_color, |x, y, w, h, color| {
             let Some(rect) = Rect::from_xywh(ox + x as f32, oy + y as f32, w as f32, h as f32)
             else {
@@ -327,12 +382,12 @@ impl RenderContext {
             return;
         }
 
-        let RenderContext {
+        let mut fonts = self.fonts.borrow_mut();
+        let FontResources {
             font_system,
             swash_cache,
-            pixmap,
-            settings,
-        } = self;
+        } = &mut *fonts;
+        let settings = &self.settings;
 
         let metrics = Metrics::new(settings.font_size, bounds.height as f32);
         let mut buffer = Buffer::new(font_system, metrics);
@@ -374,7 +429,7 @@ impl RenderContext {
         let offset_x = offset_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         let offset_y = offset_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
 
-        let mut dst = pixmap.as_mut();
+        let mut dst = self.pixmap.as_mut();
         buffer.draw(font_system, swash_cache, text_color, |x, y, w, h, color| {
             let Some(rect) = Rect::from_xywh(
                 (offset_x + x) as f32,
@@ -404,11 +459,9 @@ impl RenderContext {
             return 0;
         }
 
-        let RenderContext {
-            font_system,
-            settings,
-            ..
-        } = self;
+        let mut fonts = self.fonts.borrow_mut();
+        let font_system = &mut fonts.font_system;
+        let settings = &self.settings;
 
         let metrics = Metrics::new(settings.font_size, settings.font_size);
         let mut buffer = Buffer::new(font_system, metrics);

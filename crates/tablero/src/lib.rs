@@ -39,12 +39,13 @@ pub mod upower;
 pub mod volume;
 
 use std::error::Error;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::blit::write_argb8888;
 use crate::clock::millis_until_next_minute;
 use crate::config::{Config, WidgetKind};
-use crate::render::{Bounds, RenderContext, RenderSettings};
+use crate::render::{Bounds, RenderContext, RenderSettings, SharedFonts, shared_fonts};
 use crate::scale::Scale;
 use crate::widget::{
     ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
@@ -82,7 +83,10 @@ use smithay_client_toolkit::{
             window::{Window, WindowConfigure, WindowHandler},
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 
 use crate::backlight::BacklightProducer;
@@ -137,10 +141,19 @@ struct Surface {
     /// This output's resolved configuration, retained so the physical font size
     /// can be re-resolved whenever the output scale changes.
     config: Config,
+    /// Connector name (`DP-1`, …) for workspace scoping and config reloads.
+    monitor: Option<String>,
     /// Widgets composing the bar, plus the dirty-flag redraw policy over them.
     dashboard: Dashboard,
-    /// Reused software-render target (font machinery + pixmap).
+    /// Reused software-render target (shared fonts + pixmap).
     ctx: RenderContext,
+    /// Alternating SHM buffers so a free slot is reused without a new mmap when
+    /// the compositor has released the previous frame.
+    buffers: [Option<Buffer>; 2],
+    /// Physical pixel size of the slots in [`buffers`].
+    buffer_px: (u32, u32),
+    /// Next double-buffer index to try (0 or 1).
+    next_buffer: usize,
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
@@ -151,7 +164,9 @@ impl Surface {
     ///
     /// `monitor` is the output's connector name (`DP-1`, …), threaded into the
     /// dashboard so this surface's workspace widget shows only this monitor's
-    /// workspaces and highlights its active one.
+    /// workspaces and highlights its active one. `fonts` is the process-wide
+    /// shared font set.
+    #[allow(clippy::too_many_arguments)] // Wayland + config + shared fonts seed
     fn new(
         compositor: &CompositorState,
         layer_shell: &LayerShell,
@@ -160,6 +175,7 @@ impl Surface {
         output_id: OutputId,
         monitor: Option<&str>,
         config: Config,
+        fonts: SharedFonts,
     ) -> Self {
         // The bar reserves exactly its own height so windows tile beneath it.
         let height = config.height;
@@ -190,7 +206,7 @@ impl Surface {
         // renderer through the context's settings.
         let full = Bounds::new(0, 0, INITIAL_WIDTH, height);
         let dashboard = config.build_dashboard(full, monitor);
-        let ctx = RenderContext::with_settings(INITIAL_WIDTH, height, config.render_settings());
+        let ctx = RenderContext::with_fonts(INITIAL_WIDTH, height, config.render_settings(), fonts);
 
         Self {
             output_id,
@@ -203,9 +219,48 @@ impl Surface {
             // unscaled output.
             scale: Scale::ONE,
             config,
+            monitor: monitor.map(str::to_owned),
             dashboard,
             ctx,
+            buffers: [None, None],
+            buffer_px: (0, 0),
+            next_buffer: 0,
             configured: false,
+        }
+    }
+
+    /// Rebuild layout and visuals from a new config (hot-reload).
+    ///
+    /// `seed` is replayed into the fresh dashboard so widgets keep the last
+    /// producer snapshot instead of going blank until the next event.
+    fn apply_config(&mut self, config: Config, pool: &mut SlotPool, seed: &[Msg]) {
+        let height = config.height;
+        let height_changed = self.height != height;
+        if height_changed {
+            self.height = height;
+            self.layer.set_size(0, height);
+            self.layer.set_exclusive_zone(height as i32);
+            // Size change requests a new configure; still repaint at the current
+            // geometry so theme/widget changes appear immediately.
+            self.layer.commit();
+            // Only drop SHM slots when geometry changes — dropping an attached
+            // buffer while the compositor still holds it can tear down the surface.
+            self.buffers = [None, None];
+            self.buffer_px = (0, 0);
+        }
+        self.config = config;
+        let full = Bounds::new(0, 0, self.width.max(1), self.height.max(1));
+        self.dashboard = self.config.build_dashboard(full, self.monitor.as_deref());
+        self.ctx
+            .set_settings(self.config.scaled_render_settings(self.scale));
+        // Rebuild clears widget state; replay the last producer snapshots and
+        // a fresh clock tick so the bar does not go empty until the next event.
+        for msg in seed {
+            let _ = self.dashboard.update(msg);
+        }
+        let _ = self.dashboard.update(&Msg::tick_now());
+        if self.configured {
+            self.draw(pool);
         }
     }
 
@@ -318,6 +373,9 @@ impl Surface {
     /// Render the current dashboard state and commit it through the app's shared
     /// shared-memory pool. Called on a visible change or when the Wayland
     /// lifecycle (first configure, resize) requires a fresh frame regardless.
+    ///
+    /// Uses two alternating SHM slots: when the compositor has released the
+    /// next slot, its mmap is reused instead of allocating a new one.
     fn draw(&mut self, pool: &mut SlotPool) {
         if !self.configured {
             return;
@@ -329,6 +387,50 @@ impl Surface {
         let (width, height) = self.scale.to_physical_size(self.width, self.height);
         let stride = width as i32 * 4;
 
+        if self.buffer_px != (width, height) {
+            self.buffers = [None, None];
+            self.buffer_px = (width, height);
+        }
+
+        let idx = self.next_buffer;
+        self.next_buffer = 1 - self.next_buffer;
+
+        let can_reuse = self.buffers[idx]
+            .as_ref()
+            .is_some_and(|buf| !buf.slot().has_active_buffers());
+
+        if can_reuse {
+            let canvas = match pool.canvas(self.buffers[idx].as_ref().unwrap()) {
+                Some(canvas) => canvas,
+                None => {
+                    // Race: became active between the check and canvas(). Fall through.
+                    self.paint_new_buffer(pool, idx, width, height, stride);
+                    self.commit_buffer(idx, width, height);
+                    return;
+                }
+            };
+            self.paint_frame(canvas, width, height);
+        } else {
+            self.paint_new_buffer(pool, idx, width, height, stride);
+        }
+        self.commit_buffer(idx, width, height);
+    }
+
+    fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) {
+        self.ctx.resize(width, height);
+        self.dashboard.layout(&mut self.ctx, width, height);
+        self.dashboard.draw(&mut self.ctx);
+        write_argb8888(self.ctx.pixels(), canvas);
+    }
+
+    fn paint_new_buffer(
+        &mut self,
+        pool: &mut SlotPool,
+        idx: usize,
+        width: u32,
+        height: u32,
+        stride: i32,
+    ) {
         let (buffer, canvas) = match pool.create_buffer(
             width as i32,
             height as i32,
@@ -341,12 +443,14 @@ impl Surface {
                 return;
             }
         };
+        self.paint_frame(canvas, width, height);
+        self.buffers[idx] = Some(buffer);
+    }
 
-        self.ctx.resize(width, height);
-        self.dashboard.layout(&mut self.ctx, width, height);
-        self.dashboard.draw(&mut self.ctx);
-        write_argb8888(self.ctx.pixels(), canvas);
-
+    fn commit_buffer(&mut self, idx: usize, width: u32, height: u32) {
+        let Some(buffer) = self.buffers[idx].as_ref() else {
+            return;
+        };
         let surface = self.layer.wl_surface();
         // Tell the compositor the buffer holds `scale`× physical pixels per
         // logical pixel, so it maps the larger buffer back to the logical size.
@@ -728,7 +832,77 @@ struct App {
     tooltip: Option<TooltipSurface>,
     pending_tray_menu: Option<PendingTrayMenu>,
     tray_menu: Option<TrayMenuSurface>,
+    /// Process-wide font set shared by every surface and popup.
+    fonts: SharedFonts,
+    /// Optional path watched for config hot-reload.
+    config_path: Option<PathBuf>,
+    /// Last successfully applied mtime of `config_path` (or `None` if missing).
+    config_mtime: Option<SystemTime>,
+    /// mtime we are debouncing before applying (editor mid-save).
+    config_pending_mtime: Option<SystemTime>,
+    /// When `config_pending_mtime` was first observed.
+    config_pending_at: Option<Instant>,
+    /// Latest producer messages, replayed after a dashboard rebuild on reload.
+    producer_snapshot: ProducerSnapshot,
     exit: bool,
+}
+
+/// Latest producer payloads retained for config hot-reload reseeding.
+///
+/// Rebuilds replace every widget; without a snapshot the bar goes blank until
+/// each source next emits (workspace/title/volume can stay empty for a long
+/// time). Transient menu messages are not stored.
+#[derive(Default)]
+struct ProducerSnapshot {
+    messages: Vec<Msg>,
+}
+
+impl ProducerSnapshot {
+    fn note(&mut self, msg: &Msg) {
+        if matches!(
+            msg,
+            Msg::Tick(_) | Msg::TrayMenu(_) | Msg::TrayMenuUnavailable(_)
+        ) {
+            return;
+        }
+        let key = snapshot_key(msg);
+        if let Some(slot) = self
+            .messages
+            .iter_mut()
+            .find(|existing| snapshot_key(existing) == key)
+        {
+            *slot = msg.clone();
+        } else {
+            self.messages.push(msg.clone());
+        }
+    }
+
+    fn as_slice(&self) -> &[Msg] {
+        &self.messages
+    }
+}
+
+/// Stable key for the latest-message map. Active-window is per-monitor so a
+/// dual-head setup keeps both titles across reload.
+fn snapshot_key(msg: &Msg) -> String {
+    match msg {
+        Msg::Tick(_) => "tick".into(),
+        Msg::Workspaces(_) => "workspaces".into(),
+        Msg::Battery(_) => "battery".into(),
+        Msg::Backlight(_) => "backlight".into(),
+        Msg::System(_) => "system".into(),
+        Msg::Network(_) => "network".into(),
+        Msg::Bluetooth(_) => "bluetooth".into(),
+        Msg::Tray(_) => "tray".into(),
+        Msg::TrayMenu(_) => "tray-menu".into(),
+        Msg::TrayMenuUnavailable(_) => "tray-menu-unavail".into(),
+        Msg::ActiveWindow { monitor, .. } => format!("aw:{monitor}"),
+        Msg::Volume(_) => "volume".into(),
+        Msg::Notifications(_) => "notifications".into(),
+        Msg::PowerProfiles(_) => "power-profiles".into(),
+        Msg::Updates(_) => "updates".into(),
+        Msg::Hypridle(_) => "hypridle".into(),
+    }
 }
 
 impl App {
@@ -745,6 +919,7 @@ impl App {
         // `self.outputs` and these shared borrows of other fields stay disjoint.
         let compositor = &self.compositor;
         let layer_shell = &self.layer_shell;
+        let fonts = self.fonts.clone();
         let built = self.outputs.ensure(id, name.as_deref(), |config| {
             Surface::new(
                 compositor,
@@ -754,6 +929,7 @@ impl App {
                 id,
                 name.as_deref(),
                 config,
+                fonts,
             )
         });
         if built {
@@ -762,6 +938,80 @@ impl App {
                 name.as_deref().unwrap_or("<unnamed>"),
                 self.outputs.len()
             );
+        }
+    }
+
+    /// Apply a freshly loaded config to every live bar (theme, layout, widgets).
+    ///
+    /// Producers already running stay as-is; newly required modules need a
+    /// process restart. Invalid files are logged and ignored by the watcher.
+    fn reload_config(&mut self, config: Config) {
+        self.outputs.set_base(config);
+        self.hide_tooltip();
+        self.hide_tray_menu();
+        let base = self.outputs.base().clone();
+        let seed: Vec<Msg> = self.producer_snapshot.as_slice().to_vec();
+        let reloads: Vec<(OutputId, Config)> = self
+            .outputs
+            .values()
+            .map(|surface| {
+                let name = self
+                    .output_state
+                    .info(&surface.output)
+                    .and_then(|info| info.name);
+                (surface.output_id, base.resolve_for_output(name.as_deref()))
+            })
+            .collect();
+        for (id, resolved) in reloads {
+            if let Some(surface) = self.outputs.get_mut(id) {
+                surface.apply_config(resolved, &mut self.pool, &seed);
+            }
+        }
+        info!("config reloaded");
+    }
+
+    /// Poll the config file mtime and reload when it changes.
+    ///
+    /// Debounces ~400ms so editors that truncate-then-write do not apply an
+    /// empty mid-save document (which would parse as defaults and wipe the bar).
+    fn poll_config_reload(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let mtime = file_mtime(&path);
+        if mtime == self.config_mtime {
+            self.config_pending_mtime = None;
+            self.config_pending_at = None;
+            return;
+        }
+
+        // New or updated mtime: (re)start the settle timer.
+        if self.config_pending_mtime != mtime {
+            self.config_pending_mtime = mtime;
+            self.config_pending_at = Some(Instant::now());
+            return;
+        }
+        let Some(started) = self.config_pending_at else {
+            return;
+        };
+        if started.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+
+        match Config::load_for_reload(&path) {
+            Ok(config) => {
+                self.config_mtime = mtime;
+                self.config_pending_mtime = None;
+                self.config_pending_at = None;
+                self.reload_config(config);
+            }
+            Err(error) => {
+                warn!("config reload ignored: {error}");
+                // Stop retrying this mtime until the user saves again.
+                self.config_mtime = mtime;
+                self.config_pending_mtime = None;
+                self.config_pending_at = None;
+            }
         }
     }
 
@@ -785,6 +1035,7 @@ impl App {
     /// Fan a message out to every output's dashboard, redrawing the ones that
     /// changed. The clock timer and every producer reach all bars this way.
     fn handle_all(&mut self, msg: &Msg) {
+        self.producer_snapshot.note(msg);
         let App { pool, outputs, .. } = self;
         let mut changed = false;
         for surface in outputs.values_mut() {
@@ -879,7 +1130,7 @@ impl App {
         let background = popup_background(settings.background);
         let foreground = settings.foreground;
         settings.background = (0, 0, 0, 0);
-        let mut ctx = RenderContext::with_settings(1, 1, settings);
+        let mut ctx = RenderContext::with_fonts(1, 1, settings, self.fonts.clone());
         let (physical_width, physical_height) = tooltip_size(&mut ctx, &tooltip.text);
         let divisor = scale.get();
         let width = physical_width.div_ceil(divisor);
@@ -956,7 +1207,7 @@ impl App {
         let foreground = settings.foreground;
         let accent = settings.accent;
         settings.background = (0, 0, 0, 0);
-        let mut ctx = RenderContext::with_settings(1, 1, settings);
+        let mut ctx = RenderContext::with_fonts(1, 1, settings, self.fonts.clone());
         let scale = pending.scale.get();
         let physical_width = rows
             .iter()
@@ -1023,6 +1274,11 @@ impl App {
     }
 }
 
+/// mtime of `path`, or `None` if the file is missing or unstatable.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// The stable per-output key: the `wl_output`'s protocol object id.
 ///
 /// Available in both `new_output` and `output_destroyed` (unlike the output's
@@ -1049,48 +1305,54 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// Open the bar and run its event loop until the compositor closes the surface.
 ///
 /// The bar's height, theme, font, spacing, and widget order all come from
-/// `config` (see [`crate::config::Config`]). Wires the default producer
-/// set — the Hyprland workspace source, the UPower battery source, the procfs
-/// system-stats source, the NetworkManager connectivity source, the BlueZ
-/// bluetooth source, the native PipeWire volume source, the
-/// StatusNotifierItem tray host, swaync notification source, and optional Arch
-/// package-update and Hypridle process pollers — so the
-/// bar shows live workspaces, battery, CPU/memory load, network state,
-/// Bluetooth adapter state, the active output sink's volume, tray icons, and
-/// the notification indicator alongside the clock. The bluetooth, volume,
-/// tray, and notifications producers run even when their widgets are not in
-/// any zone; the widget only appears when the user adds `"bluetooth"`,
-/// `"volume"`, `"tray"`, or `"notifications"` to a zone. The update poller is
-/// the exception: it starts only when `"updates"` is configured, avoiding
-/// needless subprocess and network work. Hypridle process polling is likewise
-/// enabled only when `"hypridle"` is configured. The volume source runs on a dedicated
-/// OS thread —
-/// PipeWire's main loop is synchronous, unlike the other producers' zbus
-/// backends. The clock itself is still driven by the synchronous tick timer;
-/// see [`run_with_producers`] to supply a custom producer set.
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    let mut producers: Vec<Box<dyn Producer>> = vec![
-        Box::new(HyprlandProducer::new()),
-        Box::new(UPowerProducer::new()),
-        Box::new(BacklightProducer::new()),
-        Box::new(SystemProducer::new()),
-        Box::new(NetworkProducer::new()),
-        Box::new(BluetoothProducer::new()),
-        Box::new(VolumeProducer::new()),
-        Box::new(SniHostProducer::new()),
-        Box::new(NotificationsProducer::new()),
-        Box::new(PowerProfilesProducer::new()),
-    ];
-    // Unlike DBus subscriptions, checking package repositories performs network
-    // and subprocess work, so keep this producer dormant unless some output uses
-    // the opt-in module.
+/// `config` (see [`crate::config::Config`]). Wires producers for the widgets
+/// that appear in the global layout or any per-monitor override
+/// ([`Config::uses_widget`]): Hyprland always runs (workspaces / title);
+/// UPower, sysmon, NetworkManager, BlueZ, PipeWire volume, the SNI tray host,
+/// swaync, power-profiles-daemon, backlight, Arch updates, and Hypridle start
+/// only when their module is configured. The volume source uses a dedicated OS
+/// thread (PipeWire's main loop is synchronous). The clock is driven by the
+/// synchronous tick timer. When `config_path` is set, the file is polled for
+/// mtime changes and the bar hot-reloads theme/layout (producers keep their
+/// original set until restart). See [`run_with_producers`] for a custom set.
+pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    let mut producers: Vec<Box<dyn Producer>> = vec![Box::new(HyprlandProducer::new())];
+    // Gate non-Hyprland sources so a minimal bar does not open PipeWire, host a
+    // StatusNotifierWatcher, or poll sysfs/backlight unnecessarily.
+    if config.uses_widget(WidgetKind::Battery) {
+        producers.push(Box::new(UPowerProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Backlight) {
+        producers.push(Box::new(BacklightProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::System) {
+        producers.push(Box::new(SystemProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Network) {
+        producers.push(Box::new(NetworkProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Bluetooth) {
+        producers.push(Box::new(BluetoothProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Volume) {
+        producers.push(Box::new(VolumeProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Tray) {
+        producers.push(Box::new(SniHostProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::Notifications) {
+        producers.push(Box::new(NotificationsProducer::new()));
+    }
+    if config.uses_widget(WidgetKind::PowerProfilesDaemon) {
+        producers.push(Box::new(PowerProfilesProducer::new()));
+    }
     if config.uses_widget(WidgetKind::Updates) {
         producers.push(Box::new(UpdatesProducer::new()));
     }
     if config.uses_widget(WidgetKind::Hypridle) {
         producers.push(Box::new(HypridleProducer::new()));
     }
-    run_with_producers(config, producers)
+    run_with_producers(config, producers, config_path)
 }
 
 /// Open the bar and run its event loop, additionally driving `producers` on an
@@ -1106,12 +1368,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 /// their layer surfaces before producers start. Later outputs still arrive
 /// through [`OutputHandler::new_output`], and `output_destroyed` tears each down,
 /// so plugging or unplugging a monitor adds or removes its bar without restarting
-/// the loop.
+/// the loop. `config_path` enables mtime-based hot-reload of the TOML config.
 pub fn run_with_producers(
     config: Config,
     producers: Vec<Box<dyn Producer>>,
+    config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let height = config.height;
+    let config_mtime = config_path.as_ref().and_then(|p| file_mtime(p));
+    let fonts = shared_fonts();
 
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
@@ -1124,7 +1389,8 @@ pub fn run_with_producers(
 
     // Size the shared pool for one full-width bar at the default height; it grows
     // automatically as further outputs and higher scales demand more buffers.
-    let pool = SlotPool::new((INITIAL_WIDTH * height * 4) as usize, &shm)?;
+    // Double-buffering uses two slots per surface, so seed a little larger.
+    let pool = SlotPool::new((INITIAL_WIDTH * height * 4 * 2) as usize, &shm)?;
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -1144,6 +1410,12 @@ pub fn run_with_producers(
         tooltip: None,
         pending_tray_menu: None,
         tray_menu: None,
+        fonts,
+        config_path,
+        config_mtime,
+        config_pending_mtime: None,
+        config_pending_at: None,
+        producer_snapshot: ProducerSnapshot::default(),
         exit: false,
     };
 
@@ -1166,6 +1438,16 @@ pub fn run_with_producers(
         app.handle_all(&Msg::tick_now());
         TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_minute()))
     })?;
+
+    // Poll the config file mtime about twice a second so theme/layout edits
+    // apply without restarting. Cheap when the path is unset (no-op).
+    if app.config_path.is_some() {
+        let reload = Timer::from_duration(Duration::from_millis(500));
+        handle.insert_source(reload, |_deadline, _, app| {
+            app.poll_config_reload();
+            TimeoutAction::ToDuration(Duration::from_millis(500))
+        })?;
+    }
 
     // Bring up the async producer bridge only when there is async work to do.
     // The bridge owns the Tokio runtime and must outlive the loop, so it is held

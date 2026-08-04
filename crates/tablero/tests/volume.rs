@@ -213,9 +213,8 @@ fn a_run_program_command_actually_spawns_the_program() {
     // spawns the script directly (no shell). Verify the spawn landed by
     // waiting for the script's marker file to appear.
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use tablero::command::{command_channel, run_commands};
-    use tablero::widget::Command;
+    use tablero::widget::{Command, LaunchSpec};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let marker = dir.path().join("clicked.marker");
@@ -226,21 +225,24 @@ fn a_run_program_command_actually_spawns_the_program() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).expect("chmod");
 
-    let widget = VolumeWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(script.clone()));
+    let spec = LaunchSpec::program_only(script.clone());
+    let widget = VolumeWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(spec.clone()));
     let Some(Command::RunProgram(path)) = widget.on_click(10, 10, ClickButton::Left) else {
         panic!("widget should emit a RunProgram command");
     };
-    assert_eq!(path, PathBuf::from(&script));
+    assert_eq!(path, spec);
 
     // Drive the command through a real executor task, exactly as the bar
     // would. The executor spawns the script as a child process and the
     // script writes the marker file.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
     let (tx, rx) = command_channel();
-    tx.send(Command::RunProgram(script.clone())).unwrap();
+    tx.send(Command::RunProgram(LaunchSpec::program_only(script)))
+        .unwrap();
     drop(tx);
     rt.block_on(run_commands(rx)).unwrap();
 

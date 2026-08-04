@@ -44,6 +44,17 @@ impl<S> Outputs<S> {
         }
     }
 
+    /// Replace the base config used for new outputs and for
+    /// [`config_for`](Self::config_for) resolution (config hot-reload).
+    pub fn set_base(&mut self, base: Config) {
+        self.base = base;
+    }
+
+    /// The shared base configuration every output resolves against.
+    pub fn base(&self) -> &Config {
+        &self.base
+    }
+
     /// The effective [`Config`] an output named `name` should run on.
     ///
     /// Delegates to [`Config::resolve_for_output`]: a matching `[[monitor]]`
@@ -155,6 +166,19 @@ mod tests {
         assert!(outputs.ensure(1, Some("DP-1"), build_from));
         assert_eq!(outputs.len(), 1);
         assert!(outputs.contains(1));
+    }
+
+    #[test]
+    fn set_base_updates_resolution_for_new_outputs() {
+        let mut outputs: Outputs<FakeSurface> = Outputs::new(base());
+        assert_eq!(outputs.config_for(Some("HDMI-A-1")).height, 30);
+        let mut taller = base();
+        taller.height = 40;
+        outputs.set_base(taller);
+        assert_eq!(outputs.base().height, 40);
+        assert_eq!(outputs.config_for(Some("HDMI-A-1")).height, 40);
+        // Monitor override still wins for DP-1.
+        assert_eq!(outputs.config_for(Some("DP-1")).height, 48);
     }
 
     #[test]

@@ -19,12 +19,12 @@
 //! widget narrow enough to live in the right cluster next to the other status
 //! pills.
 
-use std::path::PathBuf;
-
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
-use super::{Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content};
+use super::{
+    LaunchSpec, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
+};
 
 /// The kind of audio output the active sink represents, derived from the
 /// PipeWire `device.icon-name` (preferred) or `device.form-factor` (fallback).
@@ -150,7 +150,7 @@ pub struct VolumeWidget {
     bounds: Bounds,
     state: Option<Volume>,
     style: WidgetStyle,
-    on_click: Option<PathBuf>,
+    on_click: Option<LaunchSpec>,
 }
 
 impl VolumeWidget {
@@ -180,7 +180,7 @@ impl VolumeWidget {
     /// a [`Command::RunProgram`](super::Command::RunProgram) the host executor
     /// spawns directly (no shell). Consuming and returning `self` chains off
     /// [`new`](VolumeWidget::new) at build time.
-    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+    pub fn with_on_click(mut self, path: Option<LaunchSpec>) -> Self {
         self.on_click = path;
         self
     }
@@ -520,10 +520,10 @@ mod tests {
     #[test]
     fn with_on_click_a_click_inside_bounds_runs_the_program() {
         let widget = VolumeWidget::new(Bounds::new(0, 0, 200, 32))
-            .with_on_click(Some(PathBuf::from("/usr/bin/pavucontrol")));
+            .with_on_click(Some(LaunchSpec::program_only("/usr/bin/pavucontrol")));
         assert_eq!(
             widget.on_click(10, 10, ClickButton::Left),
-            Some(super::super::Command::RunProgram(PathBuf::from(
+            Some(super::super::Command::RunProgram(LaunchSpec::program_only(
                 "/usr/bin/pavucontrol"
             )))
         );
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn on_click_outside_bounds_is_ignored_even_when_configured() {
         let widget = VolumeWidget::new(Bounds::new(10, 0, 200, 32))
-            .with_on_click(Some(PathBuf::from("/usr/bin/pavucontrol")));
+            .with_on_click(Some(LaunchSpec::program_only("/usr/bin/pavucontrol")));
         // x=0 is left of bounds.x=10; click is outside the pill.
         assert_eq!(widget.on_click(0, 10, ClickButton::Left), None);
         // x=210 is at/past the right edge (x + width = 210), outside.

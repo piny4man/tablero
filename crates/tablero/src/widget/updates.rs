@@ -5,14 +5,12 @@
 //! snapshot means there is nothing to show: zero updates, a missing helper, and
 //! the pre-first-check state all reserve no space in the bar.
 
-use std::path::PathBuf;
-
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    ClickButton, Command, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
-    measure_icon_content,
+    ClickButton, Command, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
+    draw_icon_content, measure_icon_content,
 };
 
 /// Validate the placeholders accepted by [`UpdatesWidget`].
@@ -119,7 +117,7 @@ pub struct UpdatesWidget {
     state: Option<PackageUpdates>,
     style: WidgetStyle,
     format: Option<String>,
-    on_click: Option<PathBuf>,
+    on_click: Option<LaunchSpec>,
 }
 
 impl UpdatesWidget {
@@ -147,7 +145,7 @@ impl UpdatesWidget {
     }
 
     /// Set the executable path run on a left click.
-    pub fn with_on_click(mut self, path: Option<PathBuf>) -> Self {
+    pub fn with_on_click(mut self, path: Option<LaunchSpec>) -> Self {
         self.on_click = path;
         self
     }
@@ -354,7 +352,7 @@ mod tests {
 
     #[test]
     fn configured_click_emits_a_direct_program_command() {
-        let path = PathBuf::from("/usr/local/bin/update-system");
+        let path = LaunchSpec::program_only("/usr/local/bin/update-system");
         let widget =
             UpdatesWidget::new(Bounds::new(10, 0, 100, 32)).with_on_click(Some(path.clone()));
         assert_eq!(

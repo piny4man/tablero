@@ -72,10 +72,11 @@ use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HypridleWidget,
-    IconSetting, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget, StateColors,
-    SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget, WidgetStyle,
-    WorkspaceWidget, backlight::validate_backlight_format, battery::validate_battery_format,
-    power_profiles::validate_power_profiles_format, updates::validate_updates_format,
+    IconSetting, LaunchSpec, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget,
+    StateColors, SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget,
+    WidgetStyle, WorkspaceWidget, backlight::validate_backlight_format,
+    battery::validate_battery_format, power_profiles::validate_power_profiles_format,
+    updates::validate_updates_format,
 };
 
 /// Default bar height in pixels.
@@ -365,23 +366,25 @@ pub struct WidgetStyleConfig {
     pub attention: StateColorConfig,
     /// Colors used while a battery is charging.
     pub charging: StateColorConfig,
-    /// Executable path run when the widget is clicked.
+    /// Program (and optional args) run when the widget is clicked.
     ///
     /// When `Some`, a click inside the widget's bounds emits a
     /// [`Command::RunProgram`](crate::widget::Command::RunProgram) the host
-    /// executor spawns directly (no shell). When `None`, the widget is
-    /// display-only and clicks yield nothing. The path is taken verbatim and
-    /// may use a leading `~` for the user's home, which the executor expands
-    /// at click time. Available on every widget kind for forward
-    /// compatibility; today bluetooth, volume, and updates honor it.
+    /// executor spawns directly (no shell). Accepts a string (`"pavucontrol"`
+    /// or `"gtk-launch org.gnome.Calendar"`, split on whitespace) or a string
+    /// list (`["gtk-launch", "org.gnome.Calendar"]`). A leading `~` on the
+    /// program is expanded at click time; bare names are resolved via `PATH`.
+    /// When `None`, the widget is display-only. Available on every widget kind
+    /// for forward compatibility; today bluetooth, volume, updates, network,
+    /// clock, and power honor it.
     #[serde(rename = "on-click")]
-    pub on_click: Option<std::path::PathBuf>,
-    /// Executable path run when the widget is right-clicked.
+    pub on_click: Option<LaunchSpec>,
+    /// Program (and optional args) run when the widget is right-clicked.
     ///
     /// Uses the same direct-spawn semantics as [`on_click`](Self::on_click).
-    /// Currently honored by the power widget.
+    /// Honored by power, network, and clock.
     #[serde(rename = "on-click-right")]
-    pub on_click_right: Option<std::path::PathBuf>,
+    pub on_click_right: Option<LaunchSpec>,
     /// Widget label format. Supported placeholders depend on the widget.
     pub format: Option<String>,
     /// Widget-specific icon configuration: a backlight ramp or named profile map.
@@ -811,6 +814,31 @@ impl Default for Config {
     }
 }
 
+/// Resolve the user config path from the environment.
+///
+/// Prefers `$XDG_CONFIG_HOME/tablero/config.toml`; falls back to
+/// `$HOME/.config/tablero/config.toml`. Returns `None` when neither home is set.
+pub fn config_file_path() -> Option<PathBuf> {
+    config_file_path_from(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure resolver behind [`config_file_path`].
+pub fn config_file_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|s| !s.is_empty()) {
+        return Some(Path::new(xdg).join("tablero").join("config.toml"));
+    }
+    let home = home.filter(|s| !s.is_empty())?;
+    Some(
+        Path::new(home)
+            .join(".config")
+            .join("tablero")
+            .join("config.toml"),
+    )
+}
+
 impl Config {
     /// Parse a configuration from a TOML document.
     ///
@@ -835,24 +863,46 @@ impl Config {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         let path = path.as_ref();
         match fs::read_to_string(path) {
-            Ok(text) => {
-                let config: Config =
-                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                        path: Some(path.to_path_buf()),
-                        source,
-                    })?;
-                config.validate().map_err(|message| ConfigError::Invalid {
-                    path: Some(path.to_path_buf()),
-                    message,
-                })?;
-                Ok(config)
-            }
+            Ok(text) => Self::parse_file_text(path, &text),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
             Err(source) => Err(ConfigError::Read {
                 path: path.to_path_buf(),
                 source,
             }),
         }
+    }
+
+    /// Load a config for **hot-reload**: never invents defaults.
+    ///
+    /// Unlike [`Config::load_from_path`], a missing file, an empty/whitespace-only
+    /// document (common mid-save when an editor truncates), or a parse error
+    /// is always an error so the running bar keeps its previous config instead
+    /// of flashing to built-in defaults.
+    pub fn load_for_reload(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if text.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                path: Some(path.to_path_buf()),
+                message: "config file is empty (save may still be in progress)".to_string(),
+            });
+        }
+        Self::parse_file_text(path, &text)
+    }
+
+    fn parse_file_text(path: &Path, text: &str) -> Result<Config, ConfigError> {
+        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        config.validate().map_err(|message| ConfigError::Invalid {
+            path: Some(path.to_path_buf()),
+            message,
+        })?;
+        Ok(config)
     }
 
     /// Validate the resolved values, rejecting ones that deserialize fine but
@@ -1138,7 +1188,7 @@ impl WidgetKind {
         bounds: Bounds,
         style: WidgetStyle,
         monitor: Option<&str>,
-        on_click: Option<std::path::PathBuf>,
+        on_click: Option<LaunchSpec>,
     ) -> Box<dyn Widget> {
         match self {
             WidgetKind::Workspaces => match monitor {
@@ -1395,6 +1445,41 @@ mod tests {
     use crate::widget::ClickButton;
 
     #[test]
+    fn config_file_path_from_prefers_xdg() {
+        assert_eq!(
+            config_file_path_from(Some("/cfg"), Some("/home/u")),
+            Some(PathBuf::from("/cfg/tablero/config.toml"))
+        );
+        assert_eq!(
+            config_file_path_from(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.config/tablero/config.toml"))
+        );
+        assert!(
+            config_file_path_from(Some(""), Some("/home/u"))
+                .unwrap()
+                .ends_with("tablero/config.toml")
+        );
+        assert_eq!(config_file_path_from(None, None), None);
+    }
+
+    #[test]
+    fn load_for_reload_rejects_empty_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert!(Config::load_for_reload(&missing).is_err());
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "   \n").unwrap();
+        let err = Config::load_for_reload(&empty).unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "height = 40\n").unwrap();
+        let config = Config::load_for_reload(&ok).unwrap();
+        assert_eq!(config.height, 40);
+    }
+
+    #[test]
     fn default_is_the_documented_baseline() {
         let config = Config::default();
         assert_eq!(config.height, 32);
@@ -1477,12 +1562,22 @@ mod tests {
         );
         assert_eq!(parsed.widget.updates.padding, Some(6));
         assert_eq!(
-            parsed.widget.power.on_click.as_deref(),
-            Some(std::path::Path::new("wlogout"))
+            parsed
+                .widget
+                .power
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
+            Some(std::path::Path::new("/usr/bin/wlogout"))
         );
         assert_eq!(
-            parsed.widget.power.on_click_right.as_deref(),
-            Some(std::path::Path::new("hyprlock"))
+            parsed
+                .widget
+                .power
+                .on_click_right
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
+            Some(std::path::Path::new("/usr/bin/hyprlock"))
         );
         assert_eq!(
             parsed.widget.battery.format.as_deref(),
@@ -1689,7 +1784,12 @@ mod tests {
             Some("{count} {icon}")
         );
         assert_eq!(
-            config.widget.updates.on_click.as_deref(),
+            config
+                .widget
+                .updates
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/local/bin/update-system"))
         );
     }
@@ -1737,7 +1837,12 @@ mod tests {
             vec![WidgetKind::Hypridle, WidgetKind::Power, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.power.on_click_right.as_deref(),
+            config
+                .widget
+                .power
+                .on_click_right
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("hyprlock"))
         );
         assert!(config.uses_widget(WidgetKind::Hypridle));
@@ -1794,7 +1899,8 @@ mod tests {
                 .widget
                 .power
                 .on_click_right
-                .as_deref(),
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("monitor-lock"))
         );
         assert_eq!(
@@ -1803,7 +1909,8 @@ mod tests {
                 .widget
                 .power
                 .on_click_right
-                .as_deref(),
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("global-lock"))
         );
     }
@@ -1849,7 +1956,12 @@ mod tests {
             vec![WidgetKind::Bluetooth, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.bluetooth.on_click.as_deref(),
+            config
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/bin/blueman-manager"))
         );
 
@@ -1865,7 +1977,7 @@ mod tests {
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
-                std::path::PathBuf::from("/usr/bin/blueman-manager")
+                crate::widget::LaunchSpec::program_only("/usr/bin/blueman-manager")
             ))
         );
     }
@@ -1900,21 +2012,36 @@ mod tests {
         .unwrap();
         // The global path stays where it was.
         assert_eq!(
-            config.widget.bluetooth.on_click.as_deref(),
+            config
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
 
         // The resolved config for DP-1 sees the per-monitor override.
         let resolved = config.resolve_for_output(Some("DP-1"));
         assert_eq!(
-            resolved.widget.bluetooth.on_click.as_deref(),
+            resolved
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/per-monitor/launcher.sh"))
         );
 
         // An output with no matching monitor keeps the global on-click.
         let other = config.resolve_for_output(Some("HDMI-A-1"));
         assert_eq!(
-            other.widget.bluetooth.on_click.as_deref(),
+            other
+                .widget
+                .bluetooth
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
     }
@@ -1948,7 +2075,12 @@ mod tests {
             vec![WidgetKind::Volume, WidgetKind::Clock]
         );
         assert_eq!(
-            config.widget.volume.on_click.as_deref(),
+            config
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/usr/bin/pavucontrol"))
         );
 
@@ -1964,7 +2096,7 @@ mod tests {
         assert_eq!(
             click,
             Some(crate::widget::Command::RunProgram(
-                std::path::PathBuf::from("/usr/bin/pavucontrol")
+                crate::widget::LaunchSpec::program_only("/usr/bin/pavucontrol")
             ))
         );
     }
@@ -1999,21 +2131,36 @@ mod tests {
         .unwrap();
         // The global path stays where it was.
         assert_eq!(
-            config.widget.volume.on_click.as_deref(),
+            config
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
 
         // The resolved config for DP-1 sees the per-monitor override.
         let resolved = config.resolve_for_output(Some("DP-1"));
         assert_eq!(
-            resolved.widget.volume.on_click.as_deref(),
+            resolved
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/per-monitor/launcher.sh"))
         );
 
         // An output with no matching monitor keeps the global on-click.
         let other = config.resolve_for_output(Some("HDMI-A-1"));
         assert_eq!(
-            other.widget.volume.on_click.as_deref(),
+            other
+                .widget
+                .volume
+                .on_click
+                .as_ref()
+                .map(crate::widget::LaunchSpec::program),
             Some(std::path::Path::new("/global/launcher.sh"))
         );
     }

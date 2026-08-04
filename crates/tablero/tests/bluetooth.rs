@@ -197,17 +197,16 @@ fn a_configured_on_click_emits_a_run_program_command() {
     // End-to-end click path: a bluetooth widget built with an on-click
     // path returns `Some(Command::RunProgram(path))` for clicks inside its
     // bounds, and `None` for clicks outside or when no path is configured.
-    use std::path::PathBuf;
-    use tablero::widget::Command;
+    use tablero::widget::{Command, LaunchSpec};
 
     let no_click = BluetoothWidget::new(Bounds::new(0, 0, 200, 32));
     assert_eq!(no_click.on_click(10, 10, ClickButton::Left), None);
 
     let clicked = BluetoothWidget::new(Bounds::new(0, 0, 200, 32))
-        .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
+        .with_on_click(Some(LaunchSpec::program_only("/usr/bin/blueman-manager")));
     assert_eq!(
         clicked.on_click(10, 10, ClickButton::Left),
-        Some(Command::RunProgram(PathBuf::from(
+        Some(Command::RunProgram(LaunchSpec::program_only(
             "/usr/bin/blueman-manager"
         )))
     );
@@ -215,7 +214,7 @@ fn a_configured_on_click_emits_a_run_program_command() {
     // top-left corner of a (50, 10, 200, 32) widget's padding region, and
     // (260, 10) is past the right edge.
     let far_clicked = BluetoothWidget::new(Bounds::new(50, 10, 200, 32))
-        .with_on_click(Some(PathBuf::from("/usr/bin/blueman-manager")));
+        .with_on_click(Some(LaunchSpec::program_only("/usr/bin/blueman-manager")));
     assert_eq!(far_clicked.on_click(0, 0, ClickButton::Left), None);
     assert_eq!(far_clicked.on_click(260, 10, ClickButton::Left), None);
 }
@@ -228,9 +227,8 @@ fn a_run_program_command_actually_spawns_the_program() {
     // executor spawns the script directly (no shell). We verify the spawn
     // landed by waiting for the script's marker file to appear.
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use tablero::command::{command_channel, run_commands};
-    use tablero::widget::Command;
+    use tablero::widget::{Command, LaunchSpec};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let marker = dir.path().join("clicked.marker");
@@ -241,19 +239,21 @@ fn a_run_program_command_actually_spawns_the_program() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).expect("chmod");
 
-    let widget =
-        BluetoothWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(script.clone()));
+    let spec = LaunchSpec::program_only(script.clone());
+    let widget = BluetoothWidget::new(Bounds::new(0, 0, 200, 32)).with_on_click(Some(spec.clone()));
     let Some(Command::RunProgram(path)) = widget.on_click(10, 10, ClickButton::Left) else {
         panic!("widget should emit a RunProgram command");
     };
-    assert_eq!(path, PathBuf::from(&script));
+    assert_eq!(path, spec);
 
     // Drive the command through a real executor task, exactly as the bar
     // wires it.
     let (bridge, _channel) = ProducerBridge::new().expect("runtime starts");
     let (cmd_tx, cmd_rx) = command_channel();
     bridge.spawn_task("run-commands", run_commands(cmd_rx));
-    cmd_tx.send(Command::RunProgram(script.clone())).unwrap();
+    cmd_tx
+        .send(Command::RunProgram(LaunchSpec::program_only(script)))
+        .unwrap();
     drop(cmd_tx);
 
     // Wait briefly for the spawned child to land.
