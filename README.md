@@ -173,6 +173,12 @@ RUST_LOG=info cargo run -p tablero
 - Wakes **only** for clock ticks (a `calloop` timer aligned to the wall-clock
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
+- **Hot-reloads** `$XDG_CONFIG_HOME/tablero/config.toml` while running: theme,
+  layout, and widget options apply within about half a second of a save (mid-save
+  empty files are ignored). Live widget readings are kept across the reload.
+  Adding a module that was not in the layout at startup (e.g. first-time
+  `"tray"`) still needs a process restart so its producer can start — see
+  [Configuration](#configuration).
 
 ## Configuration
 
