@@ -270,7 +270,9 @@ mod tests {
         // would mean the path never rendered.
         let painted = pixmap
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[3] > 0x40 && px[0] > 0x80);
         assert!(painted, "icon fill produced no visible pixels");
     }

@@ -61,7 +61,7 @@ fn redraw_after_message_paints_the_current_state() {
 
     // The clock glyphs lighten some pixels above the background level.
     assert!(
-        px.chunks_exact(4).any(|p| p[0] > 0x60),
+        px.as_chunks::<4>().0.iter().any(|p| p[0] > 0x60),
         "no rendered clock glyphs found"
     );
 }

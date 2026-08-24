@@ -59,7 +59,9 @@ fn sampled_stats_appear_in_rendered_output() {
     dash.draw(&mut ctx);
     assert!(
         ctx.pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|p| p[0] < 0x30 && p[1] < 0x30 && p[2] < 0x30 && p[3] == 0xFF),
         "widget painted something before its first sample"
     );
@@ -68,7 +70,7 @@ fn sampled_stats_appear_in_rendered_output() {
     assert!(dash.update(&sample(12.0, 47.0)));
     dash.draw(&mut ctx);
     assert!(
-        ctx.pixels().chunks_exact(4).any(|p| p[0] > 0x60),
+        ctx.pixels().as_chunks::<4>().0.iter().any(|p| p[0] > 0x60),
         "sampled stats were not rendered as foreground glyphs"
     );
 }
