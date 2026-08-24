@@ -704,7 +704,7 @@ mod tests {
         // Somewhere in the buffer a glyph must have lightened pixels above the
         // background level, proving text is actually rendered.
         let px = render_text("12:00:00", 320, 32);
-        let has_light = px.chunks_exact(4).any(|p| p[0] > 0x60);
+        let has_light = px.as_chunks::<4>().0.iter().any(|p| p[0] > 0x60);
         assert!(has_light, "no foreground pixels found");
     }
 
@@ -722,7 +722,7 @@ mod tests {
         let mut min_y = u32::MAX;
         let mut max_x = 0;
         let mut max_y = 0;
-        for (index, pixel) in ctx.pixels().chunks_exact(4).enumerate() {
+        for (index, pixel) in ctx.pixels().as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] == 0 {
                 continue;
             }
@@ -817,6 +817,9 @@ mod tests {
             "top-left not bg"
         );
         // Somewhere a foreground pixel exists, proving the glyph was drawn.
-        assert!(px.chunks_exact(4).any(|p| p[0] > 0x60), "no glyph drawn");
+        assert!(
+            px.as_chunks::<4>().0.iter().any(|p| p[0] > 0x60),
+            "no glyph drawn"
+        );
     }
 }

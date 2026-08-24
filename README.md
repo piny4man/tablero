@@ -131,10 +131,13 @@ RUST_LOG=info cargo run -p tablero
     daemon; while it is not on the bus the widget reserves no slot, and it
     reappears automatically when swaync (re)starts.
   - **Power profiles** — the active power-profiles-daemon profile, followed
-    natively over the system DBus. Enabled by default after the network module;
-    it hides when the daemon is unavailable. Left-click rotates forward through
-    the advertised profiles, right-click rotates backward, and hovering shows
-    the configured profile and driver tooltip.
+    natively over the system DBus. When a known platform TDP/fan driver is
+    present (`qc71_laptop` today) the widget overlays that hardware state;
+    Framework laptops, desktops, and other machines stay a pure PPD client.
+    Enabled by default after the network module; it hides when neither source
+    is available. Left-click rotates forward through the advertised profiles,
+    right-click rotates backward, and hovering shows the configured profile
+    and driver tooltip.
   - **Hypridle** — exact same-user process state read natively from procfs, with
     no polling script or `pgrep`/`killall` helper. **Opt-in**: add `"hypridle"`
     to a zone. The lock glyph uses the widget accent while Hypridle is active and
@@ -414,9 +417,38 @@ power-saver = ""
 ```
 
 Both `format` and `tooltip-format` accept `{icon}`, `{profile}`, `{driver}`,
-`{cpu_driver}`, and `{platform_driver}`. The module talks directly to the
-official system D-Bus API and falls back to its legacy compatible name; it never
-spawns `powerprofilesctl`.
+`{cpu_driver}`, `{platform_driver}`, and `{hardware}`. The module talks
+directly to the official system D-Bus API and falls back to its legacy
+compatible name; it never spawns `powerprofilesctl`.
+
+On machines that expose the `qc71_laptop` sysfs (Slimbook EVO and compatibles),
+the same widget also reads the hardware performance mode and, when a privileged
+helper is installed, applies TDP/fan changes alongside power-profiles-daemon.
+Detection is automatic and silent: a Framework laptop, a desktop, or any other
+machine without that sysfs stays a pure PPD client — no extra errors, no failed
+writes. Set `hardware-control = false` to force that PPD-only path.
+
+`{hardware}` expands to `qc71` when that backend is active, otherwise `none`.
+The default tooltip is unchanged.
+
+To let tablero actually *write* qc71 sysfs, install the helper and a Polkit
+rule so an active session can call it without a password prompt:
+
+```sh
+sudo install -m 0755 contrib/qc71/tablero-qc71-set-mode /usr/local/bin/tablero-qc71-set-mode
+sudo install -m 0644 contrib/qc71/org.pinya.tablero.qc71.policy \
+  /usr/share/polkit-1/actions/org.pinya.tablero.qc71.policy
+```
+
+The helper accepts `power-saver`, `balanced`, or `performance`. The bar never
+writes sysfs itself. Clicks still update power-profiles-daemon even if the
+helper is missing; only the hardware TDP/fan step is skipped.
+
+A sudoers alternative (less flexible than Polkit):
+
+```
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/tablero-qc71-set-mode
+```
 
 ### Per-monitor overrides
 

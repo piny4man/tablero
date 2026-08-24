@@ -97,7 +97,7 @@ use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
 use crate::notifications::NotificationsProducer;
 use crate::outputs::{OutputId, Outputs};
-use crate::power_profiles::PowerProfilesProducer;
+use crate::power_profiles::{PowerProfilesProducer, PowerProfilesSettings};
 use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
 use crate::sysmon::SystemProducer;
@@ -1344,7 +1344,9 @@ pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn E
         producers.push(Box::new(NotificationsProducer::new()));
     }
     if config.uses_widget(WidgetKind::PowerProfilesDaemon) {
-        producers.push(Box::new(PowerProfilesProducer::new()));
+        producers.push(Box::new(
+            PowerProfilesProducer::new().with_settings(power_profiles_settings(&config)),
+        ));
     }
     if config.uses_widget(WidgetKind::Updates) {
         producers.push(Box::new(UpdatesProducer::new()));
@@ -1353,6 +1355,22 @@ pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn E
         producers.push(Box::new(HypridleProducer::new()));
     }
     run_with_producers(config, producers, config_path)
+}
+
+fn power_profiles_settings(config: &Config) -> PowerProfilesSettings {
+    PowerProfilesSettings::new(
+        config
+            .widget
+            .power_profiles_daemon
+            .hardware_control
+            .unwrap_or(true),
+        config
+            .widget
+            .power_profiles_daemon
+            .hardware_helper
+            .as_ref()
+            .map(PathBuf::from),
+    )
 }
 
 /// Open the bar and run its event loop, additionally driving `producers` on an
@@ -1374,6 +1392,7 @@ pub fn run_with_producers(
     producers: Vec<Box<dyn Producer>>,
     config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
+    let power_settings = power_profiles_settings(&config);
     let height = config.height;
     let config_mtime = config_path.as_ref().and_then(|p| file_mtime(p));
     let fonts = shared_fonts();
@@ -1495,7 +1514,7 @@ pub fn run_with_producers(
         let (power_tx, power_rx) = command_channel();
         bridge.spawn_task(
             "power-profiles-commands",
-            power_profiles::run_commands(power_rx),
+            power_profiles::run_commands(power_rx, power_settings),
         );
         let (hypridle_tx, hypridle_rx) = command_channel();
         let hypridle_updates = bridge.sender();

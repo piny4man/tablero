@@ -68,7 +68,9 @@ fn absent_battery_paints_a_blank_slot() {
     // With no battery present, every pixel is the opaque dark background: no
     // glyph was painted anywhere.
     assert!(
-        px.chunks_exact(4)
+        px.as_chunks::<4>()
+            .0
+            .iter()
             .all(|p| p[0] < 0x30 && p[1] < 0x30 && p[2] < 0x30 && p[3] == 0xFF),
         "absent battery left non-background pixels"
     );

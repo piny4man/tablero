@@ -149,7 +149,8 @@ pub enum Msg {
     /// `None` means swaync is not on the session bus, so the widget shows
     /// nothing — the same absent-source convention as [`Msg::Volume`].
     Notifications(Option<Notifications>),
-    /// The power-profiles-daemon state; `None` means the daemon is unavailable.
+    /// The power-profiles-daemon state, with an optional platform overlay;
+    /// `None` means neither the daemon nor a known hardware backend is available.
     PowerProfiles(Option<PowerProfilesState>),
     /// Available Arch repository and AUR updates; `None` hides the widget.
     Updates(Option<PackageUpdates>),
@@ -228,7 +229,7 @@ pub enum Command {
         /// Percentage points changed by one logical scroll step.
         step: f64,
     },
-    /// Select one of power-profiles-daemon's advertised profiles.
+    /// Select a power profile (PPD, plus a platform helper when detected).
     SetPowerProfile(String),
     /// Set whether the session's Hypridle daemon should be running.
     SetHypridle(bool),

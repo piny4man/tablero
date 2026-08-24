@@ -24,7 +24,12 @@ pub fn rgba_to_argb8888(rgba: &[u8]) -> Vec<u8> {
 /// Converts `min(rgba.len(), dst.len())` rounded down to whole pixels; any
 /// trailing bytes in `dst` are left untouched.
 pub fn write_argb8888(rgba: &[u8], dst: &mut [u8]) {
-    for (src, out) in rgba.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+    for (src, out) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0)
+    {
         out[0] = src[2]; // B
         out[1] = src[1]; // G
         out[2] = src[0]; // R

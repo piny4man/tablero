@@ -103,6 +103,9 @@ impl PowerProfile {
 pub struct PowerProfilesState {
     active: String,
     profiles: Vec<PowerProfile>,
+    /// Detected platform TDP/fan backend (`"qc71"` today), when hardware
+    /// control is active. `None` on machines that stay a pure PPD client.
+    hardware: Option<String>,
 }
 
 impl PowerProfilesState {
@@ -111,12 +114,42 @@ impl PowerProfilesState {
         Self {
             active: active.into(),
             profiles,
+            hardware: None,
         }
     }
 
-    /// Active profile name reported by the daemon.
+    /// Override the active profile name, keeping the advertised list.
+    pub fn with_active(mut self, active: impl Into<String>) -> Self {
+        self.active = active.into();
+        self
+    }
+
+    /// Label the snapshot with a platform backend name for tooltips.
+    pub fn with_hardware(mut self, hardware: Option<String>) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    /// Append `profile` when the daemon list does not already contain it.
+    pub fn ensuring_profile(mut self, profile: PowerProfile) -> Self {
+        if !self
+            .profiles
+            .iter()
+            .any(|existing| existing.name == profile.name)
+        {
+            self.profiles.push(profile);
+        }
+        self
+    }
+
+    /// Active profile name reported by the daemon (or hardware overlay).
     pub fn active_name(&self) -> &str {
         &self.active
+    }
+
+    /// Detected platform backend name, when hardware control is active.
+    pub fn hardware(&self) -> Option<&str> {
+        self.hardware.as_deref()
     }
 
     /// Profiles in the order advertised by the daemon.
@@ -168,7 +201,7 @@ pub fn validate_power_profiles_format(format: &str) -> Result<(), String> {
         let placeholder = &rest[..close];
         if !matches!(
             placeholder,
-            "icon" | "profile" | "driver" | "cpu_driver" | "platform_driver"
+            "icon" | "profile" | "driver" | "cpu_driver" | "platform_driver" | "hardware"
         ) {
             return Err(format!(
                 "contains unsupported placeholder `{{{placeholder}}}`"
@@ -314,6 +347,15 @@ impl PowerProfilesWidget {
         }
     }
 
+    /// Platform backend label for `{hardware}`: `"qc71"` when that sysfs is
+    /// in use, otherwise `"none"` so the placeholder always expands.
+    fn hardware_label(&self) -> &str {
+        self.state
+            .as_ref()
+            .and_then(PowerProfilesState::hardware)
+            .unwrap_or("none")
+    }
+
     /// Expand the profile/driver fields, leaving the `{icon}` marker for the
     /// layout helpers to fill with the resolved icon.
     fn expand_template(&self, format: &str, profile: &PowerProfile) -> String {
@@ -322,6 +364,7 @@ impl PowerProfilesWidget {
             .replace("{driver}", profile.driver())
             .replace("{cpu_driver}", profile.cpu_driver())
             .replace("{platform_driver}", profile.platform_driver())
+            .replace("{hardware}", self.hardware_label())
     }
 
     /// Expand every field for a plain-text tooltip, rendering `{icon}` as its
@@ -333,6 +376,7 @@ impl PowerProfilesWidget {
             .replace("{driver}", profile.driver())
             .replace("{cpu_driver}", profile.cpu_driver())
             .replace("{platform_driver}", profile.platform_driver())
+            .replace("{hardware}", self.hardware_label())
     }
 
     fn contains(&self, px: u32, py: u32) -> bool {
@@ -518,8 +562,35 @@ mod tests {
     #[test]
     fn validates_supported_placeholders() {
         assert!(validate_power_profiles_format("{icon} {profile} {driver}").is_ok());
-        assert!(validate_power_profiles_format("{cpu_driver} {platform_driver}").is_ok());
+        assert!(
+            validate_power_profiles_format("{cpu_driver} {platform_driver} {hardware}").is_ok()
+        );
         assert!(validate_power_profiles_format("{percent}").is_err());
         assert!(validate_power_profiles_format("{profile").is_err());
+    }
+
+    #[test]
+    fn hardware_placeholder_expands_from_state() {
+        let mut widget = PowerProfilesWidget::new(Bounds::new(0, 0, 64, 32))
+            .with_format(Some("{profile}/{hardware}".into()))
+            .with_tooltip_format(Some("hw={hardware}".into()));
+        widget.update(&state("balanced"));
+        assert_eq!(widget.template(), "balanced/none");
+        assert_eq!(widget.tooltip_text().as_deref(), Some("hw=none"));
+
+        widget.update(&Msg::PowerProfiles(Some(
+            PowerProfilesState::new(
+                "performance",
+                vec![PowerProfile::new(
+                    "performance",
+                    "amd_pstate",
+                    "amd_pstate",
+                    "amd_pstate",
+                )],
+            )
+            .with_hardware(Some("qc71".into())),
+        )));
+        assert_eq!(widget.template(), "performance/qc71");
+        assert_eq!(widget.tooltip_text().as_deref(), Some("hw=qc71"));
     }
 }

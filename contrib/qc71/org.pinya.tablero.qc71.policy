@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>tablero</vendor>
+  <vendor_url>https://github.com/piny4man/tablero</vendor_url>
+  <action id="org.pinya.tablero.set-qc71-mode">
+    <description>Set qc71_laptop hardware performance mode</description>
+    <description xml:lang="es">Establecer el modo de rendimiento de qc71_laptop</description>
+    <message>Authentication is required to change the laptop hardware power mode</message>
+    <message xml:lang="es">Se requiere autenticación para cambiar el modo de energía del portátil</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/tablero-qc71-set-mode</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">false</annotate>
+  </action>
+</policyconfig>

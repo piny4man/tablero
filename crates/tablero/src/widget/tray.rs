@@ -150,7 +150,7 @@ impl TrayIcon {
             return None;
         }
         let mut rgba = Vec::with_capacity(needed);
-        for px in argb[..needed].chunks_exact(4) {
+        for px in argb[..needed].as_chunks::<4>().0 {
             // Wire order is ARGB (big-endian 0xAARRGGBB) → [A, R, G, B].
             let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
             rgba.extend_from_slice(&premultiply(r, g, b, a));
@@ -173,7 +173,7 @@ impl TrayIcon {
             .into_rgba8();
         let (width, height) = image.dimensions();
         let mut rgba = Vec::with_capacity(image.as_raw().len());
-        for px in image.as_raw().chunks_exact(4) {
+        for px in image.as_raw().as_chunks::<4>().0 {
             rgba.extend_from_slice(&premultiply(px[0], px[1], px[2], px[3]));
         }
         Ok(TrayIcon {

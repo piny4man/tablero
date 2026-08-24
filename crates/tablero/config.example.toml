@@ -197,6 +197,12 @@ padding = 8
 format = "{icon}"
 tooltip = true
 tooltip-format = "POWER MODE: {profile}\nDRIVER: {driver}"
+# Auto-detect platform TDP/fan backends (qc71_laptop today). Framework,
+# ThinkPad, and desktop machines without that sysfs stay pure PPD clients.
+# Set false to force a PPD-only client on every machine.
+# hardware-control = true
+# Optional privileged helper for qc71 writes (default: tablero-qc71-set-mode on PATH).
+# hardware-helper = "/usr/local/bin/tablero-qc71-set-mode"
 # No `format-icons` map: the built-in vector icons carry their own accent per
 # profile — green for power-saver, blue for balanced, yellow for performance.
 # Set a `format-icons` table here to override them with your own text glyphs.

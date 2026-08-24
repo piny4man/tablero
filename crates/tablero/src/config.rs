@@ -400,6 +400,15 @@ pub struct WidgetStyleConfig {
     /// Tooltip format for widgets that expose structured hover details.
     #[serde(rename = "tooltip-format")]
     pub tooltip_format: Option<String>,
+    /// Auto-detect platform TDP/fan backends (`qc71_laptop` today) and layer
+    /// them on power-profiles-daemon. Defaults to `true`; set `false` to keep
+    /// a pure PPD client on every machine (Framework, desktop, …).
+    #[serde(rename = "hardware-control")]
+    pub hardware_control: Option<bool>,
+    /// Privileged helper that writes platform sysfs. Absent searches `PATH`
+    /// for `tablero-qc71-set-mode`, then `qc71-set-mode`.
+    #[serde(rename = "hardware-helper")]
+    pub hardware_helper: Option<String>,
 }
 
 /// The two Waybar-style shapes accepted by `format-icons`.
@@ -532,6 +541,12 @@ impl WidgetStyleConfig {
         }
         if self.tooltip_format.is_some() {
             base.tooltip_format = self.tooltip_format.clone();
+        }
+        if self.hardware_control.is_some() {
+            base.hardware_control = self.hardware_control;
+        }
+        if self.hardware_helper.is_some() {
+            base.hardware_helper = self.hardware_helper.clone();
         }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
@@ -1155,6 +1170,14 @@ fn validate_power_profiles_config(field: &str, config: &WidgetStyleConfig) -> Re
         {
             return Err(format!(
                 "{field}.format-icons must contain non-empty names and icons"
+            ));
+        }
+    }
+    if let Some(helper) = &config.hardware_helper {
+        let path = Path::new(helper);
+        if helper.trim().is_empty() || crate::command::path_has_parent_component(path) {
+            return Err(format!(
+                "{field}.hardware-helper must be a non-empty path without '..', got {helper:?}"
             ));
         }
     }
@@ -2779,7 +2802,9 @@ mod tests {
             [widget.power-profiles-daemon]
             format = "{icon} {profile}"
             tooltip = true
-            tooltip-format = "Power profile: {profile}\nDriver: {driver}"
+            tooltip-format = "Power profile: {profile}\nDriver: {driver}\nHardware: {hardware}"
+            hardware-control = true
+            hardware-helper = "/usr/local/bin/tablero-qc71-set-mode"
             [widget.power-profiles-daemon.format-icons]
             default = "sun"
             balanced = "balance"
@@ -2796,6 +2821,11 @@ mod tests {
         let widget = &config.widget.power_profiles_daemon;
         assert_eq!(widget.format.as_deref(), Some("{icon} {profile}"));
         assert_eq!(widget.tooltip, Some(true));
+        assert_eq!(widget.hardware_control, Some(true));
+        assert_eq!(
+            widget.hardware_helper.as_deref(),
+            Some("/usr/local/bin/tablero-qc71-set-mode")
+        );
         let icons = widget
             .format_icons
             .as_ref()
@@ -2817,6 +2847,8 @@ mod tests {
             "[widget.power-profiles-daemon]\nformat = \"{percent}\"",
             "[widget.power-profiles-daemon]\ntooltip-format = \"{unknown}\"",
             "[widget.power-profiles-daemon]\nformat-icons = []",
+            "[widget.power-profiles-daemon]\nhardware-helper = \"../evil\"",
+            "[widget.power-profiles-daemon]\nhardware-helper = \"\"",
         ] {
             let error = Config::from_toml_str(doc).unwrap_err().to_string();
             assert!(error.contains("power-profiles-daemon"), "message: {error}");
