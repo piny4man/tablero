@@ -1,25 +1,37 @@
 //! power-profiles-daemon source and profile-switching command executor.
+//!
+//! On machines that also expose a known platform TDP/fan driver (today:
+//! `qc71_laptop`), the same producer overlays that hardware state and the
+//! command executor applies both PPD and the privileged platform helper.
+//! Detection is silent: Framework laptops, desktops, and anything without
+//! that sysfs stay a pure D-Bus client.
+
+mod platform;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::stream::{StreamExt, select, select_all};
-use log::warn;
+use log::{info, warn};
 use zbus::Connection;
 use zbus::fdo::PropertiesProxy;
 use zbus::names::InterfaceName;
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::widget::{Command, Msg, PowerProfile, PowerProfilesState};
-
 use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
+use crate::widget::{Command, Msg, PowerProfile, PowerProfilesState};
+
+pub use platform::{PlatformKind, PowerProfilesSettings, detect_platform, overlay_snapshot};
+
+use platform::{apply_platform_profile, read_platform_profile, resolve_hardware_helper};
 
 const CURRENT_NAME: &str = "org.freedesktop.UPower.PowerProfiles";
 const CURRENT_PATH: &str = "/org/freedesktop/UPower/PowerProfiles";
 const LEGACY_NAME: &str = "net.hadess.PowerProfiles";
 const LEGACY_PATH: &str = "/net/hadess/PowerProfiles";
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const PLATFORM_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 enum Endpoint {
@@ -120,13 +132,32 @@ async fn find_endpoint(conn: &Connection) -> Option<(Endpoint, PowerProfilesStat
     None
 }
 
-/// Event-driven power-profiles-daemon producer.
-pub struct PowerProfilesProducer;
+fn compose(
+    ppd: Option<PowerProfilesState>,
+    platform: Option<PlatformKind>,
+    sys_root: &std::path::Path,
+) -> Option<PowerProfilesState> {
+    let hardware_profile = platform.and_then(|kind| read_platform_profile(sys_root, kind));
+    overlay_snapshot(ppd, platform.map(PlatformKind::name), hardware_profile)
+}
+
+/// Event-driven power-profiles-daemon producer, with optional platform overlay.
+pub struct PowerProfilesProducer {
+    settings: PowerProfilesSettings,
+}
 
 impl PowerProfilesProducer {
-    /// Create a power-profiles-daemon producer.
+    /// Create a producer that auto-detects platform backends under `/sys`.
     pub fn new() -> Self {
-        Self
+        Self {
+            settings: PowerProfilesSettings::default(),
+        }
+    }
+
+    /// Override detection settings (sysfs root, helper path, enable flag).
+    pub fn with_settings(mut self, settings: PowerProfilesSettings) -> Self {
+        self.settings = settings;
+        self
     }
 }
 
@@ -142,11 +173,11 @@ impl Producer for PowerProfilesProducer {
     }
 
     fn run(self: Box<Self>, tx: MsgSender) -> ProducerFuture {
-        Box::pin(run(tx))
+        Box::pin(run(tx, self.settings))
     }
 }
 
-async fn run(tx: MsgSender) -> ProducerResult {
+async fn run(tx: MsgSender, settings: PowerProfilesSettings) -> ProducerResult {
     let conn = Connection::system().await?;
     let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
     let owner_streams = [CURRENT_NAME, LEGACY_NAME].map(|name| async {
@@ -156,12 +187,24 @@ async fn run(tx: MsgSender) -> ProducerResult {
     });
     let mut owners = select_all(futures_util::future::try_join_all(owner_streams).await?);
 
+    let platform = settings.detect_platform();
+    if let Some(kind) = platform {
+        info!("power-profiles: {} hardware backend detected", kind.name());
+    }
+
+    let mut previous = None;
     loop {
         let Some((endpoint, _)) = find_endpoint(&conn).await else {
-            if tx.send(Msg::PowerProfiles(None)).is_err() {
+            let composed = compose(None, platform, settings.sys_root());
+            if send_if_changed(&tx, &mut previous, composed).is_err() {
                 return Ok(());
             }
-            tokio::time::sleep(RETRY_DELAY).await;
+            let delay = if platform.is_some() {
+                PLATFORM_POLL
+            } else {
+                RETRY_DELAY
+            };
+            tokio::time::sleep(delay).await;
             continue;
         };
         let proxy = match properties_proxy(&conn, endpoint).await {
@@ -200,47 +243,85 @@ async fn run(tx: MsgSender) -> ProducerResult {
                 continue;
             }
         };
-        if tx.send(Msg::PowerProfiles(Some(snapshot))).is_err() {
+        let composed = compose(Some(snapshot), platform, settings.sys_root());
+        if send_if_changed(&tx, &mut previous, composed).is_err() {
             return Ok(());
         }
         let owner_changes = (&mut owners).map(|_| ());
         let events = select(changes, owner_changes);
         futures_util::pin_mut!(events);
-        if events.next().await.is_none() {
+        if platform.is_some() {
+            if let Ok(None) = tokio::time::timeout(PLATFORM_POLL, events.next()).await {
+                return Ok(());
+            }
+        } else if events.next().await.is_none() {
             return Ok(());
         }
-        // Either state changed or one of the compatibility names changed owner.
-        // Re-seeding also refreshes the Profiles list if hardware capabilities changed.
+        // Either state changed, a compatibility name changed owner, or the
+        // platform poll ticked. Re-seeding also refreshes the Profiles list
+        // if hardware capabilities changed.
     }
 }
 
+fn send_if_changed(
+    tx: &MsgSender,
+    previous: &mut Option<Option<PowerProfilesState>>,
+    next: Option<PowerProfilesState>,
+) -> Result<(), ()> {
+    if previous.as_ref() == Some(&next) {
+        return Ok(());
+    }
+    *previous = Some(next.clone());
+    tx.send(Msg::PowerProfiles(next)).map_err(|_| ())
+}
+
 /// Execute profile rotations requested by the widget.
-pub async fn run_commands(mut commands: CommandReceiver) -> ProducerResult {
+pub async fn run_commands(
+    mut commands: CommandReceiver,
+    settings: PowerProfilesSettings,
+) -> ProducerResult {
     let conn = Connection::system().await?;
+    let platform = settings.detect_platform();
+    let helper =
+        platform.and_then(|kind| resolve_hardware_helper(settings.hardware_helper(), kind));
+    if let Some(kind) = platform
+        && helper.is_none()
+    {
+        warn!(
+            "power-profiles: {} detected but no helper on PATH; clicks update power-profiles-daemon only",
+            kind.name()
+        );
+    }
+
     while let Some(command) = commands.recv().await {
         let Command::SetPowerProfile(profile) = command else {
             continue;
         };
-        let endpoint = match find_endpoint(&conn).await {
-            Some((endpoint, _)) => endpoint,
-            None => {
+        match find_endpoint(&conn).await {
+            Some((endpoint, _)) => match properties_proxy(&conn, endpoint).await {
+                Ok(proxy) => {
+                    let interface = InterfaceName::try_from(endpoint.interface())?;
+                    if let Err(error) = proxy
+                        .set(interface, "ActiveProfile", Value::new(profile.as_str()))
+                        .await
+                    {
+                        warn!("power-profiles-daemon: setting {profile:?} failed: {error}");
+                    }
+                }
+                Err(error) => {
+                    warn!("power-profiles-daemon: setting {profile:?} failed: {error}");
+                }
+            },
+            None if platform.is_none() => {
                 warn!("power-profiles-daemon: cannot set {profile:?}; daemon unavailable");
                 continue;
             }
-        };
-        let proxy = match properties_proxy(&conn, endpoint).await {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                warn!("power-profiles-daemon: setting {profile:?} failed: {error}");
-                continue;
-            }
-        };
-        let interface = InterfaceName::try_from(endpoint.interface())?;
-        if let Err(error) = proxy
-            .set(interface, "ActiveProfile", Value::new(profile.as_str()))
-            .await
+            None => {}
+        }
+        if let (Some(kind), Some(helper)) = (platform, helper.as_ref())
+            && let Err(error) = apply_platform_profile(&profile, kind, helper).await
         {
-            warn!("power-profiles-daemon: setting {profile:?} failed: {error}");
+            warn!("power-profiles: {error}");
         }
     }
     Ok(())

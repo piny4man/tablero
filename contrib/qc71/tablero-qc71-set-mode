@@ -1,0 +1,60 @@
+#!/bin/sh
+# Privileged helper that applies a power-profiles-daemon profile to qc71_laptop
+# sysfs. Mapping must stay in sync with
+# crates/tablero/src/power_profiles/platform.rs (qc71_mode_for).
+#
+# tablero never writes these files itself; install this script plus the Polkit
+# policy in this directory so an active local session can call it without a
+# password prompt.
+set -eu
+
+SYS=/sys/devices/platform/qc71_laptop
+PERF="$SYS/performance_mode"
+SILENT="$SYS/silent_mode"
+TURBO="$SYS/turbo_mode"
+
+usage() {
+  echo "usage: tablero-qc71-set-mode <power-saver|balanced|performance>" >&2
+  exit 2
+}
+
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && usage
+[ "$#" -eq 1 ] || usage
+
+case "$1" in
+  power-saver)
+    PERF_V=1
+    SILENT_V=1
+    TURBO_V=0
+    ;;
+  balanced)
+    PERF_V=2
+    SILENT_V=0
+    TURBO_V=0
+    ;;
+  performance)
+    PERF_V=3
+    SILENT_V=0
+    TURBO_V=1
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+if [ ! -e "$PERF" ]; then
+  echo "tablero-qc71-set-mode: $PERF not found (qc71_laptop is not loaded)" >&2
+  exit 1
+fi
+
+writable() {
+  [ -w "$PERF" ] && [ -w "$SILENT" ] && [ -w "$TURBO" ]
+}
+
+if [ "$(id -u)" -ne 0 ] && ! writable; then
+  exec pkexec --disable-internal-agent "$0" "$@"
+fi
+
+printf '%s\n' "$PERF_V" >"$PERF"
+printf '%s\n' "$SILENT_V" >"$SILENT"
+printf '%s\n' "$TURBO_V" >"$TURBO"
