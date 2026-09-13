@@ -1,0 +1,10 @@
+version = 1
+[colors]
+background = "#10253F"
+foreground = "#E6F3FF"
+accent = "#80D4FF"
+muted = "#7F9AB5"
+selection_background = "#264C70"
+selection_foreground = "#FFFFFF"
+[font]
+family = "DejaVu Sans Mono"

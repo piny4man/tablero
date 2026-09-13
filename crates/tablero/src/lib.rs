@@ -17,6 +17,7 @@
 pub mod blit;
 pub mod clock;
 pub mod config;
+mod config_reload;
 pub mod icon;
 pub mod render;
 pub mod scale;
@@ -39,8 +40,8 @@ pub mod upower;
 pub mod volume;
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::blit::write_argb8888;
 use crate::clock::millis_until_next_minute;
@@ -255,10 +256,7 @@ impl Surface {
             .set_settings(self.config.scaled_render_settings(self.scale));
         // Rebuild clears widget state; replay the last producer snapshots and
         // a fresh clock tick so the bar does not go empty until the next event.
-        for msg in seed {
-            let _ = self.dashboard.update(msg);
-        }
-        let _ = self.dashboard.update(&Msg::tick_now());
+        replay_snapshot(&mut self.dashboard, seed);
         if self.configured {
             self.draw(pool);
         }
@@ -834,14 +832,8 @@ struct App {
     tray_menu: Option<TrayMenuSurface>,
     /// Process-wide font set shared by every surface and popup.
     fonts: SharedFonts,
-    /// Optional path watched for config hot-reload.
-    config_path: Option<PathBuf>,
-    /// Last successfully applied mtime of `config_path` (or `None` if missing).
-    config_mtime: Option<SystemTime>,
-    /// mtime we are debouncing before applying (editor mid-save).
-    config_pending_mtime: Option<SystemTime>,
-    /// When `config_pending_mtime` was first observed.
-    config_pending_at: Option<Instant>,
+    /// Watches app config and active/candidate theme dependencies.
+    config_watcher: Option<config_reload::ConfigWatcher>,
     /// Latest producer messages, replayed after a dashboard rebuild on reload.
     producer_snapshot: ProducerSnapshot,
     exit: bool,
@@ -855,6 +847,13 @@ struct App {
 #[derive(Default)]
 struct ProducerSnapshot {
     messages: Vec<Msg>,
+}
+
+fn replay_snapshot(dashboard: &mut Dashboard, seed: &[Msg]) {
+    for msg in seed {
+        let _ = dashboard.update(msg);
+    }
+    let _ = dashboard.update(&Msg::tick_now());
 }
 
 impl ProducerSnapshot {
@@ -970,47 +969,20 @@ impl App {
         info!("config reloaded");
     }
 
-    /// Poll the config file mtime and reload when it changes.
+    /// Poll app/theme dependencies and apply only fully validated candidates.
     ///
     /// Debounces ~400ms so editors that truncate-then-write do not apply an
     /// empty mid-save document (which would parse as defaults and wipe the bar).
     fn poll_config_reload(&mut self) {
-        let Some(path) = self.config_path.clone() else {
-            return;
-        };
-        let mtime = file_mtime(&path);
-        if mtime == self.config_mtime {
-            self.config_pending_mtime = None;
-            self.config_pending_at = None;
-            return;
-        }
-
-        // New or updated mtime: (re)start the settle timer.
-        if self.config_pending_mtime != mtime {
-            self.config_pending_mtime = mtime;
-            self.config_pending_at = Some(Instant::now());
-            return;
-        }
-        let Some(started) = self.config_pending_at else {
-            return;
-        };
-        if started.elapsed() < Duration::from_millis(400) {
-            return;
-        }
-
-        match Config::load_for_reload(&path) {
-            Ok(config) => {
-                self.config_mtime = mtime;
-                self.config_pending_mtime = None;
-                self.config_pending_at = None;
-                self.reload_config(config);
-            }
-            Err(error) => {
-                warn!("config reload ignored: {error}");
-                // Stop retrying this mtime until the user saves again.
-                self.config_mtime = mtime;
-                self.config_pending_mtime = None;
-                self.config_pending_at = None;
+        if let Some(candidate) = self
+            .config_watcher
+            .as_mut()
+            .and_then(|watcher| watcher.poll(Instant::now()))
+        {
+            match candidate {
+                Ok(config) if &config != self.outputs.base() => self.reload_config(config),
+                Ok(_) => {}
+                Err(error) => warn!("config reload ignored: {error}"),
             }
         }
     }
@@ -1274,11 +1246,6 @@ impl App {
     }
 }
 
-/// mtime of `path`, or `None` if the file is missing or unstatable.
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
 /// The stable per-output key: the `wl_output`'s protocol object id.
 ///
 /// Available in both `new_output` and `output_destroyed` (unlike the output's
@@ -1313,7 +1280,7 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// only when their module is configured. The volume source uses a dedicated OS
 /// thread (PipeWire's main loop is synchronous). The clock is driven by the
 /// synchronous tick timer. When `config_path` is set, the file is polled for
-/// mtime changes and the bar hot-reloads theme/layout (producers keep their
+/// app/theme file changes and the bar hot-reloads theme/layout (producers keep their
 /// original set until restart). See [`run_with_producers`] for a custom set.
 pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let mut producers: Vec<Box<dyn Producer>> = vec![Box::new(HyprlandProducer::new())];
@@ -1386,7 +1353,7 @@ fn power_profiles_settings(config: &Config) -> PowerProfilesSettings {
 /// their layer surfaces before producers start. Later outputs still arrive
 /// through [`OutputHandler::new_output`], and `output_destroyed` tears each down,
 /// so plugging or unplugging a monitor adds or removes its bar without restarting
-/// the loop. `config_path` enables mtime-based hot-reload of the TOML config.
+/// the loop. `config_path` enables hot-reload of the TOML config and selected theme.
 pub fn run_with_producers(
     config: Config,
     producers: Vec<Box<dyn Producer>>,
@@ -1394,7 +1361,7 @@ pub fn run_with_producers(
 ) -> Result<(), Box<dyn Error>> {
     let power_settings = power_profiles_settings(&config);
     let height = config.height;
-    let config_mtime = config_path.as_ref().and_then(|p| file_mtime(p));
+    let config_watcher = config_path.map(|path| config_reload::ConfigWatcher::new(path, &config));
     let fonts = shared_fonts();
 
     let conn = Connection::connect_to_env()?;
@@ -1430,10 +1397,7 @@ pub fn run_with_producers(
         pending_tray_menu: None,
         tray_menu: None,
         fonts,
-        config_path,
-        config_mtime,
-        config_pending_mtime: None,
-        config_pending_at: None,
+        config_watcher,
         producer_snapshot: ProducerSnapshot::default(),
         exit: false,
     };
@@ -1458,9 +1422,9 @@ pub fn run_with_producers(
         TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_minute()))
     })?;
 
-    // Poll the config file mtime about twice a second so theme/layout edits
+    // Poll app/theme metadata about twice a second so theme/layout edits
     // apply without restarting. Cheap when the path is unset (no-op).
-    if app.config_path.is_some() {
+    if app.config_watcher.is_some() {
         let reload = Timer::from_duration(Duration::from_millis(500));
         handle.insert_source(reload, |_deadline, _, app| {
             app.poll_config_reload();
@@ -1989,6 +1953,112 @@ fn scroll_directions(
 mod scroll_tests {
     use super::*;
     use smithay_client_toolkit::seat::pointer::AxisScroll;
+
+    #[test]
+    fn theme_reload_replays_latest_producers_into_rebuilt_dashboards() {
+        use crate::widget::{ActiveWindow, DeviceKind, Volume, Workspaces};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let theme = dir.path().join("theme.toml");
+        std::fs::write(&path, "[appearance]\ntheme_file = 'theme.toml'\n[bar]\nmodules-left = ['workspaces']\nmodules-center = ['title']\nmodules-right = ['volume']").unwrap();
+        let text = include_str!("../tests/fixtures/swatches.toml");
+        std::fs::write(&theme, text).unwrap();
+        let mut snapshot = ProducerSnapshot::default();
+        snapshot.note(&Msg::Workspaces(Workspaces::new([1], 1)));
+        snapshot.note(&Msg::Workspaces(Workspaces::with_monitors(
+            [(3, "DP-1"), (7, "HDMI-A-1")],
+            [("DP-1", 3), ("HDMI-A-1", 7)],
+            3,
+        )));
+        for monitor in ["DP-1", "HDMI-A-1"] {
+            snapshot.note(&Msg::ActiveWindow {
+                monitor: monitor.into(),
+                window: Some(ActiveWindow::new("app", "superseded title")),
+            });
+            snapshot.note(&Msg::ActiveWindow {
+                monitor: monitor.into(),
+                window: Some(ActiveWindow::new("app", monitor)),
+            });
+        }
+        snapshot.note(&Msg::Volume(Some(Volume::new(
+            0.12,
+            true,
+            DeviceKind::Speakers,
+        ))));
+        let volume = Msg::Volume(Some(Volume::new(0.73, false, DeviceKind::Headphones)));
+        snapshot.note(&volume);
+        snapshot.note(&Msg::tick_now());
+        snapshot.note(&Msg::TrayMenuUnavailable("stale".into()));
+        assert_eq!(snapshot.as_slice().len(), 4);
+        for accent in ["#80D4FF", "#010203"] {
+            std::fs::write(&theme, text.replace("#80D4FF", accent)).unwrap();
+            let config = Config::load_for_reload(&path).unwrap();
+            for monitor in ["DP-1", "HDMI-A-1"] {
+                let bounds = Bounds::new(0, 0, 800, 32);
+                let mut dashboard = config.build_dashboard(bounds, Some(monitor));
+                replay_snapshot(&mut dashboard, snapshot.as_slice());
+                let title = Msg::ActiveWindow {
+                    monitor: monitor.into(),
+                    window: Some(ActiveWindow::new("app", monitor)),
+                };
+                // A fresh dashboard must consume these readings, whereas the
+                // replayed one already has the latest title and volume. This
+                // guards against accidentally testing an absent widget.
+                let mut fresh = config.build_dashboard(bounds, Some(monitor));
+                assert!(fresh.update(&title));
+                assert!(fresh.update(&volume));
+                assert!(
+                    !dashboard.update(&title),
+                    "latest title restored for {monitor}"
+                );
+                assert!(
+                    !dashboard.update(&volume),
+                    "latest volume restored for {monitor}"
+                );
+
+                let mut ctx = RenderContext::with_settings(800, 32, config.render_settings());
+                dashboard.layout(&mut ctx, 800, 32);
+                dashboard.draw(&mut ctx);
+                let restored_pixels = ctx.pixels().to_vec();
+                assert_eq!(
+                    dashboard.on_click(10, 16, ClickButton::Left),
+                    Some(Command::SwitchWorkspace(if monitor == "DP-1" {
+                        3
+                    } else {
+                        7
+                    }))
+                );
+
+                // Each restored value must be visible, not merely retained in
+                // the snapshot map. Clearing it changes pixels; restoring it
+                // recreates the exact pre-clear frame without another producer.
+                for (clear, restore) in [
+                    (
+                        Msg::ActiveWindow {
+                            monitor: monitor.into(),
+                            window: None,
+                        },
+                        title,
+                    ),
+                    (Msg::Volume(None), volume.clone()),
+                ] {
+                    assert!(dashboard.update(&clear));
+                    dashboard.layout(&mut ctx, 800, 32);
+                    dashboard.draw(&mut ctx);
+                    assert_ne!(ctx.pixels(), restored_pixels.as_slice());
+                    assert!(dashboard.update(&restore));
+                    dashboard.layout(&mut ctx, 800, 32);
+                    dashboard.draw(&mut ctx);
+                    assert_eq!(ctx.pixels(), restored_pixels.as_slice());
+                }
+            }
+            assert_eq!(snapshot.as_slice().len(), 4);
+            assert_eq!(
+                popup_background(config.render_settings().background),
+                (16, 37, 63, 255)
+            );
+        }
+    }
 
     #[test]
     fn wheel_steps_map_up_to_increase_and_down_to_decrease() {

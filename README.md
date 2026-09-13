@@ -177,9 +177,10 @@ RUST_LOG=info cargo run -p tablero
   second), producer messages, pointer input, compositor configure events, or
   shutdown — there is no busy redraw loop and no frame-callback feedback cycle.
 - **Hot-reloads** `$XDG_CONFIG_HOME/tablero/config.toml` while running: theme,
-  layout, and widget options apply within about half a second of a save (mid-save
-  empty files are ignored). Live widget readings are kept across the reload.
-  Adding a module that was not in the layout at startup (e.g. first-time
+  layout, widget options, and an optional selected Swatches theme apply within
+  about half a second of a save (mid-save empty files and invalid candidates are
+  ignored; the last valid bar is kept). Live widget readings are kept across the
+  reload. Adding a module that was not in the layout at startup (e.g. first-time
   `"tray"`) still needs a process restart so its producer can start — see
   [Configuration](#configuration).
 
@@ -189,10 +190,11 @@ tablero reads an optional TOML file from
 `$XDG_CONFIG_HOME/tablero/config.toml` (falling back to
 `$HOME/.config/tablero/config.toml`). **The file is optional**: when it is
 absent the bar runs on the documented defaults below. While the bar is running
-it **hot-reloads** that path (mtime poll ~2×/s, ~400ms settle so mid-save
-empty files are ignored): theme, layout, and widget options update without
-restart, and the last producer readings are re-applied so the bar does not go
-blank. Producers already started for the original widget set keep running;
+it **hot-reloads** that path and any selected Swatches theme (metadata poll
+~2×/s, ~400ms settle so mid-save empty files are ignored): theme, layout, and
+widget options update without restart, invalid or missing candidates keep the
+last valid bar, and the last producer readings are re-applied so the bar does
+not go blank. Producers already started for the original widget set keep running;
 adding a brand-new module (e.g. first-time `"tray"`) still needs a restart so
 its producer can start. The document may be
 partial — any field you omit falls back to its default, so you only specify what
@@ -219,6 +221,11 @@ curl --fail --location \
 Every value below is the built-in default.
 
 ```toml
+# Optional shared Swatches theme. Omitted (the default) keeps tablero's built-in
+# colors and font family. See [Shared Swatches theme](#shared-swatches-theme).
+# [appearance]
+# theme_file = "~/themes/swatches.toml"
+
 # Bar height in logical pixels (scaled to the output's pixel density on HiDPI
 # displays). The width always spans the output.
 height = 32
@@ -252,6 +259,7 @@ size = 16.0
 
 | Key            | Type            | Default                                       | Notes                                                            |
 | -------------- | --------------- | --------------------------------------------- | ---------------------------------------------------------------- |
+| `appearance.theme_file` | string (opt.) | unset                                  | Path to a Swatches v1 theme. Relative to this config file; `~/` expands to `$HOME`. |
 | `height`       | integer (px)    | `32`                                          | Bar height; also drives the exclusive zone.                      |
 | `bar.background` | hex color (opt.) | unset                                       | Bar fill; inherits `theme.background` when unset.                |
 | `bar.margin`   | integer (px)    | `0`                                           | Inset around the full module row.                                |
@@ -264,6 +272,54 @@ size = 16.0
 | `theme.accent`     | hex color   | `"#eaeaea"`                                   | Emphasis color (e.g. the active workspace).                      |
 | `font.family`  | string (opt.)   | unset → system font                           | Font family name.                                                |
 | `font.size`    | float (px)      | `16.0`                                         | Text size.                                                       |
+
+### Shared Swatches theme
+
+[`swatches` 0.1.0](https://crates.io/crates/swatches/0.1.0) is an opt-in
+shared appearance crate. Set `[appearance] theme_file` to a Swatches v1 TOML
+file to fill **absent** `theme.background`, `theme.foreground`, `theme.accent`,
+and `font.family` before Tablero's built-in defaults. No theme selected means
+today's standalone look.
+
+```toml
+[appearance]
+theme_file = "~/themes/swatches.toml"
+```
+
+Absolute paths and `~/` are supported. Other relative paths resolve against the
+config file's directory, never the launch directory. There is no environment
+variable or `~user` expansion. Symlink paths are preserved so the watcher can
+follow retargeting.
+
+| Swatches v1 value | Tablero fallback |
+| --- | --- |
+| `colors.background` | `theme.background` |
+| `colors.foreground` | `theme.foreground` |
+| `colors.accent` | `theme.accent` |
+| `font.family` | `font.family` |
+
+Precedence is defaults → shared theme → explicit app theme/font → existing
+bar/widget/state/monitor specificity. An explicit value equal to the old default
+is still explicit. Shared RGB becomes opaque Tablero RGB; explicit RGBA overrides
+keep their alpha. Font size and geometry stay app-owned. Swatches `muted`,
+`selection_background`, and `selection_foreground` are validated as part of the
+v1 document but have no Tablero targets in this adapter.
+
+A missing or invalid selected theme is a **startup error**. During reload, a bad
+or missing theme (or a bad app save) is logged once per edit and the current bar,
+tooltips, and tray menus stay up. Selecting a new missing theme keeps watching
+that path so creating the file recovers without a second config edit. Removing
+`[appearance]` restores standalone resolution on the next valid save. An empty
+file during reload is rejected; use a nonempty document such as `height = 32`
+to return to defaults deliberately.
+
+Tooltip and locally rendered tray menus use each output's resolved render
+settings, including the shared font and theme colors. An accepted reload closes
+existing popups; reopen them to see the new measurements. External tray-owned
+windows and supplied tray icon artwork are not recolored.
+
+Local unpublished Swatches checkouts are documented separately in
+[`docs/local-swatches.md`](docs/local-swatches.md).
 
 Per-widget tables support equipment-like fills and outlines without changing
 the global theme:

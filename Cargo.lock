@@ -1349,6 +1349,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "swatches"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f73236df9798755583fe18b1e482fcd81ead5a92f0f02157968c44741979aa9a"
+dependencies = [
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1383,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "tablero"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -1399,6 +1409,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smithay-client-toolkit",
+ "swatches",
  "tempfile",
  "tiny-skia",
  "tokio",
