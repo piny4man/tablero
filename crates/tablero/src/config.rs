@@ -4,9 +4,13 @@
 //! The whole tree deserializes from a single TOML document via [`Config::from_toml_str`]
 //! (or [`Config::load_from_path`] to read a file), and every field has a
 //! documented default — an empty or partial document yields a fully-formed
-//! [`Config`], so users only specify what they want to override. Anything the
-//! schema does not recognize (an unknown key, an unknown widget name, a
-//! malformed color) is a hard [`ConfigError`] rather than a silent fallback.
+//! [`Config`], so users only specify what they want to override. An optional
+//! `[appearance] theme_file` is filled from a Swatches v1 theme **before** those
+//! defaults, so explicit app, bar, widget, state, and monitor values keep
+//! precedence. Theme selection needs [`Config::load_from_path`] (or reload) so
+//! relative paths have an explicit config-directory base. Anything the schema
+//! does not recognize (an unknown key, an unknown widget name, a malformed
+//! color) is a hard [`ConfigError`] rather than a silent fallback.
 //!
 //! Every field has a documented default, so an absent config file renders the
 //! full default bar. Placement (which zone a widget sits in) lives in `[bar]`;
@@ -15,6 +19,9 @@
 //! `#rrggbbaa` hex (the eight-digit form adds an alpha channel for translucency):
 //!
 //! ```toml
+//! # [appearance]
+//! # theme_file = "~/themes/swatches.toml"
+//!
 //! height = 32
 //!
 //! [bar]
@@ -801,6 +808,8 @@ pub struct MonitorConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Optional Swatches theme, resolved before default filling.
+    pub appearance: AppearanceConfig,
     /// Bar height in pixels.
     pub height: u32,
     /// Color theme.
@@ -819,6 +828,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            appearance: AppearanceConfig::default(),
             height: DEFAULT_HEIGHT,
             theme: Theme::default(),
             font: Font::default(),
@@ -827,6 +837,28 @@ impl Default for Config {
             monitors: Vec::new(),
         }
     }
+}
+
+/// Opt-in shared appearance from a Swatches v1 theme file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppearanceConfig {
+    /// Path to a Swatches theme. Relative paths resolve against the config file
+    /// directory; `~/` expands to `$HOME`. Unset keeps Tablero's built-in look.
+    pub theme_file: Option<String>,
+}
+
+pub(crate) fn resolve_theme_file(value: &str, config_path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(config_path).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    swatches::resolve_theme_path(
+        value,
+        absolute
+            .parent()
+            .expect("absolute config path has a parent"),
+        home.as_deref(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Resolve the user config path from the environment.
@@ -859,14 +891,10 @@ impl Config {
     ///
     /// Missing fields fall back to their documented defaults; unknown keys,
     /// unknown widget names, and malformed colors are reported as errors.
+    /// A selected Swatches theme requires [`Self::load_from_path`] so relative
+    /// paths have an explicit config-directory base.
     pub fn from_toml_str(toml: &str) -> Result<Config, ConfigError> {
-        let config: Config =
-            toml::from_str(toml).map_err(|source| ConfigError::Parse { path: None, source })?;
-        config.validate().map_err(|message| ConfigError::Invalid {
-            path: None,
-            message,
-        })?;
-        Ok(config)
+        Self::parse_text(None, toml)
     }
 
     /// Load a configuration from a TOML file.
@@ -909,12 +937,55 @@ impl Config {
     }
 
     fn parse_file_text(path: &Path, text: &str) -> Result<Config, ConfigError> {
-        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
-            path: Some(path.to_path_buf()),
+        Self::parse_text(Some(path), text)
+    }
+
+    fn parse_text(path: Option<&Path>, text: &str) -> Result<Config, ConfigError> {
+        let parse_error = |source| ConfigError::Parse {
+            path: path.map(Path::to_path_buf),
             source,
-        })?;
+        };
+        let invalid = |message| ConfigError::Invalid {
+            path: path.map(Path::to_path_buf),
+            message,
+        };
+        let mut raw: toml::Table = toml::from_str(text).map_err(parse_error)?;
+        let appearance: AppearanceConfig = raw
+            .get("appearance")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(parse_error)?
+            .unwrap_or_default();
+        if let Some(value) = &appearance.theme_file {
+            let path = path.ok_or_else(|| {
+                invalid(
+                    "appearance.theme_file requires a config file path; use load_from_path".into(),
+                )
+            })?;
+            let theme_path = resolve_theme_file(value, path).map_err(&invalid)?;
+            let theme =
+                swatches::Theme::load(theme_path).map_err(|error| invalid(error.to_string()))?;
+            // Insert only absent keys in the raw document. Explicit values,
+            // including old defaults and RGBA overrides, remain authoritative.
+            for (table, key, value) in [
+                ("theme", "background", theme.colors().background.to_string()),
+                ("theme", "foreground", theme.colors().foreground.to_string()),
+                ("theme", "accent", theme.colors().accent.to_string()),
+                ("font", "family", theme.font().family.as_str().to_owned()),
+            ] {
+                let entry = raw
+                    .entry(table)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                let table = entry
+                    .as_table_mut()
+                    .ok_or_else(|| invalid(format!("{table} must be a table")))?;
+                table.entry(key).or_insert(toml::Value::String(value));
+            }
+        }
+        let config: Config = toml::Value::Table(raw).try_into().map_err(parse_error)?;
         config.validate().map_err(|message| ConfigError::Invalid {
-            path: Some(path.to_path_buf()),
+            path: path.map(Path::to_path_buf),
             message,
         })?;
         Ok(config)

@@ -8,6 +8,13 @@
 # Colors accept "#rrggbb" or "#rrggbbaa". This preset follows the shared ARC
 # Raiders palette: purple-black surfaces, warm cream text, cyan focus, rainbow
 # semantic accents, and translucent state fills.
+#
+# Optional shared Swatches theme. Uncomment and point at a v1 theme to fill
+# absent theme.background/foreground/accent and font.family before defaults.
+# Explicit values below still win, including old defaults and RGBA. Relative
+# paths resolve against this file's directory; ~/ expands to $HOME.
+# [appearance]
+# theme_file = "~/themes/swatches.toml"
 
 height = 38
 

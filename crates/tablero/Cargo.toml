@@ -14,6 +14,7 @@ publish = ["crates-io"]
 include = ["src/**", "tests/**", "examples/**", "config.example.toml", "LICENSE"]
 
 [dependencies]
+swatches = "0.1.0"
 # default-features = false drops the regex filter engine, the `jiff` datetime
 # stack, and anstream/anstyle coloring — none of which a plain `env_logger::init()`
 # needs. RUST_LOG level/module filtering still works.
