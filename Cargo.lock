@@ -1406,6 +1406,7 @@ dependencies = [
  "mio",
  "nix",
  "pipewire",
+ "rustix",
  "serde",
  "serde_json",
  "smithay-client-toolkit",

@@ -41,8 +41,10 @@ pub mod updates;
 pub mod upower;
 pub mod volume;
 
+use std::cell::Cell;
 use std::error::Error;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::blit::write_argb8888;
@@ -57,9 +59,10 @@ use crate::widget::{
     ClickButton, Command, Damage, Dashboard, Hover, Msg, ScrollDirection, Tooltip, TrayMenu,
     TrayMenuItem, TrayMenuToggleKind, TrayMenuToggleState,
 };
-use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
+use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 use log::{debug, error, info, warn};
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
@@ -1605,7 +1608,13 @@ pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn E
         producers.push(Box::new(BacklightProducer::new()));
     }
     if config.uses_widget(WidgetKind::System) {
-        producers.push(Box::new(SystemProducer::new()));
+        producers.push(Box::new(
+            config
+                .widget
+                .system
+                .interval()
+                .map_or_else(SystemProducer::new, SystemProducer::with_interval),
+        ));
     }
     if config.uses_widget(WidgetKind::Network) {
         producers.push(Box::new(NetworkProducer::new()));
@@ -1628,12 +1637,46 @@ pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn E
         ));
     }
     if config.uses_widget(WidgetKind::Updates) {
-        producers.push(Box::new(UpdatesProducer::new()));
+        producers.push(Box::new(
+            config
+                .widget
+                .updates
+                .interval()
+                .map_or_else(UpdatesProducer::new, UpdatesProducer::with_interval),
+        ));
     }
     if config.uses_widget(WidgetKind::Hypridle) {
-        producers.push(Box::new(HypridleProducer::new()));
+        producers.push(Box::new(
+            config
+                .widget
+                .hypridle
+                .interval()
+                .map_or_else(HypridleProducer::new, HypridleProducer::with_interval),
+        ));
     }
     run_with_producers(config, producers, config_path)
+}
+
+/// Run the config poll timer until the watcher no longer needs one. `polling`
+/// keeps a burst of directory events from stacking up timers.
+fn start_config_polling(handle: &LoopHandle<'static, App>, polling: &Rc<Cell<bool>>) {
+    if polling.replace(true) {
+        return;
+    }
+    let polling = polling.clone();
+    let inserted = handle.insert_source(Timer::immediate(), move |_deadline, _, app| {
+        app.poll_config_reload();
+        match app.config_watcher.as_ref().and_then(|w| w.next_poll()) {
+            Some(delay) => TimeoutAction::ToDuration(delay),
+            None => {
+                polling.set(false);
+                TimeoutAction::Drop
+            }
+        }
+    });
+    if let Err(error) = inserted {
+        error!("config reload timer could not start: {error}");
+    }
 }
 
 fn power_profiles_settings(config: &Config) -> PowerProfilesSettings {
@@ -1739,14 +1782,22 @@ pub fn run_with_producers(
         TimeoutAction::ToDuration(Duration::from_millis(millis_until_next_minute()))
     })?;
 
-    // Poll app/theme metadata about twice a second so theme/layout edits
-    // apply without restarting. Cheap when the path is unset (no-op).
-    if app.config_watcher.is_some() {
-        let reload = Timer::from_duration(Duration::from_millis(500));
-        handle.insert_source(reload, |_deadline, _, app| {
-            app.poll_config_reload();
-            TimeoutAction::ToDuration(Duration::from_millis(500))
-        })?;
+    // Theme/layout edits apply without restarting. Directory events say when to
+    // look, so an idle bar has no reload timer at all: the poll timer runs only
+    // while an edit settles (and for the first validation of the on-disk state),
+    // or permanently if the files cannot be watched.
+    if let Some(watcher) = &app.config_watcher {
+        let polling = Rc::new(Cell::new(false));
+        if let Some(fd) = watcher.event_fd() {
+            let (timer_handle, polling) = (handle.clone(), polling.clone());
+            let events = Generic::new(fd, Interest::READ, Mode::Level);
+            handle.insert_source(events, move |_, fd, _app| {
+                config_reload::drain_events(&**fd);
+                start_config_polling(&timer_handle, &polling);
+                Ok(PostAction::Continue)
+            })?;
+        }
+        start_config_polling(&handle, &polling);
     }
 
     // Bring up the async producer bridge only when there is async work to do.

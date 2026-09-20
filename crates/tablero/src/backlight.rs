@@ -3,13 +3,14 @@
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::widget::{Backlight, Command, Msg, ScrollDirection};
 use log::warn;
 use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -19,7 +20,12 @@ use crate::command::CommandReceiver;
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
 const SYSFS_BACKLIGHT: &str = "/sys/class/backlight";
+/// Re-read cadence when no udev monitor is available to report changes.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Re-read cadence while udev reports changes: only a net under a lost event.
+const RESYNC_INTERVAL: Duration = Duration::from_secs(60);
+const UDEV_TOKEN: Token = Token(0);
+const SHUTDOWN_TOKEN: Token = Token(1);
 
 #[proxy(interface = "org.freedesktop.login1.Session")]
 trait LoginSession {
@@ -85,8 +91,12 @@ async fn run_producer(root: PathBuf, interval: Duration, tx: MsgSender) -> Produ
                 return Ok(());
             }
         }
-        if let Some(receiver) = &mut events {
-            if matches!(time::timeout(interval, receiver.recv()).await, Ok(None)) {
+        if let Some(monitor) = &mut events {
+            let resync = interval.max(RESYNC_INTERVAL);
+            if matches!(
+                time::timeout(resync, monitor.changes.recv()).await,
+                Ok(None)
+            ) {
                 events = None;
             }
         } else {
@@ -95,29 +105,48 @@ async fn run_producer(root: PathBuf, interval: Duration, tx: MsgSender) -> Produ
     }
 }
 
-fn spawn_udev_monitor() -> io::Result<mpsc::UnboundedReceiver<()>> {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// Change notifications from the udev monitor thread, which is told to stop
+/// when this is dropped instead of waking periodically to find out.
+struct UdevMonitor {
+    changes: mpsc::UnboundedReceiver<()>,
+    shutdown: Arc<Waker>,
+}
+
+impl Drop for UdevMonitor {
+    fn drop(&mut self) {
+        // Nothing to do on failure: the thread then ends with its next event.
+        let _ = self.shutdown.wake();
+    }
+}
+
+fn spawn_udev_monitor() -> io::Result<UdevMonitor> {
+    let (tx, changes) = mpsc::unbounded_channel();
+    let mut poll = Poll::new()?;
+    let shutdown = Arc::new(Waker::new(poll.registry(), SHUTDOWN_TOKEN)?);
     thread::Builder::new()
         .name("tablero-backlight".to_string())
         .spawn(move || {
-            let result = || -> io::Result<()> {
+            let mut result = || -> io::Result<()> {
+                // Not `Send`, so the socket lives and dies on this thread.
                 let socket = udev::MonitorBuilder::new()?
                     .match_subsystem("backlight")?
                     .listen()?;
-                let mut poll = Poll::new()?;
                 let mut events = Events::with_capacity(8);
                 let fd = socket.as_raw_fd();
                 poll.registry()
-                    .register(&mut SourceFd(&fd), Token(0), Interest::READABLE)?;
+                    .register(&mut SourceFd(&fd), UDEV_TOKEN, Interest::READABLE)?;
                 loop {
-                    poll.poll(&mut events, Some(Duration::from_secs(2)))?;
-                    if events.is_empty() {
-                        if tx.is_closed() {
-                            return Ok(());
+                    if let Err(error) = poll.poll(&mut events, None) {
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
                         }
-                        continue;
+                        return Err(error);
                     }
-                    if socket.iter().next().is_some() && tx.send(()).is_err() {
+                    if events.iter().any(|event| event.token() == SHUTDOWN_TOKEN) {
+                        return Ok(());
+                    }
+                    // Drain the queue: a burst is answered by one re-read.
+                    if socket.iter().count() > 0 && tx.send(()).is_err() {
                         return Ok(());
                     }
                 }
@@ -126,7 +155,7 @@ fn spawn_udev_monitor() -> io::Result<mpsc::UnboundedReceiver<()>> {
                 warn!("backlight: udev monitor failed: {error}");
             }
         })?;
-    Ok(rx)
+    Ok(UdevMonitor { changes, shutdown })
 }
 
 /// Read and normalize every usable device below a backlight sysfs class path.
@@ -389,5 +418,27 @@ mod tests {
         assert!(!is_safe_backlight_device("../brightness"));
         assert!(!is_safe_backlight_device("foo/bar"));
         assert!(!is_safe_backlight_device("foo\0bar"));
+    }
+
+    #[test]
+    fn dropping_the_monitor_stops_its_thread_without_a_poll_timeout() {
+        let mut monitor = spawn_udev_monitor().unwrap();
+        let shutdown = monitor.shutdown.clone();
+        let (done, stopped) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            // The thread owns the only sender, so `None` means it has returned.
+            while monitor.changes.blocking_recv().is_some() {}
+            done.send(()).unwrap();
+        });
+        if stopped.recv_timeout(Duration::from_millis(100)).is_ok() {
+            eprintln!("skipped: no udev monitor socket in this environment");
+            return;
+        }
+
+        // What `Drop` does; the monitor itself is busy being waited on above.
+        shutdown.wake().unwrap();
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor thread stopped");
     }
 }

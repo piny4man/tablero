@@ -26,11 +26,11 @@ use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
 /// How often the producer samples system load.
 ///
-/// Two seconds is frequent enough to track pressure as it moves but far too
+/// Three seconds is frequent enough to track pressure as it moves but far too
 /// coarse to keep the loop busy: between ticks the producer is parked on a timer
-/// and the render loop is idle, waking only when a sample changes a visible
-/// percent.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+/// and the render loop is idle, woken only by a sample that changes a visible
+/// percent. Configurable per widget as `interval`.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A point-in-time reading of the kernel's aggregate CPU time counters.
 ///
@@ -160,7 +160,7 @@ impl SystemProducer {
         }
     }
 
-    /// Create a producer sampling at a custom `interval` (used by tests).
+    /// Create a producer sampling at a custom `interval`.
     pub fn with_interval(interval: Duration) -> Self {
         Self { interval }
     }
@@ -186,7 +186,9 @@ impl Producer for SystemProducer {
 ///
 /// CPU load needs two readings to form a delta, so the first tick (which a Tokio
 /// [`interval`] fires immediately) only seeds the baseline; every tick after that
-/// emits a [`SystemStats`]. A failed CPU read degrades that tick's CPU figure to
+/// emits a [`SystemStats`] if it differs from the last one sent — the snapshot is
+/// whole percents, so a steady machine sends nothing and the render loop sleeps
+/// on. A failed CPU read degrades that tick's CPU figure to
 /// `0` and keeps the last good baseline; a failed memory read degrades to `0`.
 /// Returns `Ok(())` once the render loop drops its receiver.
 async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
@@ -196,6 +198,7 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
     // so the first emitted sample reflects real elapsed time.
     ticker.tick().await;
     let mut prev = read_cpu_times();
+    let mut sent = None;
 
     loop {
         ticker.tick().await;
@@ -212,10 +215,20 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
 
         let mem = read_mem_usage().unwrap_or(0.0);
 
-        if tx.send(Msg::System(SystemStats::new(cpu, mem))).is_err() {
+        if !send_if_changed(&tx, &mut sent, SystemStats::new(cpu, mem)) {
             return Ok(());
         }
     }
+}
+
+/// Send `stats` unless it is what the widget already shows. Returns `false`
+/// once the render loop has gone away.
+fn send_if_changed(tx: &MsgSender, sent: &mut Option<SystemStats>, stats: SystemStats) -> bool {
+    if *sent == Some(stats) {
+        return true;
+    }
+    *sent = Some(stats);
+    tx.send(Msg::System(stats)).is_ok()
 }
 
 #[cfg(test)]
@@ -236,6 +249,49 @@ MemAvailable:    8000000 kB
 Buffers:          500000 kB
 Cached:          3000000 kB
 ";
+
+    #[test]
+    fn an_unchanged_whole_percent_reading_is_not_sent_again() {
+        let (bridge, channel) = crate::producer::ProducerBridge::new().unwrap();
+        let tx = bridge.sender();
+        let mut sent = None;
+
+        assert!(send_if_changed(
+            &tx,
+            &mut sent,
+            SystemStats::new(12.2, 47.0)
+        ));
+        // Moves within the displayed percent: the widget would show the same.
+        assert!(send_if_changed(
+            &tx,
+            &mut sent,
+            SystemStats::new(12.4, 47.3)
+        ));
+        assert!(send_if_changed(
+            &tx,
+            &mut sent,
+            SystemStats::new(13.0, 47.0)
+        ));
+
+        let received: Vec<_> = std::iter::from_fn(|| channel.try_recv().ok())
+            .map(|msg| match msg {
+                Msg::System(stats) => stats,
+                other => panic!("unexpected message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [SystemStats::new(12.0, 47.0), SystemStats::new(13.0, 47.0)]
+        );
+    }
+
+    #[test]
+    fn a_closed_render_loop_ends_the_producer_on_the_next_change() {
+        let (bridge, channel) = crate::producer::ProducerBridge::new().unwrap();
+        let tx = bridge.sender();
+        drop((bridge, channel));
+        assert!(!send_if_changed(&tx, &mut None, SystemStats::new(1.0, 1.0)));
+    }
 
     #[test]
     fn parse_cpu_times_reads_the_aggregate_line() {

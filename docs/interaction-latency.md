@@ -254,3 +254,46 @@ settings without evidence:
 - Re-run with blur/animations both enabled and disabled. Application acceptance
   must pass with effects enabled; a compositor-only delta should be filed and
   measured separately.
+
+## Idle wakeups
+
+A bar that renders quickly can still keep the machine out of its deep sleep
+states by waking often. No tracing tool is needed to count that; the kernel
+keeps a per-thread counter of voluntary context switches, one per wakeup:
+
+```sh
+pid=$(pidof tablero)
+snap() { for t in /proc/$pid/task/*; do
+  echo "${t##*/} $(cat $t/comm) $(awk '/^voluntary_ctxt/{print $2}' $t/status)"
+done | sort; }
+snap >a; sleep 60; snap >b
+join a b | awk '{d=$5-$3; s+=d; if (d) print $1, $2, d} END {print "total", s}'
+```
+
+Run it against an otherwise quiet desktop. A terminal that retitles itself
+(a shell prompt, a progress spinner) drives the title widget and is activity,
+not idle cost; `TABLERO_PERF=1` shows it as `cause=active-window` frames.
+
+### 2026-09-20, full daily config, hypridle not running, 60 s
+
+| Thread | Installed daily bar (before) | Idle-wakeup branch |
+| --- | ---: | ---: |
+| render loop (`tablero`) | 310 | 134 |
+| producer runtime worker | 16,753 | 370 |
+| Tokio blocking pool (30 threads → none) | 16,740 | 0 |
+| volume / backlight threads | 66 | 18 |
+| **total** | **32,754** | **522** |
+
+Nearly all of the baseline was one widget. With hypridle stopped, its producer
+walked `/proc` every two seconds through `tokio::fs`, which hands every
+`read_dir` step, `stat`, and `comm` read to the blocking pool: about 560
+dispatches per walk, each waking a pool thread and then the worker. The walk is
+now synchronous (a millisecond or two on a memory-backed filesystem), reads
+`comm` before it `stat`s, runs every ten seconds, and stops entirely once a
+hypridle process is found and held by pidfd.
+
+The remaining 522 were measured on a desktop that was not idle: a diagnostic run
+over the same period attributed 51 of 66 frames to `active-window` title changes
+from the terminal driving the measurement, and 4 to the three-second system
+sample. The config watcher, bluetooth, backlight, and hypridle producers caused
+no frame at all. A quiet-desktop figure is still to be recorded.

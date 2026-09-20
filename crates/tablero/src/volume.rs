@@ -68,7 +68,7 @@
 //! The volume can change at any time (key press, GUI slider, app that
 //! auto-balances audio), so every sink `info` / `param` event and every
 //! `default.audio.sink` change re-evaluates the snapshot immediately. A
-//! 2-second ticker re-reads the same cached state as a safety net for anything
+//! 10-second ticker re-reads the same cached state as a safety net for anything
 //! the server did not push. Either way a snapshot is only sent when the
 //! normalized value actually differs, plus one forced re-emit every
 //! `RESYNC_TICKS` ticks in case a message never reached the render loop.
@@ -105,13 +105,12 @@ use crate::widget::{DeviceKind, Msg, Volume};
 
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
-/// How often the producer polls the cached PipeWire state.
+/// How often the producer re-evaluates the cached PipeWire state unprompted.
 ///
-/// Two seconds is frequent enough to track volume keys as they happen, and
-/// far too coarse to keep the loop busy: between ticks the producer is parked
-/// on a timer and the render loop is idle, waking only when a sample changes
-/// a visible label.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+/// Volume keys and device changes arrive as PipeWire events and are handled as
+/// they happen; this tick is only the net under a push the server never sent,
+/// so it is slow enough to leave an idle machine asleep.
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long a fresh connection has to answer its first `core.sync` before it
 /// is written off as never-handshaked and retried.
@@ -144,11 +143,11 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 ///
 /// [`on_tick`] gates sends on a real change, which means a snapshot that never
 /// reached the render loop is never re-sent and the widget stays blank until
-/// the volume physically changes. Dropping the gate every 15th tick (~30s at
+/// the volume physically changes. Dropping the gate every 3rd tick (~30s at
 /// the default interval) bounds that to half a minute. It is nearly free:
 /// `VolumeWidget::update` diffs its own state, so an unchanged value costs one
 /// channel message and no redraw.
-const RESYNC_TICKS: u32 = 15;
+const RESYNC_TICKS: u32 = 3;
 
 /// The object id of the PipeWire core itself (`PW_ID_CORE`), which the
 /// `pipewire` crate does not re-export. `done` and `error` events carrying this

@@ -10,38 +10,53 @@
 //! `org.freedesktop.DBus.ObjectManager` at the well-known name `org.bluez`:
 //! `GetManagedObjects` returns the full tree of `org.bluez.Adapter1` and
 //! `org.bluez.Device1` instances as a `{path: {iface: props}}` map. The
-//! producer polls that map on a fixed cadence, normalizes the readings into
-//! a [`Bluetooth`] snapshot, and re-emits on every change.
+//! producer reads that map, normalizes it into a [`Bluetooth`] snapshot, and
+//! emits it whenever it differs from the last one sent.
 //!
 //! Normalization lives in [`bluetooth_from_bluez`], a pure function the
 //! tests drive directly — the full DBus value → message → widget path is
-//! covered without a live system bus. Polling (rather than per-property
-//! signal subscriptions) is what keeps the implementation tractable: BlueZ
-//! adapters and devices appear and disappear dynamically, so a static
-//! `select_all` over per-proxy property streams would miss additions after
-//! startup. The widget's `update` reports `false` on an unchanged
-//! snapshot, so a steady-state adapter costs one DBus call per tick and no
-//! repaints.
+//! covered without a live system bus.
+//!
+//! Re-reads are driven by BlueZ's own signals, not a timer. Adapters and
+//! devices appear and disappear dynamically, so rather than per-proxy property
+//! streams (which would miss objects added after startup) the producer holds a
+//! single match rule on every signal `org.bluez` sends and re-reads the whole
+//! map when one could change the snapshot (`signal_changes_state`). An idle
+//! adapter therefore costs nothing: no timer, no DBus call, no message. A slow
+//! resync remains as a safety net for a missed signal.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use futures_util::FutureExt;
+use futures_util::stream::{StreamExt, select};
 use log::warn;
-use tokio::time::interval;
+use tokio::time::{sleep, timeout};
+use zbus::fdo::DBusProxy;
+use zbus::message::Type;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
-use zbus::{Connection, proxy};
+use zbus::{Connection, MatchRule, Message, MessageStream, proxy};
 
 use crate::widget::{Bluetooth, BluetoothState, Msg};
 
 use crate::producer::{MsgSender, Producer, ProducerFuture, ProducerResult};
 
-/// How often the producer polls BlueZ for adapter and device state.
+/// How often the producer re-reads BlueZ without having seen a signal.
 ///
-/// Two seconds is frequent enough to track power toggles and device
-/// connections as they happen, and far too coarse to keep the loop busy:
-/// between ticks the producer is parked on a timer and the render loop is
-/// idle, waking only when a sample changes a visible label.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+/// Changes arrive as signals; this only bounds how long a missed one could
+/// leave the widget stale, so it is slow enough not to matter to an idle CPU.
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long to let a burst of signals finish before re-reading once. Powering
+/// an adapter or connecting a device emits several in quick succession.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// BlueZ's well-known bus name.
+const BLUEZ: &str = "org.bluez";
+
+/// Signals kept queued while a read is in flight; a burst beyond this is
+/// collapsed into the one re-read anyway.
+const MAX_QUEUED_SIGNALS: usize = 64;
 
 /// The `org.bluez.Adapter1` interface name — the marker the ObjectManager
 /// map uses to distinguish adapters from devices.
@@ -204,25 +219,62 @@ async fn read_snapshot(om: &ObjectManagerProxy<'_>) -> Bluetooth {
     }
 }
 
-/// A [`Producer`] that polls BlueZ for the local adapter state and emits
+/// Whether a signal from BlueZ could change the [`Bluetooth`] snapshot.
+///
+/// Objects coming and going always can. Of the property changes only an
+/// adapter's `Powered` and a device's `Connected` are displayed; the rest —
+/// notably the `RSSI` updates that stream in for every nearby device while
+/// something is scanning — must not cost a re-read each.
+fn signal_changes_state(message: &Message) -> bool {
+    let header = message.header();
+    let (Some(interface), Some(member)) = (header.interface(), header.member()) else {
+        return false;
+    };
+    match (interface.as_str(), member.as_str()) {
+        ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded" | "InterfacesRemoved") => true,
+        ("org.freedesktop.DBus.Properties", "PropertiesChanged") => message
+            .body()
+            .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+            .is_ok_and(|(interface, changed, invalidated)| {
+                let names = changed.keys().chain(&invalidated).map(String::as_str);
+                property_change_is_displayed(&interface, names)
+            }),
+        _ => false,
+    }
+}
+
+/// Whether a `PropertiesChanged` on `interface` touching `names` is one the
+/// widget shows. Pure over its input.
+fn property_change_is_displayed<'a>(
+    interface: &str,
+    mut names: impl Iterator<Item = &'a str>,
+) -> bool {
+    match interface {
+        ADAPTER_IFACE => names.any(|name| name == "Powered"),
+        DEVICE_IFACE => names.any(|name| name == "Connected"),
+        _ => false,
+    }
+}
+
+/// A [`Producer`] that follows BlueZ's local adapter state and emits
 /// [`Msg::Bluetooth`] snapshots on every change.
 ///
 /// Construct with [`new`](BluetoothProducer::new) and hand it to the
-/// producer bridge; it reads an initial snapshot, then re-reads and emits on
-/// every tick until the system bus closes or the render loop shuts down.
+/// producer bridge; it reads an initial snapshot, then re-reads whenever BlueZ
+/// signals a change until the system bus closes or the render loop shuts down.
 pub struct BluetoothProducer {
     interval: Duration,
 }
 
 impl BluetoothProducer {
-    /// Create a bluetooth producer sampling at the default cadence.
+    /// Create a bluetooth producer resyncing at the default cadence.
     pub fn new() -> Self {
         Self {
             interval: DEFAULT_INTERVAL,
         }
     }
 
-    /// Create a producer sampling at a custom `interval` (used by tests).
+    /// Create a producer resyncing at a custom `interval` (used by tests).
     pub fn with_interval(interval: Duration) -> Self {
         Self { interval }
     }
@@ -244,33 +296,67 @@ impl Producer for BluetoothProducer {
     }
 }
 
-/// Drive the polling loop: connect to the system bus, seed the bar with the
-/// initial snapshot, then on every tick re-read and re-emit.
+/// Drive the producer: connect to the system bus, seed the bar with the
+/// initial snapshot, then re-read on every relevant BlueZ signal, on BlueZ
+/// appearing or vanishing, and at the slow `resync` cadence.
 ///
 /// A failed system-bus connection propagates as an error the bridge logs
 /// and isolates — the bar keeps running, the bluetooth widget simply stays
-/// `unavailable`. A failed per-tick read is logged and degrades to
-/// [`Unavailable`](BluetoothState::Unavailable); the next tick retries the
+/// `unavailable`. A failed read is logged and degrades to
+/// [`Unavailable`](BluetoothState::Unavailable); the next event retries the
 /// live read.
 ///
 /// [`Unavailable`]: crate::widget::BluetoothState::Unavailable
-async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
+async fn run(tx: MsgSender, resync: Duration) -> ProducerResult {
     let conn = Connection::system().await?;
     let om = ObjectManagerProxy::new(&conn).await?;
 
-    // Seed the bar with the current adapter before the first tick fires, so
-    // the widget never shows the empty initial state for the full interval.
-    if tx.send(Msg::Bluetooth(read_snapshot(&om).await)).is_err() {
-        return Ok(());
-    }
+    // One rule for every object BlueZ has or will have. The bus resolves the
+    // well-known name per signal, so it keeps matching across a BlueZ restart.
+    let rule = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .sender(BLUEZ)?
+        .build();
+    let signals = MessageStream::for_match_rule(rule, &conn, Some(MAX_QUEUED_SIGNALS))
+        .await?
+        .filter_map(|message| async move {
+            message
+                .is_ok_and(|message| signal_changes_state(&message))
+                .then_some(())
+        });
+    // A vanished BlueZ sends nothing, so watch its name too.
+    let owners = DBusProxy::new(&conn)
+        .await?
+        .receive_name_owner_changed_with_args(&[(0, BLUEZ)])
+        .await?
+        .map(|_| ());
+    let events = select(signals, owners);
+    futures_util::pin_mut!(events);
 
-    let mut ticker = interval(period);
+    // Subscribed before the first read, so a change racing with it stays
+    // queued and causes another read instead of being lost.
+    let mut sent = None;
     loop {
-        ticker.tick().await;
-        if tx.send(Msg::Bluetooth(read_snapshot(&om).await)).is_err() {
+        if !send_if_changed(&tx, &mut sent, read_snapshot(&om).await) {
             return Ok(());
         }
+        if let Ok(None) = timeout(resync, events.next()).await {
+            return Ok(());
+        }
+        // Let the rest of a burst arrive, then answer it with a single read.
+        sleep(SETTLE).await;
+        while let Some(Some(())) = events.next().now_or_never() {}
     }
+}
+
+/// Send `snapshot` unless it is what the widget already shows. Returns `false`
+/// once the render loop has gone away.
+fn send_if_changed(tx: &MsgSender, sent: &mut Option<Bluetooth>, snapshot: Bluetooth) -> bool {
+    if *sent == Some(snapshot) {
+        return true;
+    }
+    *sent = Some(snapshot);
+    tx.send(Msg::Bluetooth(snapshot)).is_ok()
 }
 
 #[cfg(test)]
@@ -533,5 +619,103 @@ mod tests {
         let no_adapter = bluetooth_from_bluez(0, None, 0);
         assert_eq!(no_adapter.state(), BluetoothState::Unavailable);
         assert_eq!(no_adapter.label(), "unavailable");
+    }
+
+    fn properties_changed(interface: &str, changed: &[&str], invalidated: &[&str]) -> Message {
+        let changed: HashMap<&str, OwnedValue> = changed
+            .iter()
+            .map(|name| (*name, OwnedValue::from(true)))
+            .collect();
+        Message::signal(
+            "/org/bluez/hci0",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+        )
+        .unwrap()
+        .build(&(interface, changed, invalidated))
+        .unwrap()
+    }
+
+    #[test]
+    fn displayed_property_changes_cause_a_re_read() {
+        assert!(signal_changes_state(&properties_changed(
+            ADAPTER_IFACE,
+            &["Powered"],
+            &[]
+        )));
+        assert!(signal_changes_state(&properties_changed(
+            DEVICE_IFACE,
+            &["ServicesResolved", "Connected"],
+            &[]
+        )));
+        // A property BlueZ only invalidates still has to be read back.
+        assert!(signal_changes_state(&properties_changed(
+            DEVICE_IFACE,
+            &[],
+            &["Connected"]
+        )));
+    }
+
+    #[test]
+    fn scan_noise_and_foreign_interfaces_cause_no_re_read() {
+        for (interface, name) in [
+            (DEVICE_IFACE, "RSSI"),
+            (ADAPTER_IFACE, "Discovering"),
+            // `Connected` exists on other interfaces too; only devices count.
+            ("org.bluez.MediaTransport1", "Connected"),
+            ("org.bluez.Battery1", "Percentage"),
+        ] {
+            assert!(
+                !signal_changes_state(&properties_changed(interface, &[name], &[])),
+                "{interface} {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn objects_appearing_and_vanishing_cause_a_re_read() {
+        for member in ["InterfacesAdded", "InterfacesRemoved"] {
+            let message = Message::signal("/", "org.freedesktop.DBus.ObjectManager", member)
+                .unwrap()
+                .build(&())
+                .unwrap();
+            assert!(signal_changes_state(&message), "{member}");
+        }
+    }
+
+    #[test]
+    fn unrelated_and_malformed_signals_cause_no_re_read() {
+        let unrelated = Message::signal("/", "org.bluez.Custom", "Something")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        assert!(!signal_changes_state(&unrelated));
+        let malformed =
+            Message::signal("/", "org.freedesktop.DBus.Properties", "PropertiesChanged")
+                .unwrap()
+                .build(&("not the PropertiesChanged body",))
+                .unwrap();
+        assert!(!signal_changes_state(&malformed));
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_is_not_sent_again() {
+        let (bridge, channel) = crate::producer::ProducerBridge::new().unwrap();
+        let tx = bridge.sender();
+        let on = Bluetooth::new(BluetoothState::On, 0);
+        let connected = Bluetooth::new(BluetoothState::On, 1);
+        let mut sent = None;
+
+        for snapshot in [on, on, connected, connected] {
+            assert!(send_if_changed(&tx, &mut sent, snapshot));
+        }
+
+        let received: Vec<_> = std::iter::from_fn(|| channel.try_recv().ok())
+            .map(|msg| match msg {
+                Msg::Bluetooth(snapshot) => snapshot,
+                other => panic!("unexpected message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(received, [on, connected]);
     }
 }
