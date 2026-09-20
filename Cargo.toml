@@ -20,6 +20,23 @@ codegen-units = 1   # maximum cross-unit optimization (slower compile)
 panic = "abort"     # drop unwind tables; a panic aborts the process
 strip = true        # strip symbols and debuginfo from the binary
 
+# The exception to the size-first rule: the rasteriser, text shaper and glyph
+# scaler run on the event-loop thread for every frame, and at `"z"` they lose the
+# inlining and vectorisation their inner loops rely on. Speed there is what lets
+# a frame finish quickly on a clocked-down (balanced / power-saver) core.
+[profile.release.package.tiny-skia]
+opt-level = 3
+[profile.release.package.tiny-skia-path]
+opt-level = 3
+[profile.release.package.cosmic-text]
+opt-level = 3
+[profile.release.package.harfrust]
+opt-level = 3
+[profile.release.package.swash]
+opt-level = 3
+[profile.release.package.zeno]
+opt-level = 3
+
 # Shared lints, inherited by every member via `[lints] workspace = true`. Kept
 # pragmatic: deny clippy's default group and direct `unsafe`, but leave the
 # pedantic/nursery groups opt-in so the build isn't flooded with style nits.
