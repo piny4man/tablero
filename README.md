@@ -51,6 +51,9 @@ Set `RUST_LOG=info` for startup and lifecycle logging:
 RUST_LOG=info cargo run -p tablero
 ```
 
+For opt-in render and interaction timing, including the balanced-vs-performance
+A/B procedure and baseline, see [Interaction latency diagnostics](docs/interaction-latency.md).
+
 ## What it does
 
 - Opens a **top-anchored** layer-shell surface spanning the output width, with an

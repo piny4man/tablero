@@ -222,13 +222,13 @@ fn collect_paths(node: Node, transform: Matrix, out: &mut Vec<SubPath>) {
             .attribute("transform")
             .map_or(Matrix::IDENTITY, parse_transform);
         let combined = transform.compose(local);
-        if tag == "path" {
-            if let Some(d) = child.attribute("d") {
-                let even_odd = child.attribute("fill-rule") == Some("evenodd");
-                let cmds = flatten_path(d, combined);
-                if !cmds.is_empty() {
-                    out.push(SubPath { even_odd, cmds });
-                }
+        if tag == "path"
+            && let Some(d) = child.attribute("d")
+        {
+            let even_odd = child.attribute("fill-rule") == Some("evenodd");
+            let cmds = flatten_path(d, combined);
+            if !cmds.is_empty() {
+                out.push(SubPath { even_odd, cmds });
             }
         }
         collect_paths(child, combined, out);

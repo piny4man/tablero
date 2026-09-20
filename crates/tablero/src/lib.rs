@@ -19,6 +19,7 @@ pub mod clock;
 pub mod config;
 mod config_reload;
 pub mod icon;
+mod performance;
 pub mod render;
 pub mod scale;
 pub mod widget;
@@ -98,6 +99,7 @@ use crate::hyprland::HyprlandProducer;
 use crate::networkmanager::NetworkProducer;
 use crate::notifications::NotificationsProducer;
 use crate::outputs::{OutputId, Outputs};
+use crate::performance::PerformanceLogger;
 use crate::power_profiles::{PowerProfilesProducer, PowerProfilesSettings};
 use crate::producer::{Producer, ProducerBridge};
 use crate::sni::SniHostProducer;
@@ -117,6 +119,14 @@ const NAMESPACE: &str = "tablero";
 /// Assumed width (px) for the initial shared-memory pool, before the compositor
 /// reports the real output width via the first configure event.
 const INITIAL_WIDTH: u32 = 1920;
+
+/// Application-side phases captured for one rendered frame.
+struct FrameTimings {
+    layout: Option<Duration>,
+    draw: Option<Duration>,
+    blit: Option<Duration>,
+    render: Option<Duration>,
+}
 
 /// One output's bar: its layer-shell surface plus the per-output render state.
 ///
@@ -158,6 +168,8 @@ struct Surface {
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
+    /// Opt-in render timing diagnostics; disabled in the normal path.
+    performance: PerformanceLogger,
 }
 
 impl Surface {
@@ -177,6 +189,7 @@ impl Surface {
         monitor: Option<&str>,
         config: Config,
         fonts: SharedFonts,
+        performance: PerformanceLogger,
     ) -> Self {
         // The bar reserves exactly its own height so windows tile beneath it.
         let height = config.height;
@@ -227,6 +240,7 @@ impl Surface {
             buffer_px: (0, 0),
             next_buffer: 0,
             configured: false,
+            performance,
         }
     }
 
@@ -258,7 +272,7 @@ impl Surface {
         // a fresh clock tick so the bar does not go empty until the next event.
         replay_snapshot(&mut self.dashboard, seed);
         if self.configured {
-            self.draw(pool);
+            self.draw(pool, "config-reload");
         }
     }
 
@@ -280,7 +294,7 @@ impl Surface {
     fn handle(&mut self, msg: &Msg, pool: &mut SlotPool) -> bool {
         let changed = self.dashboard.update(msg);
         if changed {
-            self.draw(pool);
+            self.draw(pool, message_kind(msg));
         }
         changed
     }
@@ -298,7 +312,7 @@ impl Surface {
         self.scale = scale;
         self.ctx
             .set_settings(self.config.scaled_render_settings(scale));
-        self.draw(pool);
+        self.draw(pool, "scale-change");
         true
     }
 
@@ -364,7 +378,7 @@ impl Surface {
             // Lifecycle-forced frame: seed the clock so the bar shows the time
             // immediately, then draw regardless of the dirty flag.
             self.dashboard.update(&Msg::tick_now());
-            self.draw(pool);
+            self.draw(pool, "configure");
         }
     }
 
@@ -374,10 +388,11 @@ impl Surface {
     ///
     /// Uses two alternating SHM slots: when the compositor has released the
     /// next slot, its mmap is reused instead of allocating a new one.
-    fn draw(&mut self, pool: &mut SlotPool) {
+    fn draw(&mut self, pool: &mut SlotPool, cause: &'static str) {
         if !self.configured {
             return;
         }
+        let started = self.performance.start();
 
         // Logical surface dimensions scale up to the physical buffer the
         // compositor maps back down via `set_buffer_scale`. Everything below this
@@ -397,28 +412,85 @@ impl Surface {
             .as_ref()
             .is_some_and(|buf| !buf.slot().has_active_buffers());
 
-        if can_reuse {
-            let canvas = match pool.canvas(self.buffers[idx].as_ref().unwrap()) {
-                Some(canvas) => canvas,
+        let timings = if can_reuse {
+            match pool.canvas(self.buffers[idx].as_ref().unwrap()) {
+                Some(canvas) => Some(self.paint_frame(canvas, width, height)),
                 None => {
-                    // Race: became active between the check and canvas(). Fall through.
-                    self.paint_new_buffer(pool, idx, width, height, stride);
-                    self.commit_buffer(idx, width, height);
-                    return;
+                    // Race: became active between the check and canvas(). Allocate.
+                    self.paint_new_buffer(pool, idx, width, height, stride)
                 }
-            };
-            self.paint_frame(canvas, width, height);
+            }
         } else {
-            self.paint_new_buffer(pool, idx, width, height, stride);
+            self.paint_new_buffer(pool, idx, width, height, stride)
+        };
+        let committed = timings.is_some() && self.commit_buffer(idx, width, height);
+        let total_elapsed = started.map(|started| started.elapsed());
+        let output = self.monitor.as_deref().unwrap_or("unknown");
+        self.performance.record_duration(
+            "frame-total",
+            total_elapsed,
+            format_args!(
+                "cause={cause} output={output} width={width} height={height} reused={can_reuse} committed={committed}"
+            ),
+        );
+        if let Some(timings) = timings {
+            self.record_frame_timings(timings, cause, width, height);
         }
-        self.commit_buffer(idx, width, height);
+        if cause == "configure" && committed {
+            self.performance.record_process_elapsed(
+                "startup-to-first-commit",
+                format_args!(
+                    "output={} width={width} height={height}",
+                    self.monitor.as_deref().unwrap_or("unknown")
+                ),
+            );
+        }
     }
 
-    fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) {
+    fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
+        let started = self.performance.start();
         self.ctx.resize(width, height);
+
+        let phase_started = self.performance.start();
         self.dashboard.layout(&mut self.ctx, width, height);
+        let layout = phase_started.map(|started| started.elapsed());
+
+        let phase_started = self.performance.start();
         self.dashboard.draw(&mut self.ctx);
+        let draw = phase_started.map(|started| started.elapsed());
+
+        let phase_started = self.performance.start();
         write_argb8888(self.ctx.pixels(), canvas);
+        let blit = phase_started.map(|started| started.elapsed());
+        let render = started.map(|started| started.elapsed());
+        FrameTimings {
+            layout,
+            draw,
+            blit,
+            render,
+        }
+    }
+
+    fn record_frame_timings(
+        &self,
+        timings: FrameTimings,
+        cause: &'static str,
+        width: u32,
+        height: u32,
+    ) {
+        let output = self.monitor.as_deref().unwrap_or("unknown");
+        for (metric, elapsed) in [
+            ("frame-layout", timings.layout),
+            ("frame-draw", timings.draw),
+            ("frame-blit", timings.blit),
+            ("frame-render", timings.render),
+        ] {
+            self.performance.record_duration(
+                metric,
+                elapsed,
+                format_args!("cause={cause} output={output} width={width} height={height}"),
+            );
+        }
     }
 
     fn paint_new_buffer(
@@ -428,7 +500,7 @@ impl Surface {
         width: u32,
         height: u32,
         stride: i32,
-    ) {
+    ) -> Option<FrameTimings> {
         let (buffer, canvas) = match pool.create_buffer(
             width as i32,
             height as i32,
@@ -438,16 +510,17 @@ impl Surface {
             Ok(parts) => parts,
             Err(e) => {
                 error!("failed to create shm buffer: {e}");
-                return;
+                return None;
             }
         };
-        self.paint_frame(canvas, width, height);
+        let timings = self.paint_frame(canvas, width, height);
         self.buffers[idx] = Some(buffer);
+        Some(timings)
     }
 
-    fn commit_buffer(&mut self, idx: usize, width: u32, height: u32) {
+    fn commit_buffer(&mut self, idx: usize, width: u32, height: u32) -> bool {
         let Some(buffer) = self.buffers[idx].as_ref() else {
-            return;
+            return false;
         };
         let surface = self.layer.wl_surface();
         // Tell the compositor the buffer holds `scale`× physical pixels per
@@ -456,9 +529,10 @@ impl Surface {
         surface.damage_buffer(0, 0, width as i32, height as i32);
         if let Err(e) = buffer.attach_to(surface) {
             error!("failed to attach buffer: {e}");
-            return;
+            return false;
         }
         self.layer.commit();
+        true
     }
 }
 
@@ -474,6 +548,8 @@ struct TooltipSurface {
     foreground: (u8, u8, u8, u8),
     ctx: RenderContext,
     configured: bool,
+    performance: PerformanceLogger,
+    requested_at: Option<Instant>,
 }
 
 const MENU_ROW_HEIGHT: u32 = 28;
@@ -532,6 +608,7 @@ struct PendingTrayMenu {
     settings: RenderSettings,
     serial: u32,
     seat: Option<wl_seat::WlSeat>,
+    requested_at: Option<Instant>,
 }
 
 /// One interactive tray menu, rendered as an XDG popup parented to its bar.
@@ -549,6 +626,8 @@ struct TrayMenuSurface {
     accent: (u8, u8, u8, u8),
     ctx: RenderContext,
     configured: bool,
+    performance: PerformanceLogger,
+    requested_at: Option<Instant>,
 }
 
 impl TrayMenuSurface {
@@ -691,6 +770,11 @@ impl TrayMenuSurface {
             return;
         }
         self.popup.wl_surface().commit();
+        self.performance.record_since(
+            "tray-menu-input-to-commit",
+            self.requested_at.take(),
+            format_args!("output={} rows={}", self.output_id, self.rows.len()),
+        );
     }
 }
 
@@ -769,6 +853,11 @@ impl TooltipSurface {
             return;
         }
         self.popup.wl_surface().commit();
+        self.performance.record_since(
+            "tooltip-input-to-commit",
+            self.requested_at.take(),
+            format_args!("output={} width={width} height={height}", self.output_id),
+        );
     }
 }
 
@@ -836,7 +925,17 @@ struct App {
     config_watcher: Option<config_reload::ConfigWatcher>,
     /// Latest producer messages, replayed after a dashboard rebuild on reload.
     producer_snapshot: ProducerSnapshot,
+    /// Opt-in latency diagnostics shared with surfaces and popups.
+    performance: PerformanceLogger,
+    /// Workspace click awaiting the matching Hyprland state and bar commit.
+    pending_workspace: Option<PendingWorkspace>,
     exit: bool,
+}
+
+struct PendingWorkspace {
+    target: i32,
+    monitor: Option<String>,
+    started: Option<Instant>,
 }
 
 /// Latest producer payloads retained for config hot-reload reseeding.
@@ -883,6 +982,27 @@ impl ProducerSnapshot {
 
 /// Stable key for the latest-message map. Active-window is per-monitor so a
 /// dual-head setup keeps both titles across reload.
+fn message_kind(msg: &Msg) -> &'static str {
+    match msg {
+        Msg::Tick(_) => "tick",
+        Msg::Workspaces(_) => "workspaces",
+        Msg::Battery(_) => "battery",
+        Msg::Backlight(_) => "backlight",
+        Msg::System(_) => "system",
+        Msg::Network(_) => "network",
+        Msg::Bluetooth(_) => "bluetooth",
+        Msg::Tray(_) => "tray",
+        Msg::TrayMenu(_) => "tray-menu",
+        Msg::TrayMenuUnavailable(_) => "tray-menu-unavailable",
+        Msg::ActiveWindow { .. } => "active-window",
+        Msg::Volume(_) => "volume",
+        Msg::Notifications(_) => "notifications",
+        Msg::PowerProfiles(_) => "power-profiles",
+        Msg::Updates(_) => "updates",
+        Msg::Hypridle(_) => "hypridle",
+    }
+}
+
 fn snapshot_key(msg: &Msg) -> String {
     match msg {
         Msg::Tick(_) => "tick".into(),
@@ -919,6 +1039,7 @@ impl App {
         let compositor = &self.compositor;
         let layer_shell = &self.layer_shell;
         let fonts = self.fonts.clone();
+        let performance = self.performance.clone();
         let built = self.outputs.ensure(id, name.as_deref(), |config| {
             Surface::new(
                 compositor,
@@ -929,6 +1050,7 @@ impl App {
                 name.as_deref(),
                 config,
                 fonts,
+                performance,
             )
         });
         if built {
@@ -1016,6 +1138,26 @@ impl App {
         if changed && matches!(msg, Msg::PowerProfiles(_)) {
             self.hide_tooltip();
         }
+        if changed
+            && let Msg::Workspaces(workspaces) = msg
+            && self.pending_workspace.as_ref().is_some_and(|pending| {
+                pending.monitor.as_deref().map_or_else(
+                    || workspaces.active() == pending.target,
+                    |monitor| workspaces.active_for(monitor) == Some(pending.target),
+                )
+            })
+        {
+            let pending = self.pending_workspace.take().unwrap();
+            self.performance.record_since(
+                "workspace-input-to-commit",
+                pending.started,
+                format_args!(
+                    "target={} output={}",
+                    pending.target,
+                    pending.monitor.as_deref().unwrap_or("unknown")
+                ),
+            );
+        }
     }
 
     fn handle_message(&mut self, msg: &Msg, qh: &QueueHandle<App>) {
@@ -1073,6 +1215,7 @@ impl App {
         y: f64,
         qh: &QueueHandle<App>,
     ) {
+        let requested_at = self.performance.start();
         let request = self
             .outputs
             .values()
@@ -1157,6 +1300,8 @@ impl App {
             foreground,
             ctx,
             configured: false,
+            performance: self.performance.clone(),
+            requested_at,
         });
     }
 
@@ -1242,6 +1387,8 @@ impl App {
             accent,
             ctx,
             configured: false,
+            performance: self.performance.clone(),
+            requested_at: pending.requested_at,
         });
     }
 }
@@ -1253,6 +1400,21 @@ impl App {
 /// and unique per output for its lifetime — exactly the key the registry needs.
 fn output_key(output: &wl_output::WlOutput) -> OutputId {
     output.id().protocol_id()
+}
+
+fn command_kind(command: &Command) -> &'static str {
+    match command {
+        Command::SwitchWorkspace(_) => "switch-workspace",
+        Command::ActivateTrayItem { .. } => "activate-tray-item",
+        Command::OpenTrayMenu { .. } => "open-tray-menu",
+        Command::ActivateTrayMenuItem { .. } => "activate-tray-menu-item",
+        Command::RunProgram(_) => "run-program",
+        Command::ToggleNotificationPanel => "toggle-notification-panel",
+        Command::ToggleNotificationsDnd => "toggle-notifications-dnd",
+        Command::AdjustBacklight { .. } => "adjust-backlight",
+        Command::SetPowerProfile(_) => "set-power-profile",
+        Command::SetHypridle(_) => "set-hypridle",
+    }
 }
 
 fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (f64, f64)) {
@@ -1359,6 +1521,7 @@ pub fn run_with_producers(
     producers: Vec<Box<dyn Producer>>,
     config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
+    let performance = PerformanceLogger::from_env();
     let power_settings = power_profiles_settings(&config);
     let height = config.height;
     let config_watcher = config_path.map(|path| config_reload::ConfigWatcher::new(path, &config));
@@ -1399,6 +1562,8 @@ pub fn run_with_producers(
         fonts,
         config_watcher,
         producer_snapshot: ProducerSnapshot::default(),
+        performance,
+        pending_workspace: None,
         exit: false,
     };
 
@@ -1815,6 +1980,7 @@ impl PointerHandler for App {
                     self.pointer_cursor = CursorIcon::Default;
                 }
             } else if let PointerEventKind::Press { button, serial, .. } = event.kind {
+                let input_started = self.performance.start();
                 // Normalize the kernel input code to the typed button the
                 // widgets branch on; other buttons (middle, side, scroll
                 // clicks) are ignored here so widgets never see them.
@@ -1858,10 +2024,19 @@ impl PointerHandler for App {
                             bar.scale,
                             bar.height,
                             bar.config.scaled_render_settings(bar.scale),
+                            bar.monitor.clone(),
                         ))
                     });
-                if let Some((mut command, parent, output, output_id, scale, bar_height, settings)) =
-                    interaction
+                if let Some((
+                    mut command,
+                    parent,
+                    output,
+                    output_id,
+                    scale,
+                    bar_height,
+                    settings,
+                    monitor,
+                )) = interaction
                 {
                     let origin = self
                         .output_state
@@ -1881,13 +2056,29 @@ impl PointerHandler for App {
                             settings,
                             serial,
                             seat: self.pointer_seat.clone(),
+                            requested_at: input_started,
                         });
                     }
+                    if let (Command::SwitchWorkspace(target), Some(started)) =
+                        (&command, input_started)
+                    {
+                        self.pending_workspace = Some(PendingWorkspace {
+                            target: *target,
+                            monitor,
+                            started: Some(started),
+                        });
+                    }
+                    let kind = command_kind(&command);
                     for sender in &self.commands {
                         if sender.send(command.clone()).is_err() {
                             warn!("command channel closed; dropping click command");
                         }
                     }
+                    self.performance.record_since(
+                        "click-to-command-queue",
+                        input_started,
+                        format_args!("command={kind} output={output_id}"),
+                    );
                 }
             } else if let PointerEventKind::Axis { vertical, .. } = event.kind {
                 let directions = scroll_directions(vertical, &mut self.scroll_remainder);
