@@ -121,6 +121,15 @@ impl Bounds {
     pub fn contains(&self, px: u32, py: u32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
+
+    /// The smallest rectangle covering both `self` and `other`.
+    pub fn union(&self, other: &Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self::new(x, y, right - x, bottom - y)
+    }
 }
 
 fn rounded_rect_path(bounds: Bounds, radius: f32, inset: f32) -> Option<Path> {

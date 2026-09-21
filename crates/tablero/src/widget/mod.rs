@@ -964,6 +964,24 @@ pub struct Dashboard {
     margin: u32,
     /// Gap between adjacent pills within a zone, in logical pixels.
     gap: u32,
+    /// Which widgets (zone order) reported a change since the last
+    /// [`take_damage`](Dashboard::take_damage).
+    changed: Vec<bool>,
+    /// Every widget's slot as of the last `take_damage`; `None` until a frame
+    /// has been accounted for, or after [`invalidate`](Dashboard::invalidate).
+    painted: Option<Vec<Bounds>>,
+}
+
+/// The part of a freshly painted frame that differs from the one before it.
+///
+/// The whole bar is always repainted; this only tells the compositor how much
+/// of it to recomposite, which is what bounds its blur and blend work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Damage {
+    /// Anything may have changed: first frame, moved slots, or a forced repaint.
+    Full,
+    /// Only pixels inside this rectangle changed.
+    Region(Bounds),
 }
 
 impl Dashboard {
@@ -971,13 +989,7 @@ impl Dashboard {
     /// or gap. This is the single-zone constructor the redraw harnesses and the
     /// host's simplest path use; richer layouts use [`with_zones`](Dashboard::with_zones).
     pub fn new(widgets: Vec<Box<dyn Widget>>) -> Self {
-        Self {
-            left: widgets,
-            center: Vec::new(),
-            right: Vec::new(),
-            margin: 0,
-            gap: 0,
-        }
+        Self::with_zones(widgets, Vec::new(), Vec::new())
     }
 
     /// Build a dashboard from its three zones, with no margin or gap.
@@ -986,12 +998,15 @@ impl Dashboard {
         center: Vec<Box<dyn Widget>>,
         right: Vec<Box<dyn Widget>>,
     ) -> Self {
+        let widgets = left.len() + center.len() + right.len();
         Self {
             left,
             center,
             right,
             margin: 0,
             gap: 0,
+            changed: vec![false; widgets],
+            painted: None,
         }
     }
 
@@ -1011,15 +1026,53 @@ impl Dashboard {
     /// once a change is seen, so each keeps its state current.
     pub fn update(&mut self, msg: &Msg) -> bool {
         let mut dirty = false;
-        for widget in self
+        for (widget, changed) in self
             .left
             .iter_mut()
             .chain(&mut self.center)
             .chain(&mut self.right)
+            .zip(&mut self.changed)
         {
-            dirty |= widget.update(msg);
+            let updated = widget.update(msg);
+            *changed |= updated;
+            dirty |= updated;
         }
         dirty
+    }
+
+    /// Account for a frame: what it changed relative to the frame accounted for
+    /// by the previous call. Call after [`layout`](Dashboard::layout), once per
+    /// committed frame.
+    ///
+    /// A widget paints only inside its slot, so while every slot stays put the
+    /// damage is the union of the changed widgets' slots. A moved or resized
+    /// slot shifts its neighbours and exposes background, and a repaint nothing
+    /// asked for has an unknown reason; both damage the whole bar.
+    pub fn take_damage(&mut self) -> Damage {
+        let bounds: Vec<Bounds> = self.widgets().map(|widget| widget.bounds()).collect();
+        let region = if self.painted.as_ref() == Some(&bounds) {
+            bounds
+                .iter()
+                .zip(&self.changed)
+                .filter(|(_, changed)| **changed)
+                .map(|(bounds, _)| *bounds)
+                .reduce(|damage, bounds| damage.union(&bounds))
+        } else {
+            None
+        };
+        self.painted = Some(bounds);
+        self.changed.fill(false);
+        region.map_or(Damage::Full, Damage::Region)
+    }
+
+    /// Forget the last accounted frame, so the next damages the whole bar. For a
+    /// frame that was painted but never reached the compositor.
+    pub fn invalidate(&mut self) {
+        self.painted = None;
+    }
+
+    fn widgets(&self) -> impl Iterator<Item = &Box<dyn Widget>> {
+        self.left.iter().chain(&self.center).chain(&self.right)
     }
 
     /// Assign layout slots for a `width * height` surface.
@@ -1337,5 +1390,112 @@ mod tests {
         let last = &px[px.len() - 4..];
         assert!(last[0] < 0x30 && last[1] < 0x30 && last[2] < 0x30);
         assert_eq!(last[3], 0xFF);
+    }
+
+    /// Workspaces on the left, a clock on the right: a workspace message changes
+    /// only the first, a tick only the second, and neither moves a slot.
+    fn workspaces_and_clock() -> (Dashboard, RenderContext) {
+        let mut workspaces = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1));
+        workspaces.update(&Msg::Workspaces(Workspaces::new([1, 2], 1)));
+        let mut dash = Dashboard::with_zones(
+            vec![Box::new(workspaces)],
+            vec![],
+            vec![Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1)))],
+        );
+        dash.update(&at(12, 0, 0));
+        (dash, RenderContext::new(400, 32))
+    }
+
+    fn frame(dash: &mut Dashboard, ctx: &mut RenderContext) -> (Damage, Vec<u8>) {
+        dash.layout(ctx, 400, 32);
+        let damage = dash.take_damage();
+        dash.draw(ctx);
+        (damage, ctx.pixels().to_vec())
+    }
+
+    #[test]
+    fn the_first_frame_damages_the_whole_bar() {
+        let (mut dash, mut ctx) = workspaces_and_clock();
+        assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Full);
+    }
+
+    #[test]
+    fn a_change_inside_fixed_slots_damages_only_the_changed_widgets() {
+        let (mut dash, mut ctx) = workspaces_and_clock();
+        frame(&mut dash, &mut ctx);
+
+        assert!(dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2))));
+        let workspaces = dash.left[0].bounds();
+        assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Region(workspaces));
+    }
+
+    #[test]
+    fn widgets_changed_by_coalesced_messages_damage_the_union_of_their_slots() {
+        let strip = |active| {
+            let mut widget = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1));
+            widget.update(&Msg::Workspaces(Workspaces::new([1, 2], active)));
+            widget
+        };
+        let mut dash =
+            Dashboard::with_zones(vec![Box::new(strip(1))], vec![], vec![Box::new(strip(1))]);
+        let mut ctx = RenderContext::new(400, 32);
+        frame(&mut dash, &mut ctx);
+
+        assert!(dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2))));
+        let (damage, _) = frame(&mut dash, &mut ctx);
+        let (left, right) = (dash.left[0].bounds(), dash.right[0].bounds());
+        assert_eq!(damage, Damage::Region(left.union(&right)));
+    }
+
+    #[test]
+    fn every_pixel_that_differs_between_frames_lies_inside_the_damage() {
+        let (mut dash, mut ctx) = workspaces_and_clock();
+        let (_, before) = frame(&mut dash, &mut ctx);
+        dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2)));
+        let (damage, after) = frame(&mut dash, &mut ctx);
+
+        let Damage::Region(region) = damage else {
+            panic!("fixed slots should give partial damage, got {damage:?}");
+        };
+        let differing: Vec<(u32, u32)> = before
+            .chunks_exact(4)
+            .zip(after.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| (i as u32 % 400, i as u32 / 400))
+            .collect();
+        assert!(!differing.is_empty(), "the active workspace moved");
+        assert!(
+            differing.iter().all(|&(x, y)| region.contains(x, y)),
+            "pixels outside {region:?} changed"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_moves_or_resizes_damages_the_whole_bar() {
+        let (mut dash, mut ctx) = workspaces_and_clock();
+        frame(&mut dash, &mut ctx);
+        // A third workspace widens the left slot.
+        dash.update(&Msg::Workspaces(Workspaces::new([1, 2, 3], 1)));
+        assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Full);
+    }
+
+    #[test]
+    fn a_repaint_nothing_asked_for_and_an_invalidated_frame_damage_the_whole_bar() {
+        let (mut dash, mut ctx) = workspaces_and_clock();
+        frame(&mut dash, &mut ctx);
+        assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Full);
+
+        dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2)));
+        dash.invalidate();
+        assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Full);
+    }
+
+    #[test]
+    fn bounds_union_covers_both_rectangles() {
+        let a = Bounds::new(10, 4, 20, 8);
+        let b = Bounds::new(50, 0, 5, 30);
+        assert_eq!(a.union(&b), Bounds::new(10, 0, 45, 30));
+        assert_eq!(a.union(&a), a);
     }
 }

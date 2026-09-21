@@ -26,7 +26,7 @@ Each line has a stable `metric=... duration_us=...` prefix:
 | `frame-draw` | Software painting, including text shaping/rasterization. |
 | `frame-blit` | RGBA-to-Wayland ARGB conversion/copy. |
 | `frame-render` | Layout + draw + blit. |
-| `frame-total` | Render/allocation through Wayland commit. |
+| `frame-total` | Render/allocation through Wayland commit. `cause` is the first change folded into the frame; `damage` is `full` or the `WxH` of the region handed to the compositor. |
 | `frame-idle-gap` | Time since this output's previous frame (0 for its first). Also carries the frame's work counters: `text_shapes` (strings shaped from scratch), `text_cache_hits`, `glyph_pixels` (coverage pixels blended). |
 | `click-to-command-queue` | Pointer press received through command fan-out. |
 | `workspace-input-to-commit` | Workspace press through the matching Hyprland state and Tablero buffer commit. |
@@ -175,6 +175,44 @@ The probe does not exercise the compositor or the input path. The live-bar
 `TABLERO_PERF` run over at least 30 samples per profile is still required to
 close the acceptance criteria below; `frame-idle-gap` now lets those samples be
 split into cold and warm frames.
+
+## Redraw coalescing and damage
+
+A change no longer paints a frame by itself. It marks the output's bar dirty,
+and every dirty bar is painted once at the end of the loop dispatch that applied
+the change. Messages that arrive together — Hyprland's workspace, active-window
+and title events for one switch, or several producers waking on the same second —
+share one repaint per output instead of costing one each. `cause` on the frame
+metrics names the first change folded into the frame.
+
+Each commit also requests a Wayland frame callback, and a dirty bar waits for it
+before painting again. That caps repaints at the output's refresh rate under a
+burst (a terminal retitling itself many times a second), and because a compositor
+sends no frame callbacks to a surface it is not showing, a bar hidden behind a
+fullscreen window stops painting and catches up with one frame when it is shown
+again. If a callback has not arrived within one second the bar paints anyway, so
+a lost callback cannot freeze it. The callback is requested only with a commit
+that carries damage, never on its own, so an idle bar still runs no frame loop.
+
+The buffer is always painted in full, which keeps both shared-memory slots
+complete frames, but the damage handed to the compositor is only the union of the
+bounds of the widgets that changed. When any widget's slot moved or resized, on a
+bar's first frame, after a reload, a scale change or a failed commit, the whole
+buffer is damaged. A clock tick on a 3840 px bar damages the clock's pill rather
+than the full strip, which is what bounds the compositor's blur and re-composite
+work for a bar over a blurred background.
+
+A 25-second live run on Hyprland (3840x76 buffer, balanced) committed 37 frames:
+29 with partial damage — 26 `active-window` frames at 615x60 and 3 `system`
+frames at 203x60, 13% and 4% of the buffer's pixels — and 8 start-up frames with
+full damage. Start-up frames followed each other 7 ms apart, so frame callbacks
+arrive at the refresh rate and the one-second fallback never fired.
+
+Coalescing and damage are covered by `tests/redraw_coalescing.rs` and the
+dashboard's pixel-diff test (every pixel that differs between two frames lies
+inside the reported damage). Their effect on the compositor is not visible in
+Tablero's own metrics; compare Hyprland's frame time with its damage-tracking
+overlay (`debug:damage_blink`) when validating on a live bar.
 
 ## Follow-up acceptance criteria
 

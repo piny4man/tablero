@@ -20,6 +20,7 @@ pub mod config;
 mod config_reload;
 pub mod icon;
 mod performance;
+pub mod redraw;
 pub mod render;
 pub mod scale;
 pub mod widget;
@@ -47,12 +48,13 @@ use std::time::{Duration, Instant};
 use crate::blit::write_argb8888;
 use crate::clock::millis_until_next_minute;
 use crate::config::{Config, WidgetKind};
+use crate::redraw::RedrawScheduler;
 use crate::render::{
     Bounds, RenderContext, RenderSettings, RenderStats, SharedFonts, shared_fonts,
 };
 use crate::scale::Scale;
 use crate::widget::{
-    ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
+    ClickButton, Command, Damage, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
     TrayMenuToggleKind, TrayMenuToggleState,
 };
 use calloop::EventLoop;
@@ -132,6 +134,8 @@ struct FrameTimings {
     /// idle (clocked-down CPU, evicted caches) from a warm one.
     idle_gap: Option<Duration>,
     stats: RenderStats,
+    /// The part of the buffer this frame changed.
+    damage: Damage,
 }
 
 /// One output's bar: its layer-shell surface plus the per-output render state.
@@ -176,8 +180,14 @@ struct Surface {
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
+    /// Whether a frame has been committed yet, for the startup metric.
+    presented: bool,
     /// Opt-in render timing diagnostics; disabled in the normal path.
     performance: PerformanceLogger,
+    /// Pending-repaint state: changes request a frame, [`Surface::flush`] paints it.
+    redraw: RedrawScheduler,
+    /// Retained to request a frame callback with each commit.
+    qh: QueueHandle<App>,
 }
 
 impl Surface {
@@ -249,7 +259,10 @@ impl Surface {
             next_buffer: 0,
             last_frame: None,
             configured: false,
+            presented: false,
             performance,
+            redraw: RedrawScheduler::new(),
+            qh: qh.clone(),
         }
     }
 
@@ -257,7 +270,7 @@ impl Surface {
     ///
     /// `seed` is replayed into the fresh dashboard so widgets keep the last
     /// producer snapshot instead of going blank until the next event.
-    fn apply_config(&mut self, config: Config, pool: &mut SlotPool, seed: &[Msg]) {
+    fn apply_config(&mut self, config: Config, seed: &[Msg]) {
         let height = config.height;
         let height_changed = self.height != height;
         if height_changed {
@@ -280,9 +293,7 @@ impl Surface {
         // Rebuild clears widget state; replay the last producer snapshots and
         // a fresh clock tick so the bar does not go empty until the next event.
         replay_snapshot(&mut self.dashboard, seed);
-        if self.configured {
-            self.draw(pool, "config-reload");
-        }
+        self.redraw.request("config-reload");
     }
 
     /// Whether this surface owns `wl_surface` — for routing pointer and scale
@@ -297,13 +308,14 @@ impl Surface {
         self.layer.wl_surface() == layer.wl_surface()
     }
 
-    /// Apply a message to the dashboard; redraw only if a widget reported a
-    /// visible change. This is the steady-state redraw policy: the loop stays
-    /// idle when an update changes nothing on screen.
-    fn handle(&mut self, msg: &Msg, pool: &mut SlotPool) -> bool {
+    /// Apply a message to the dashboard; request a repaint only if a widget
+    /// reported a visible change. This is the steady-state redraw policy: the
+    /// loop stays idle when an update changes nothing on screen, and a burst of
+    /// changes shares the one frame [`Surface::flush`] paints.
+    fn handle(&mut self, msg: &Msg) -> bool {
         let changed = self.dashboard.update(msg);
         if changed {
-            self.draw(pool, message_kind(msg));
+            self.redraw.request(message_kind(msg));
         }
         changed
     }
@@ -311,17 +323,17 @@ impl Surface {
     /// Adopt a new output buffer scale.
     ///
     /// Re-resolves the physical font size from this output's configuration so
-    /// text stays crisp at the new density, then repaints (once configured) so
-    /// the buffer is reallocated at the new physical size. A no-op when the scale
-    /// is unchanged.
-    fn set_scale(&mut self, scale: Scale, pool: &mut SlotPool) -> bool {
+    /// text stays crisp at the new density, then requests a repaint so the
+    /// buffer is reallocated at the new physical size. A no-op when the scale is
+    /// unchanged.
+    fn set_scale(&mut self, scale: Scale) -> bool {
         if self.scale == scale {
             return false;
         }
         self.scale = scale;
         self.ctx
             .set_settings(self.config.scaled_render_settings(scale));
-        self.draw(pool, "scale-change");
+        self.redraw.request("scale-change");
         true
     }
 
@@ -371,8 +383,8 @@ impl Surface {
             .tooltip_at((x * scale) as u32, (y * scale) as u32)
     }
 
-    /// Adopt the compositor's configure, seeding and drawing the first frame.
-    fn configure(&mut self, configure: LayerSurfaceConfigure, pool: &mut SlotPool) {
+    /// Adopt the compositor's configure, seeding and requesting the first frame.
+    fn configure(&mut self, configure: LayerSurfaceConfigure) {
         // A zero dimension means "you decide"; keep our current value.
         if configure.new_size.0 != 0 {
             self.width = configure.new_size.0;
@@ -385,22 +397,36 @@ impl Surface {
         self.configured = true;
         if first {
             // Lifecycle-forced frame: seed the clock so the bar shows the time
-            // immediately, then draw regardless of the dirty flag.
+            // immediately, then paint whether or not anything changed.
             self.dashboard.update(&Msg::tick_now());
-            self.draw(pool, "configure");
+            self.redraw.request("configure");
+        }
+    }
+
+    /// Paint the requested frame, if there is one and the compositor is ready for
+    /// it. Returns whether a frame was committed.
+    ///
+    /// The host loop calls this once per dispatch, after every pending message
+    /// has been applied, so however many changes arrived they share one repaint.
+    /// Nothing is painted before the first configure (drawing earlier is invalid
+    /// per the layer-shell protocol) or while the previous commit's frame
+    /// callback is outstanding; the request stays pending in both cases.
+    fn flush(&mut self, pool: &mut SlotPool) -> bool {
+        if !self.configured {
+            return false;
+        }
+        match self.redraw.take_due(Instant::now()) {
+            Some(cause) => self.draw(pool, cause),
+            None => false,
         }
     }
 
     /// Render the current dashboard state and commit it through the app's shared
-    /// shared-memory pool. Called on a visible change or when the Wayland
-    /// lifecycle (first configure, resize) requires a fresh frame regardless.
+    /// shared-memory pool. Returns whether the frame was committed.
     ///
     /// Uses two alternating SHM slots: when the compositor has released the
     /// next slot, its mmap is reused instead of allocating a new one.
-    fn draw(&mut self, pool: &mut SlotPool, cause: &'static str) {
-        if !self.configured {
-            return;
-        }
+    fn draw(&mut self, pool: &mut SlotPool, cause: &'static str) -> bool {
         let started = self.performance.start();
 
         // Logical surface dimensions scale up to the physical buffer the
@@ -412,6 +438,8 @@ impl Surface {
         if self.buffer_px != (width, height) {
             self.buffers = [None, None];
             self.buffer_px = (width, height);
+            // Nothing on screen matches a buffer of another size.
+            self.dashboard.invalidate();
         }
 
         let idx = self.next_buffer;
@@ -432,20 +460,28 @@ impl Surface {
         } else {
             self.paint_new_buffer(pool, idx, width, height, stride)
         };
-        let committed = timings.is_some() && self.commit_buffer(idx, width, height);
+        let damage = timings.as_ref().map(|timings| timings.damage);
+        let committed = damage.is_some_and(|damage| self.commit_buffer(idx, width, height, damage));
+        if !committed {
+            // The compositor never saw this frame, so the next one cannot be
+            // described as a change relative to it.
+            self.dashboard.invalidate();
+        }
         let total_elapsed = started.map(|started| started.elapsed());
         let output = self.monitor.as_deref().unwrap_or("unknown");
         self.performance.record_duration(
             "frame-total",
             total_elapsed,
             format_args!(
-                "cause={cause} output={output} width={width} height={height} reused={can_reuse} committed={committed}"
+                "cause={cause} output={output} width={width} height={height} reused={can_reuse} committed={committed} damage={}",
+                damage.map_or_else(|| "none".to_owned(), damage_label)
             ),
         );
         if let Some(timings) = timings {
             self.record_frame_timings(timings, cause, width, height);
         }
-        if cause == "configure" && committed {
+        if committed && !self.presented {
+            self.presented = true;
             self.performance.record_process_elapsed(
                 "startup-to-first-commit",
                 format_args!(
@@ -454,6 +490,7 @@ impl Surface {
                 ),
             );
         }
+        committed
     }
 
     fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
@@ -468,6 +505,7 @@ impl Surface {
 
         let phase_started = self.performance.start();
         self.dashboard.layout(&mut self.ctx, width, height);
+        let damage = self.dashboard.take_damage();
         let layout = phase_started.map(|started| started.elapsed());
 
         let phase_started = self.performance.start();
@@ -486,6 +524,7 @@ impl Surface {
             idle_gap,
             // Taken even when diagnostics are off so the counters never wrap.
             stats: self.ctx.take_stats(),
+            damage,
         }
     }
 
@@ -548,7 +587,11 @@ impl Surface {
         Some(timings)
     }
 
-    fn commit_buffer(&mut self, idx: usize, width: u32, height: u32) -> bool {
+    /// Attach slot `idx` and commit it, damaging only what `damage` covers so the
+    /// compositor re-composites (and re-blurs) just that part of the strip. The
+    /// buffer itself is always painted in full, so either slot is a complete
+    /// frame whichever the compositor shows.
+    fn commit_buffer(&mut self, idx: usize, width: u32, height: u32, damage: Damage) -> bool {
         let Some(buffer) = self.buffers[idx].as_ref() else {
             return false;
         };
@@ -556,13 +599,42 @@ impl Surface {
         // Tell the compositor the buffer holds `scale`× physical pixels per
         // logical pixel, so it maps the larger buffer back to the logical size.
         surface.set_buffer_scale(self.scale.get() as i32);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
+        let (x, y, w, h) = damage_rect(damage, width, height);
+        surface.damage_buffer(x, y, w, h);
         if let Err(e) = buffer.attach_to(surface) {
             error!("failed to attach buffer: {e}");
             return false;
         }
+        // Ask to be told when this frame has been shown; repaints wait for it.
+        surface.frame(&self.qh, surface.clone());
         self.layer.commit();
+        self.redraw.committed(Instant::now());
         true
+    }
+}
+
+/// `damage` as a `wl_surface.damage_buffer` rectangle, clipped to the buffer.
+fn damage_rect(damage: Damage, width: u32, height: u32) -> (i32, i32, i32, i32) {
+    let full = Bounds::new(0, 0, width, height);
+    let region = match damage {
+        Damage::Full => full,
+        Damage::Region(region) => region,
+    };
+    let x = region.x.min(width);
+    let y = region.y.min(height);
+    let w = region.width.min(width - x);
+    let h = region.height.min(height - y);
+    if w == 0 || h == 0 {
+        // A change that paints nothing visible still has to present the buffer.
+        return (0, 0, width as i32, height as i32);
+    }
+    (x as i32, y as i32, w as i32, h as i32)
+}
+
+fn damage_label(damage: Damage) -> String {
+    match damage {
+        Damage::Full => "full".to_owned(),
+        Damage::Region(region) => format!("{}x{}", region.width, region.height),
     }
 }
 
@@ -957,8 +1029,10 @@ struct App {
     producer_snapshot: ProducerSnapshot,
     /// Opt-in latency diagnostics shared with surfaces and popups.
     performance: PerformanceLogger,
-    /// Workspace click awaiting the matching Hyprland state and bar commit.
+    /// Workspace click awaiting the matching Hyprland state.
     pending_workspace: Option<PendingWorkspace>,
+    /// Workspace click whose state has arrived, awaiting the bar commit.
+    committing_workspace: Option<PendingWorkspace>,
     exit: bool,
 }
 
@@ -1115,7 +1189,7 @@ impl App {
             .collect();
         for (id, resolved) in reloads {
             if let Some(surface) = self.outputs.get_mut(id) {
-                surface.apply_config(resolved, &mut self.pool, &seed);
+                surface.apply_config(resolved, &seed);
             }
         }
         info!("config reloaded");
@@ -1156,14 +1230,14 @@ impl App {
         }
     }
 
-    /// Fan a message out to every output's dashboard, redrawing the ones that
-    /// changed. The clock timer and every producer reach all bars this way.
+    /// Fan a message out to every output's dashboard; the ones that changed
+    /// repaint at the next [`App::flush_redraws`]. The clock timer and every
+    /// producer reach all bars this way.
     fn handle_all(&mut self, msg: &Msg) {
         self.producer_snapshot.note(msg);
-        let App { pool, outputs, .. } = self;
         let mut changed = false;
-        for surface in outputs.values_mut() {
-            changed |= surface.handle(msg, pool);
+        for surface in self.outputs.values_mut() {
+            changed |= surface.handle(msg);
         }
         if changed && matches!(msg, Msg::PowerProfiles(_)) {
             self.hide_tooltip();
@@ -1177,7 +1251,19 @@ impl App {
                 )
             })
         {
-            let pending = self.pending_workspace.take().unwrap();
+            self.committing_workspace = self.pending_workspace.take();
+        }
+    }
+
+    /// Paint every bar with a repaint pending. Runs once per loop dispatch, after
+    /// all of that dispatch's messages and Wayland events have been applied.
+    fn flush_redraws(&mut self) {
+        let App { pool, outputs, .. } = self;
+        let mut committed = false;
+        for surface in outputs.values_mut() {
+            committed |= surface.flush(pool);
+        }
+        if committed && let Some(pending) = self.committing_workspace.take() {
             self.performance.record_since(
                 "workspace-input-to-commit",
                 pending.started,
@@ -1594,6 +1680,7 @@ pub fn run_with_producers(
         producer_snapshot: ProducerSnapshot::default(),
         performance,
         pending_workspace: None,
+        committing_workspace: None,
         exit: false,
     };
 
@@ -1693,8 +1780,13 @@ pub fn run_with_producers(
         Some(bridge)
     };
 
+    // A configure handled during the roundtrip above has a frame waiting.
+    app.flush_redraws();
+
     let signal = event_loop.get_signal();
     event_loop.run(None, &mut app, move |app| {
+        // Requests made here go out before the loop next sleeps.
+        app.flush_redraws();
         if app.exit {
             info!("all surfaces closed; shutting down");
             signal.stop();
@@ -1715,7 +1807,6 @@ impl CompositorHandler for App {
         // The compositor reports a surface's preferred integer buffer scale.
         // Route it to the owning bar so each output renders at its own density.
         let App {
-            pool,
             outputs,
             tooltip,
             tray_menu,
@@ -1725,7 +1816,7 @@ impl CompositorHandler for App {
         let changed_output = outputs
             .values_mut()
             .find(|bar| bar.owns(surface))
-            .and_then(|bar| bar.set_scale(scale, pool).then_some(bar.output_id));
+            .and_then(|bar| bar.set_scale(scale).then_some(bar.output_id));
         if tooltip.as_ref().is_some_and(|shown| {
             (shown.owns_surface(surface) && shown.scale != scale)
                 || changed_output == Some(shown.output_id)
@@ -1753,11 +1844,15 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // We never request frame callbacks: redraws are driven solely by the
-        // tick timer, which keeps the loop free of a busy redraw cycle.
+        // Requested only alongside a commit, so this never becomes a redraw
+        // cycle: it releases the repaint (if any) that waited for this frame,
+        // which the loop's post-dispatch flush then paints.
+        if let Some(bar) = self.outputs.values_mut().find(|bar| bar.owns(surface)) {
+            bar.redraw.frame_done();
+        }
     }
 
     fn surface_enter(
@@ -1841,9 +1936,8 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let App { pool, outputs, .. } = self;
-        if let Some(bar) = outputs.values_mut().find(|bar| bar.is_layer(layer)) {
-            bar.configure(configure, pool);
+        if let Some(bar) = self.outputs.values_mut().find(|bar| bar.is_layer(layer)) {
+            bar.configure(configure);
         }
     }
 }
@@ -2388,6 +2482,33 @@ mod scroll_tests {
             popup_background((0x30, 0x32, 0x38, 0xD0)),
             (0x30, 0x32, 0x38, 0xF0)
         );
+    }
+
+    #[test]
+    fn full_damage_covers_the_whole_buffer() {
+        assert_eq!(damage_rect(Damage::Full, 3840, 76), (0, 0, 3840, 76));
+    }
+
+    #[test]
+    fn region_damage_is_passed_through_in_buffer_pixels() {
+        let region = Damage::Region(Bounds::new(3600, 8, 200, 60));
+        assert_eq!(damage_rect(region, 3840, 76), (3600, 8, 200, 60));
+    }
+
+    #[test]
+    fn region_damage_is_clipped_to_the_buffer() {
+        let region = Damage::Region(Bounds::new(3800, 70, 200, 60));
+        assert_eq!(damage_rect(region, 3840, 76), (3800, 70, 40, 6));
+    }
+
+    #[test]
+    fn an_empty_or_offscreen_region_falls_back_to_full_damage() {
+        for region in [Bounds::new(10, 10, 0, 20), Bounds::new(5000, 0, 10, 10)] {
+            assert_eq!(
+                damage_rect(Damage::Region(region), 3840, 76),
+                (0, 0, 3840, 76)
+            );
+        }
     }
 }
 
