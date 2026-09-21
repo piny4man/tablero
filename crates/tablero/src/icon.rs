@@ -28,7 +28,7 @@ use builtin_icon_paths::{Cmd, ICONS, RawIcon};
 /// [`BatteryCharging`](BuiltinIcon::BatteryCharging) while charging, a volume
 /// control picks a level); the concrete vector art each maps to is an
 /// implementation detail resolved by its private `stem` mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinIcon {
     /// The clock readout's leading icon.
     Clock,

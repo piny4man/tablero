@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 use crate::blit::write_argb8888;
 use crate::clock::millis_until_next_minute;
 use crate::config::{Config, WidgetKind};
-use crate::render::{Bounds, RenderContext, RenderSettings, SharedFonts, shared_fonts};
+use crate::render::{
+    Bounds, RenderContext, RenderSettings, RenderStats, SharedFonts, shared_fonts,
+};
 use crate::scale::Scale;
 use crate::widget::{
     ClickButton, Command, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
@@ -126,6 +128,10 @@ struct FrameTimings {
     draw: Option<Duration>,
     blit: Option<Duration>,
     render: Option<Duration>,
+    /// Time since this surface last painted. Separates a cold frame after a long
+    /// idle (clocked-down CPU, evicted caches) from a warm one.
+    idle_gap: Option<Duration>,
+    stats: RenderStats,
 }
 
 /// One output's bar: its layer-shell surface plus the per-output render state.
@@ -165,6 +171,8 @@ struct Surface {
     buffer_px: (u32, u32),
     /// Next double-buffer index to try (0 or 1).
     next_buffer: usize,
+    /// When diagnostics are enabled, the start of the previous painted frame.
+    last_frame: Option<Instant>,
     /// Set once the first configure has been received; drawing before that is
     /// invalid per the layer-shell protocol.
     configured: bool,
@@ -239,6 +247,7 @@ impl Surface {
             buffers: [None, None],
             buffer_px: (0, 0),
             next_buffer: 0,
+            last_frame: None,
             configured: false,
             performance,
         }
@@ -449,6 +458,12 @@ impl Surface {
 
     fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
         let started = self.performance.start();
+        // Zero for a surface's first frame, so its counters are still logged.
+        let idle_gap = started.map(|now| {
+            self.last_frame
+                .map_or(Duration::ZERO, |last| now.duration_since(last))
+        });
+        self.last_frame = started;
         self.ctx.resize(width, height);
 
         let phase_started = self.performance.start();
@@ -468,6 +483,9 @@ impl Surface {
             draw,
             blit,
             render,
+            idle_gap,
+            // Taken even when diagnostics are off so the counters never wrap.
+            stats: self.ctx.take_stats(),
         }
     }
 
@@ -491,6 +509,18 @@ impl Surface {
                 format_args!("cause={cause} output={output} width={width} height={height}"),
             );
         }
+        let RenderStats {
+            text_shapes,
+            text_cache_hits,
+            glyph_pixels,
+        } = timings.stats;
+        self.performance.record_duration(
+            "frame-idle-gap",
+            timings.idle_gap,
+            format_args!(
+                "cause={cause} output={output} text_shapes={text_shapes} text_cache_hits={text_cache_hits} glyph_pixels={glyph_pixels}"
+            ),
+        );
     }
 
     fn paint_new_buffer(

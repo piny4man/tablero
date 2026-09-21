@@ -27,6 +27,7 @@ Each line has a stable `metric=... duration_us=...` prefix:
 | `frame-blit` | RGBA-to-Wayland ARGB conversion/copy. |
 | `frame-render` | Layout + draw + blit. |
 | `frame-total` | Render/allocation through Wayland commit. |
+| `frame-idle-gap` | Time since this output's previous frame (0 for its first). Also carries the frame's work counters: `text_shapes` (strings shaped from scratch), `text_cache_hits`, `glyph_pixels` (coverage pixels blended). |
 | `click-to-command-queue` | Pointer press received through command fan-out. |
 | `workspace-input-to-commit` | Workspace press through the matching Hyprland state and Tablero buffer commit. |
 | `tooltip-input-to-commit` | Hover event through the tooltip's first buffer commit. |
@@ -126,6 +127,54 @@ and remain unresolved. Crabture has no equivalent measurement mode, so its
 opening and area-selection comparison also remains unresolved. The next needed
 measurement is the external input-to-presentation run in step 4, correlated with
 these application-side metrics.
+
+## Frame-cost fixes: 2026-09-20
+
+Same hardware, config, and 3840×76 buffer as the baseline, measured offscreen
+with the `frame-cost` example so both revisions paint identical input with no
+second bar on screen:
+
+```sh
+cargo run --release -p tablero --example frame-cost -- ~/.config/tablero/config.toml 2 500
+```
+
+The third argument sleeps 500 ms between frames, so every sample is the cold
+burst after idle that a live bar paints, not a clocked-up tight loop. 40 frames
+per cell (the cold first frame excluded), `frame-render` median / p95 in ms:
+
+| Profile | `main` (`3f2c0ad`) | This change | p95 speed-up |
+| --- | ---: | ---: | ---: |
+| performance | 9.110 / 11.456 | 1.214 / 1.527 | 7.5× |
+| balanced | 12.654 / 14.947 | 2.052 / 2.708 | 5.5× |
+| power-saver | 30.823 / 32.103 | 3.304 / 3.496 | 9.2× |
+
+Back to back (no idle, 200 frames) the change renders in 0.89 ms median in
+performance and 1.12 ms in power-saver, against 8.86 ms and 11.27 ms.
+
+What changed, in order of effect:
+
+- Glyph coverage is blended straight into the pixmap. It used to be one
+  `tiny_skia::fill_rect` — a paint and a raster pipeline — per coverage pixel,
+  transparent ones included: text was ~6.6 ms of the 8.6 ms draw and is now
+  ~0.01 ms.
+- `tiny-skia`, `cosmic-text`, `swash`, `zeno` and `harfrust` build at
+  `opt-level = 3` while the rest of the graph stays at `"z"`. Render 2.21 →
+  0.98 ms for +322 KB of binary (4.98 → 5.30 MB).
+- Shaped strings are cached per render context (bounded, dropped on a font
+  change), so layout and draw share one shaping and an unchanged label is never
+  re-shaped: steady `frame-layout` 0.028 → 0.003 ms, and only the strings that
+  actually changed show up in `text_shapes`.
+- Built-in icons are rasterised once per (icon, size, color) and composited:
+  0.13 → ~0.05 ms per frame.
+
+The remaining ~0.6 ms of draw is the background fill and the widgets' pill
+fills and strokes. The first frame after start costs 45–60 ms (font faces load
+and every label shapes from cold); that is startup, not interaction latency.
+
+The probe does not exercise the compositor or the input path. The live-bar
+`TABLERO_PERF` run over at least 30 samples per profile is still required to
+close the acceptance criteria below; `frame-idle-gap` now lets those samples be
+split into cold and warm frames.
 
 ## Follow-up acceptance criteria
 
