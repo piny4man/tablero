@@ -1542,8 +1542,10 @@ mod tests {
             panic!("fixed slots should give partial damage, got {damage:?}");
         };
         let differing: Vec<(u32, u32)> = before
-            .chunks_exact(4)
-            .zip(after.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks::<4>().0)
             .enumerate()
             .filter(|(_, (before, after))| before != after)
             .map(|(i, _)| (i as u32 % 400, i as u32 / 400))
