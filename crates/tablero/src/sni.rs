@@ -859,13 +859,17 @@ async fn connect_and_register() -> zbus::Result<(Connection, StatusNotifierWatch
 /// [`TrayState`], which is cheap relative to the change rate and keeps dynamic
 /// item set correct without bespoke per-item bookkeeping. A low-cost periodic
 /// membership check recovers missed or closed signal streams without repeatedly
-/// decoding unchanged icon pixmaps. Startup is retried until the session bus
+/// decoding unchanged icon pixmaps; it runs rarely while the watcher's signals
+/// are flowing and often only once they are known to be lost. Startup is retried until the session bus
 /// and watcher are usable — failing here would leave the tray dead for the
 /// whole session when the bar starts before the bus is ready. Returns `Ok(())`
 /// once the render loop drops its receiver.
 async fn run(tx: MsgSender) -> ProducerResult {
     const RETRY_DELAY: Duration = Duration::from_secs(1);
+    /// Membership check cadence without the watcher's lifecycle signals.
     const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+    /// The same check as a net under signals that are arriving normally.
+    const SIGNALLED_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
     let (conn, watcher) = loop {
         match connect_and_register().await {
@@ -901,8 +905,10 @@ async fn run(tx: MsgSender) -> ProducerResult {
     loop {
         let delay = if needs_retry {
             RETRY_DELAY
-        } else {
+        } else if lifecycle_closed {
             RECONCILE_INTERVAL
+        } else {
+            SIGNALLED_RECONCILE_INTERVAL
         };
         let wake = wait_for_sni_change(&mut lifecycle, &mut changes, delay).await;
         let mut rebuild_changes = matches!(wake, SniWake::Item(None));

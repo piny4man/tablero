@@ -1,6 +1,14 @@
-//! Native Hypridle process discovery, polling, and state control.
+//! Native Hypridle process discovery, watching, and state control.
+//!
+//! Finding hypridle means scanning the process table, which is too much to do
+//! every couple of seconds for a state that changes a few times a day. So the
+//! scan only runs while hypridle is *not* running, at a slow cadence; once a
+//! process is found the producer holds a pidfd on it and sleeps until the kernel
+//! reports its exit.
 
+use std::fs;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,7 +18,8 @@ use log::warn;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use tokio::fs;
+use rustix::process::{PidfdFlags, pidfd_open};
+use tokio::io::unix::AsyncFd;
 use tokio::process::Command as TokioCommand;
 use tokio::time;
 
@@ -20,7 +29,10 @@ use crate::widget::{Command, Hypridle, Msg};
 
 const PROC_ROOT: &str = "/proc";
 const HYPRIDLE_EXECUTABLE: &str = "hypridle";
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the process table is scanned while hypridle is not running — the
+/// longest an instance started outside the bar goes unnoticed. Configurable per
+/// widget as `interval`.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -40,31 +52,32 @@ fn required_action(active: bool, desired: bool) -> HypridleAction {
 }
 
 /// Find same-user processes whose kernel command name is exactly `hypridle`.
-async fn discover_hypridle_processes(root: &Path) -> io::Result<Vec<i32>> {
+///
+/// Deliberately synchronous: `/proc` is memory-backed, so a walk takes a
+/// millisecond or two, whereas `tokio::fs` would hand each of its hundreds of
+/// reads to the blocking pool and wake two threads apiece.
+fn discover_hypridle_processes(root: &Path) -> io::Result<Vec<i32>> {
     let current_uid = fs::metadata(root.join("self"))
-        .await
-        .or_else(|_| std::fs::metadata(root))?
+        .or_else(|_| fs::metadata(root))?
         .uid();
-    let mut entries = fs::read_dir(root).await?;
     let mut pids = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
             continue;
         };
-        let Ok(pid) = name.parse::<i32>() else {
-            continue;
-        };
-        let path = entry.path();
-        let Ok(metadata) = entry.metadata().await else {
-            continue;
-        };
-        if metadata.uid() != current_uid {
+        if !is_hypridle(root, pid) {
             continue;
         }
-        let Ok(comm) = fs::read_to_string(path.join("comm")).await else {
-            continue;
-        };
-        if comm.trim_end() == HYPRIDLE_EXECUTABLE {
+        // Checked last: almost no process gets this far, so almost none is stat'ed.
+        if entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.uid() == current_uid)
+        {
             pids.push(pid);
         }
     }
@@ -72,22 +85,96 @@ async fn discover_hypridle_processes(root: &Path) -> io::Result<Vec<i32>> {
     Ok(pids)
 }
 
-async fn active(root: &Path) -> io::Result<bool> {
-    Ok(!discover_hypridle_processes(root).await?.is_empty())
+fn active(root: &Path) -> io::Result<bool> {
+    Ok(!discover_hypridle_processes(root)?.is_empty())
 }
 
-/// Lightweight process poller used only when the Hypridle widget is configured.
+/// Remembers the hypridle process last seen, so that confirming it is still
+/// there costs one small read instead of a walk over every process.
+#[derive(Debug, Default)]
+struct Tracker {
+    pid: Option<i32>,
+    /// A process seen to exit but still listed: a zombie awaiting its parent. It
+    /// is not running, and its pidfd would report the same exit forever.
+    exited: Option<i32>,
+}
+
+impl Tracker {
+    fn active(&mut self, root: &Path) -> io::Result<bool> {
+        if let Some(pid) = self.pid
+            && is_hypridle(root, pid)
+        {
+            return Ok(true);
+        }
+        let pids = discover_hypridle_processes(root)?;
+        self.exited = self.exited.filter(|exited| pids.contains(exited));
+        self.pid = pids.into_iter().find(|pid| Some(*pid) != self.exited);
+        Ok(self.pid.is_some())
+    }
+
+    /// Wait until the state may have changed: for the tracked process to exit,
+    /// or, with none to track, for the next scan to be due.
+    async fn changed(&mut self, interval: Duration) {
+        match self.pid.map(ProcessExit::watch) {
+            Some(Ok(exit)) => {
+                exit.wait().await;
+                self.exited = self.pid.take();
+            }
+            Some(Err(error)) => {
+                // Already gone is the ordinary case and worth a prompt rescan;
+                // anything else (no pidfd support) falls back to polling.
+                if error.kind() != io::ErrorKind::NotFound {
+                    time::sleep(interval).await;
+                }
+            }
+            None => time::sleep(interval).await,
+        }
+    }
+}
+
+fn is_hypridle(root: &Path, pid: i32) -> bool {
+    fs::read_to_string(root.join(pid.to_string()).join("comm"))
+        .is_ok_and(|comm| comm.trim_end() == HYPRIDLE_EXECUTABLE)
+}
+
+/// A process's exit as an awaitable event: a pidfd becomes readable when the
+/// process terminates, so nothing runs until then.
+struct ProcessExit(AsyncFd<OwnedFd>);
+
+impl ProcessExit {
+    fn watch(pid: i32) -> io::Result<Self> {
+        let pid = rustix::process::Pid::from_raw(pid)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let fd = pidfd_open(pid, PidfdFlags::NONBLOCK).map_err(|errno| match errno {
+            rustix::io::Errno::SRCH => io::Error::from(io::ErrorKind::NotFound),
+            errno => io::Error::from(errno),
+        })?;
+        AsyncFd::new(fd).map(Self)
+    }
+
+    async fn wait(self) {
+        // An error here means the reactor is going away; either way stop waiting.
+        let _ = self.0.readable().await;
+    }
+}
+
+/// Lightweight process watcher used only when the Hypridle widget is configured.
 pub struct HypridleProducer {
     root: PathBuf,
     interval: Duration,
 }
 
 impl HypridleProducer {
-    /// Poll the session's process table every two seconds.
+    /// Watch the session's process table, scanning at the default cadence.
     pub fn new() -> Self {
+        Self::with_interval(DEFAULT_INTERVAL)
+    }
+
+    /// Scan for a not-yet-running hypridle every `interval`.
+    pub fn with_interval(interval: Duration) -> Self {
         Self {
             root: PathBuf::from(PROC_ROOT),
-            interval: POLL_INTERVAL,
+            interval,
         }
     }
 }
@@ -110,8 +197,9 @@ impl Producer for HypridleProducer {
 
 async fn run_producer(root: PathBuf, interval: Duration, tx: MsgSender) -> ProducerResult {
     let mut previous = None;
+    let mut tracker = Tracker::default();
     loop {
-        let next = match active(&root).await {
+        let next = match tracker.active(&root) {
             Ok(active) => active,
             Err(error) => {
                 warn!("hypridle: reading process state failed: {error}");
@@ -125,7 +213,7 @@ async fn run_producer(root: PathBuf, interval: Duration, tx: MsgSender) -> Produ
                 return Ok(());
             }
         }
-        time::sleep(interval).await;
+        tracker.changed(interval).await;
     }
 }
 
@@ -143,7 +231,7 @@ fn signal_stop(pids: &[i32]) -> io::Result<()> {
 async fn wait_until_stopped(root: &Path) -> io::Result<bool> {
     let deadline = time::Instant::now() + STOP_TIMEOUT;
     loop {
-        if !active(root).await? {
+        if !active(root)? {
             return Ok(false);
         }
         if time::Instant::now() >= deadline {
@@ -154,7 +242,7 @@ async fn wait_until_stopped(root: &Path) -> io::Result<bool> {
 }
 
 async fn set_state(root: &Path, executable: &Path, desired: bool) -> io::Result<bool> {
-    let pids = discover_hypridle_processes(root).await?;
+    let pids = discover_hypridle_processes(root)?;
     match required_action(!pids.is_empty(), desired) {
         HypridleAction::None => Ok(desired),
         HypridleAction::Start => {
@@ -188,7 +276,7 @@ pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> 
             Ok(state) => state,
             Err(error) => {
                 warn!("hypridle: setting active={desired} failed: {error}");
-                match active(Path::new(PROC_ROOT)).await {
+                match active(Path::new(PROC_ROOT)) {
                     Ok(state) => state,
                     Err(refresh_error) => {
                         warn!("hypridle: refreshing after command failed: {refresh_error}");
@@ -208,7 +296,11 @@ pub async fn run_commands(mut commands: CommandReceiver, updates: MsgSender) -> 
 mod tests {
     use std::fs;
 
-    use super::{HypridleAction, discover_hypridle_processes, required_action};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        HypridleAction, ProcessExit, Tracker, discover_hypridle_processes, required_action,
+    };
 
     fn process(root: &std::path::Path, pid: i32, name: &str) {
         let path = root.join(pid.to_string());
@@ -218,30 +310,24 @@ mod tests {
 
     #[test]
     fn discovery_matches_exact_same_user_process_names() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("self")).unwrap();
         process(root.path(), 42, "hypridle");
         process(root.path(), 43, "hypridle-helper");
         process(root.path(), 44, "Hypridle");
 
-        let pids = runtime
-            .block_on(discover_hypridle_processes(root.path()))
-            .unwrap();
+        let pids = discover_hypridle_processes(root.path()).unwrap();
         assert_eq!(pids, vec![42]);
     }
 
     #[test]
     fn discovery_ignores_non_process_entries_and_missing_comm_files() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("self")).unwrap();
         fs::create_dir(root.path().join("51")).unwrap();
         process(root.path(), 52, "hypridle");
 
-        let pids = runtime
-            .block_on(discover_hypridle_processes(root.path()))
-            .unwrap();
+        let pids = discover_hypridle_processes(root.path()).unwrap();
         assert_eq!(pids, vec![52]);
     }
 
@@ -251,5 +337,96 @@ mod tests {
         assert_eq!(required_action(true, true), HypridleAction::None);
         assert_eq!(required_action(false, true), HypridleAction::Start);
         assert_eq!(required_action(true, false), HypridleAction::Stop);
+    }
+
+    #[test]
+    fn a_tracked_process_is_confirmed_without_rescanning() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("self")).unwrap();
+        process(root.path(), 42, "hypridle");
+        let mut tracker = Tracker::default();
+        assert!(tracker.active(root.path()).unwrap());
+        assert_eq!(tracker.pid, Some(42));
+
+        // A scan would now fail outright; only the remembered pid is consulted.
+        fs::remove_dir(root.path().join("self")).unwrap();
+        process(root.path(), 7, "hypridle");
+        assert!(tracker.active(root.path()).unwrap());
+        assert_eq!(tracker.pid, Some(42));
+    }
+
+    #[test]
+    fn a_vanished_or_recycled_pid_falls_back_to_a_scan() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("self")).unwrap();
+        process(root.path(), 42, "hypridle");
+        let mut tracker = Tracker::default();
+        assert!(tracker.active(root.path()).unwrap());
+
+        // The pid now belongs to something else, and hypridle runs elsewhere.
+        fs::write(root.path().join("42/comm"), "bash\n").unwrap();
+        process(root.path(), 99, "hypridle");
+        assert!(tracker.active(root.path()).unwrap());
+        assert_eq!(tracker.pid, Some(99));
+
+        fs::remove_dir_all(root.path().join("99")).unwrap();
+        assert!(!tracker.active(root.path()).unwrap());
+        assert_eq!(tracker.pid, None);
+    }
+
+    #[test]
+    fn an_exited_process_still_listed_as_a_zombie_is_not_running() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("self")).unwrap();
+        process(root.path(), 42, "hypridle");
+        let mut tracker = Tracker {
+            pid: None,
+            exited: Some(42),
+        };
+        assert!(!tracker.active(root.path()).unwrap());
+
+        // Once reaped it is forgotten, so a later reuse of the pid counts.
+        fs::remove_dir_all(root.path().join("42")).unwrap();
+        assert!(!tracker.active(root.path()).unwrap());
+        process(root.path(), 42, "hypridle");
+        assert!(tracker.active(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_process_exit_ends_the_wait_without_polling() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+
+        runtime.block_on(async {
+            let exit = ProcessExit::watch(pid).unwrap();
+            let waiting = tokio::spawn(exit.wait());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished(), "still running");
+
+            let killed = Instant::now();
+            child.kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("exit observed")
+                .unwrap();
+            assert!(killed.elapsed() < Duration::from_secs(1));
+        });
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn watching_a_process_that_is_already_gone_reports_not_found() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        let error = runtime
+            .block_on(async { ProcessExit::watch(pid).map(|_| ()) })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }

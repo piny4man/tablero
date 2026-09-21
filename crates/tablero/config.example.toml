@@ -98,6 +98,8 @@ border-width = 1
 radius = 2
 padding = 6
 format = "{icon} {count}"
+# Seconds between checks (default 300). Read at startup.
+# interval = 300
 # on-click = "/path/to/update-system"
 
 [widget.notifications]
@@ -181,6 +183,8 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+# Seconds between CPU/memory samples (default 3). Read at startup.
+# interval = 3
 
 [widget.clock]
 background = "#1c0e1ee8"
@@ -224,6 +228,8 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 10
+# Seconds between scans for a hypridle started outside the bar (default 10).
+# interval = 10
 
 # Direct executable launches (no shell): left opens the logout menu, right locks.
 # Absolute paths avoid PATH surprises when tablero is started from autostart.

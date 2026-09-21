@@ -71,6 +71,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
@@ -105,6 +106,8 @@ const MIN_FONT_SIZE: f32 = 1.0;
 const MAX_FONT_SIZE: f32 = 512.0;
 /// Largest accepted widget spacing/padding, in pixels.
 const MAX_GAP: u32 = 4096;
+/// Longest accepted widget sampling interval, in seconds (one day).
+const MAX_INTERVAL_SECS: u64 = 86_400;
 
 /// An RGBA color, parsed from a `"#rrggbb"` (opaque) or `"#rrggbbaa"` hex string.
 ///
@@ -416,6 +419,10 @@ pub struct WidgetStyleConfig {
     /// for `tablero-qc71-set-mode`, then `qc71-set-mode`.
     #[serde(rename = "hardware-helper")]
     pub hardware_helper: Option<String>,
+    /// Seconds between samples for the polled widgets (system, updates,
+    /// hypridle). Absent keeps each widget's default. One producer feeds every
+    /// output, so only the top-level table is read, and only at startup.
+    pub interval: Option<u64>,
 }
 
 /// The two Waybar-style shapes accepted by `format-icons`.
@@ -426,6 +433,13 @@ pub enum FormatIconsConfig {
     Ramp(Vec<String>),
     /// Named state icons, used by power-profiles-daemon.
     Named(BTreeMap<String, String>),
+}
+
+impl WidgetStyleConfig {
+    /// The configured sampling interval, or `None` for the widget's default.
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval.map(Duration::from_secs)
+    }
 }
 
 impl FormatIconsConfig {
@@ -554,6 +568,9 @@ impl WidgetStyleConfig {
         }
         if self.hardware_helper.is_some() {
             base.hardware_helper = self.hardware_helper.clone();
+        }
+        if self.interval.is_some() {
+            base.interval = self.interval;
         }
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
@@ -1011,6 +1028,9 @@ impl Config {
             &self.widget.power_profiles_daemon,
         )?;
         validate_updates_config("widget.updates", &self.widget.updates)?;
+        validate_interval("widget.system", &self.widget.system)?;
+        validate_interval("widget.updates", &self.widget.updates)?;
+        validate_interval("widget.hypridle", &self.widget.hypridle)?;
 
         for monitor in &self.monitors {
             if monitor.name.trim().is_empty() {
@@ -1260,6 +1280,15 @@ fn validate_updates_config(field: &str, config: &WidgetStyleConfig) -> Result<()
         validate_updates_format(format).map_err(|error| format!("{field}.format {error}"))?;
     }
     Ok(())
+}
+
+fn validate_interval(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    match config.interval {
+        Some(seconds) if !(1..=MAX_INTERVAL_SECS).contains(&seconds) => Err(format!(
+            "{field}.interval must be between 1 and {MAX_INTERVAL_SECS} seconds, got {seconds}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 impl WidgetKind {
@@ -2923,6 +2952,41 @@ mod tests {
         ] {
             let error = Config::from_toml_str(doc).unwrap_err().to_string();
             assert!(error.contains("power-profiles-daemon"), "message: {error}");
+        }
+    }
+
+    #[test]
+    fn a_widget_interval_is_optional_and_parsed_as_seconds() {
+        let config = Config::from_toml_str(
+            "[widget.system]\ninterval = 5\n[widget.updates]\ninterval = 86400",
+        )
+        .unwrap();
+        assert_eq!(
+            config.widget.system.interval(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            config.widget.updates.interval(),
+            Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(config.widget.hypridle.interval(), None);
+        assert_eq!(Config::default().widget.system.interval(), None);
+    }
+
+    #[test]
+    fn a_widget_interval_outside_one_second_to_one_day_is_rejected() {
+        for (table, value) in [
+            ("system", "0"),
+            ("updates", "0"),
+            ("hypridle", "0"),
+            ("system", "86401"),
+            ("system", "-1"),
+            ("system", "1.5"),
+            ("system", "\"2s\""),
+        ] {
+            let doc = format!("[widget.{table}]\ninterval = {value}");
+            let error = Config::from_toml_str(&doc).unwrap_err().to_string();
+            assert!(error.contains("interval"), "{doc}: {error}");
         }
     }
 

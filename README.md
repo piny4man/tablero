@@ -437,10 +437,30 @@ format = "{icon} {count}"
 ```
 
 Only `{count}` and `{icon}` are accepted in `format`. Checks run immediately and
-then every 300 seconds. A missing or failed `paru` command falls back to official
+then every 300 seconds, or every `interval` seconds when that is set. A missing or failed `paru` command falls back to official
 updates; a missing or failed `checkupdates` command hides the module rather than
 presenting a misleading partial total. Hovering the module lists each package's
 installed and available versions, grouped by official repositories and AUR.
+
+The polled modules take an optional `interval`, in whole seconds from 1 to
+86400. Every other module is event-driven and wakes only when its source
+changes, so these three are the ones worth slowing down on battery:
+
+```toml
+[widget.system]
+interval = 3    # CPU and memory sample; redraws only when a shown percent moves
+
+[widget.updates]
+interval = 300  # checkupdates / paru run
+
+[widget.hypridle]
+interval = 10   # scan for a hypridle started outside the bar; a running one is
+                # watched through its pidfd and costs nothing
+```
+
+The values shown are the defaults. `interval` is read from the top-level
+`[widget.*]` table when the bar starts; one producer feeds every output, so it
+has no per-monitor form and a change needs a restart.
 
 The backlight module has four module-specific fields:
 
@@ -670,9 +690,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
       hardware it should always reserve a slot and read `unavailable`; on a
       laptop with the adapter powered off it reads `off`.
     - Toggle the adapter with `bluetoothctl power on` / `bluetoothctl power
-      off` and confirm the label changes by the next poll (the producer
-      polls BlueZ every two seconds, so allow up to a couple of seconds
-      for the flip).
+      off` and confirm the label changes within a moment (the producer
+      follows BlueZ signals and re-reads the state once they settle).
     - Pair and connect a device (e.g. `bluetoothctl connect <mac>`); confirm
       the label flips to `1 connected` (or higher) and back to `on` on
       disconnect.
@@ -695,8 +714,8 @@ surface placement and input need a live compositor. To verify on Hyprland:
        reserves no slot.
      - Change the volume with `pactl set-sink-volume @DEFAULT_SINK@ 50%`
        (or `wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.5`) and confirm the
-       label updates by the next poll (the producer re-emits every two
-       seconds when the cached state changes). The widget should track
+       label updates at once (every PipeWire sink event re-evaluates the
+       level; a ten-second tick is only the safety net). The widget should track
        per-cent: `12%`, `13%`, …
      - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
        the label flips to `Mute` with the muted speaker icon; toggling

@@ -9,10 +9,13 @@
 mod platform;
 
 use std::collections::HashMap;
+use std::pin::pin;
 use std::time::Duration;
 
+use futures_util::future::{self, Either};
 use futures_util::stream::{StreamExt, select, select_all};
 use log::{info, warn};
+use tokio::sync::Notify;
 use zbus::Connection;
 use zbus::fdo::PropertiesProxy;
 use zbus::names::InterfaceName;
@@ -31,7 +34,14 @@ const CURRENT_PATH: &str = "/org/freedesktop/UPower/PowerProfiles";
 const LEGACY_NAME: &str = "net.hadess.PowerProfiles";
 const LEGACY_PATH: &str = "/net/hadess/PowerProfiles";
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-const PLATFORM_POLL: Duration = Duration::from_secs(2);
+/// How often the platform driver's sysfs state is re-read. The driver offers no
+/// change notification, so this bounds how long a mode set by another tool (or
+/// the laptop's own key) goes unnoticed; our own changes are re-read at once.
+const PLATFORM_POLL: Duration = Duration::from_secs(5);
+
+/// Raised by the command executor once it has applied a platform profile, so
+/// the producer shows a click's result without waiting out [`PLATFORM_POLL`].
+static PLATFORM_APPLIED: Notify = Notify::const_new();
 
 #[derive(Debug, Clone, Copy)]
 enum Endpoint {
@@ -243,23 +253,33 @@ async fn run(tx: MsgSender, settings: PowerProfilesSettings) -> ProducerResult {
                 continue;
             }
         };
-        let composed = compose(Some(snapshot), platform, settings.sys_root());
-        if send_if_changed(&tx, &mut previous, composed).is_err() {
-            return Ok(());
-        }
         let owner_changes = (&mut owners).map(|_| ());
         let events = select(changes, owner_changes);
         futures_util::pin_mut!(events);
-        if platform.is_some() {
-            if let Ok(None) = tokio::time::timeout(PLATFORM_POLL, events.next()).await {
+        // The daemon pushes its changes, so between those only the platform
+        // file is re-read, against the daemon state already in hand.
+        loop {
+            let composed = compose(Some(snapshot.clone()), platform, settings.sys_root());
+            if send_if_changed(&tx, &mut previous, composed).is_err() {
                 return Ok(());
             }
-        } else if events.next().await.is_none() {
-            return Ok(());
+            if platform.is_none() {
+                match events.next().await {
+                    Some(()) => break,
+                    None => return Ok(()),
+                }
+            }
+            let applied = pin!(PLATFORM_APPLIED.notified());
+            let wake = future::select(events.next(), applied);
+            match tokio::time::timeout(PLATFORM_POLL, wake).await {
+                Ok(Either::Left((Some(()), _))) => break,
+                Ok(Either::Left((None, _))) => return Ok(()),
+                Ok(Either::Right(_)) | Err(_) => {}
+            }
         }
-        // Either state changed, a compatibility name changed owner, or the
-        // platform poll ticked. Re-seeding also refreshes the Profiles list
-        // if hardware capabilities changed.
+        // Either state changed or a compatibility name changed owner.
+        // Re-seeding also refreshes the Profiles list if hardware
+        // capabilities changed.
     }
 }
 
@@ -318,10 +338,11 @@ pub async fn run_commands(
             }
             None => {}
         }
-        if let (Some(kind), Some(helper)) = (platform, helper.as_ref())
-            && let Err(error) = apply_platform_profile(&profile, kind, helper).await
-        {
-            warn!("power-profiles: {error}");
+        if let (Some(kind), Some(helper)) = (platform, helper.as_ref()) {
+            if let Err(error) = apply_platform_profile(&profile, kind, helper).await {
+                warn!("power-profiles: {error}");
+            }
+            PLATFORM_APPLIED.notify_one();
         }
     }
     Ok(())
@@ -361,5 +382,51 @@ mod tests {
     #[test]
     fn empty_profile_name_is_dropped() {
         assert!(profile_from_properties(HashMap::from([("Profile".into(), value(""))])).is_none());
+    }
+
+    /// The platform poll works from the daemon state already in hand: it takes
+    /// no bus connection, so it cannot issue a D-Bus call.
+    #[test]
+    fn a_platform_poll_reports_only_a_changed_hardware_mode() {
+        let sys = tempfile::tempdir().unwrap();
+        let qc71 = sys.path().join("devices/platform/qc71_laptop");
+        std::fs::create_dir_all(&qc71).unwrap();
+        let mode = qc71.join("performance_mode");
+        std::fs::write(&mode, "2\n").unwrap();
+        let platform = detect_platform(sys.path());
+        assert!(platform.is_some());
+        let daemon = PowerProfilesState::new(
+            "balanced",
+            vec![
+                PowerProfile::new("balanced", "multiple", "amd_pstate", "placeholder"),
+                PowerProfile::new("performance", "amd_pstate", "amd_pstate", "amd_pstate"),
+            ],
+        );
+        let (bridge, channel) = crate::producer::ProducerBridge::new().unwrap();
+        let tx = bridge.sender();
+        let mut previous = None;
+        let mut poll = || {
+            let composed = compose(Some(daemon.clone()), platform, sys.path());
+            send_if_changed(&tx, &mut previous, composed).unwrap();
+            std::iter::from_fn(|| channel.try_recv().ok())
+                .map(|msg| match msg {
+                    Msg::PowerProfiles(Some(state)) => state,
+                    other => panic!("unexpected message: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let seeded = poll();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].active_name(), "balanced");
+        assert!(poll().is_empty(), "steady hardware sends nothing");
+
+        // Another tool switches the hardware mode behind the daemon's back.
+        std::fs::write(&mode, "3\n").unwrap();
+        let changed = poll();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].active_name(), "performance");
+        assert_eq!(changed[0].profiles(), daemon.profiles());
+        assert!(poll().is_empty());
     }
 }
