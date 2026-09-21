@@ -54,8 +54,8 @@ use crate::render::{
 };
 use crate::scale::Scale;
 use crate::widget::{
-    ClickButton, Command, Damage, Dashboard, Msg, ScrollDirection, Tooltip, TrayMenu, TrayMenuItem,
-    TrayMenuToggleKind, TrayMenuToggleState,
+    ClickButton, Command, Damage, Dashboard, Hover, Msg, ScrollDirection, Tooltip, TrayMenu,
+    TrayMenuItem, TrayMenuToggleKind, TrayMenuToggleState,
 };
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
@@ -354,13 +354,15 @@ impl Surface {
             .on_click((x * s) as u32, (y * s) as u32, button)
     }
 
-    fn is_clickable_at(&self, x: f64, y: f64) -> bool {
+    /// Resolve what the pointer is over at surface-local logical coordinates:
+    /// whether it is clickable and which tooltip it shows, in one hit-test.
+    fn hover_at(&self, x: f64, y: f64) -> Hover {
         if x < 0.0 || y < 0.0 {
-            return false;
+            return Hover::default();
         }
         let scale = self.scale.get() as f64;
         self.dashboard
-            .is_clickable_at((x * scale) as u32, (y * scale) as u32)
+            .hover_at((x * scale) as u32, (y * scale) as u32)
     }
 
     /// Resolve one logical scroll step against the widget under `(x, y)`.
@@ -371,16 +373,6 @@ impl Surface {
         let scale = self.scale.get() as f64;
         self.dashboard
             .on_scroll((x * scale) as u32, (y * scale) as u32, direction)
-    }
-
-    /// Resolve tooltip content at surface-local logical coordinates.
-    fn tooltip_at(&self, x: f64, y: f64) -> Option<Tooltip> {
-        if x < 0.0 || y < 0.0 {
-            return None;
-        }
-        let scale = self.scale.get() as f64;
-        self.dashboard
-            .tooltip_at((x * scale) as u32, (y * scale) as u32)
     }
 
     /// Adopt the compositor's configure, seeding and requesting the first frame.
@@ -805,6 +797,9 @@ impl TrayMenuSurface {
         };
 
         self.ctx.resize(width, height);
+        // The context outlives a popup and the panel is translucent, so start
+        // from clear pixels rather than blending over the previous paint.
+        self.ctx.fill_background();
         self.ctx.fill_rounded_rect(
             Bounds::new(0, 0, width, height),
             self.background,
@@ -922,27 +917,13 @@ impl TooltipSurface {
             }
         };
 
-        self.ctx.resize(width, height);
-        self.ctx.fill_rounded_rect(
-            Bounds::new(0, 0, width, height),
+        paint_tooltip(
+            &mut self.ctx,
+            &self.text,
+            (width, height),
             self.background,
-            POPUP_RADIUS * scale as f32,
+            self.foreground,
         );
-        let padding_x = POPUP_PADDING_X * scale;
-        let padding_y = POPUP_PADDING_Y * scale;
-        let line_height = tooltip_line_height(&self.ctx);
-        for (index, line) in self.text.lines().enumerate() {
-            self.ctx.draw_text(
-                line,
-                Bounds::new(
-                    padding_x,
-                    padding_y + index as u32 * line_height,
-                    width.saturating_sub(2 * padding_x),
-                    line_height,
-                ),
-                self.foreground,
-            );
-        }
         write_argb8888(self.ctx.pixels(), canvas);
         self.popup
             .wl_surface()
@@ -959,6 +940,41 @@ impl TooltipSurface {
             "tooltip-input-to-commit",
             self.requested_at.take(),
             format_args!("output={} width={width} height={height}", self.output_id),
+        );
+    }
+}
+
+/// Paint a tooltip panel of physical `size` holding `text` into `ctx`.
+fn paint_tooltip(
+    ctx: &mut RenderContext,
+    text: &str,
+    (width, height): (u32, u32),
+    background: (u8, u8, u8, u8),
+    foreground: (u8, u8, u8, u8),
+) {
+    let scale = ctx.scale_factor();
+    ctx.resize(width, height);
+    // The context outlives a popup and the panel is translucent, so start from
+    // clear pixels rather than blending over the previous paint.
+    ctx.fill_background();
+    ctx.fill_rounded_rect(
+        Bounds::new(0, 0, width, height),
+        background,
+        POPUP_RADIUS * scale as f32,
+    );
+    let padding_x = POPUP_PADDING_X * scale;
+    let padding_y = POPUP_PADDING_Y * scale;
+    let line_height = tooltip_line_height(ctx);
+    for (index, line) in text.lines().enumerate() {
+        ctx.draw_text(
+            line,
+            Bounds::new(
+                padding_x,
+                padding_y + index as u32 * line_height,
+                width.saturating_sub(2 * padding_x),
+                line_height,
+            ),
+            foreground,
         );
     }
 }
@@ -1021,6 +1037,8 @@ struct App {
     tooltip: Option<TooltipSurface>,
     pending_tray_menu: Option<PendingTrayMenu>,
     tray_menu: Option<TrayMenuSurface>,
+    /// The render context of the last popup hidden, reused by the next one.
+    popup_ctx: Option<RenderContext>,
     /// Process-wide font set shared by every surface and popup.
     fonts: SharedFonts,
     /// Watches app config and active/candidate theme dependencies.
@@ -1303,12 +1321,31 @@ impl App {
     }
 
     fn hide_tooltip(&mut self) {
-        self.tooltip = None;
+        if let Some(tooltip) = self.tooltip.take() {
+            self.popup_ctx = Some(tooltip.ctx);
+        }
     }
 
     fn hide_tray_menu(&mut self) {
         self.pending_tray_menu = None;
-        self.tray_menu = None;
+        if let Some(menu) = self.tray_menu.take() {
+            self.popup_ctx = Some(menu.ctx);
+        }
+    }
+
+    /// A render context for a new popup, painting with `settings`.
+    ///
+    /// The context of the last popup hidden is handed back here rather than
+    /// dropped, so a tooltip shown again finds its lines already shaped in the
+    /// text cache instead of starting from an empty context on every hover.
+    fn popup_context(&mut self, settings: RenderSettings) -> RenderContext {
+        match self.popup_ctx.take() {
+            Some(mut ctx) => {
+                ctx.set_settings(settings);
+                ctx
+            }
+            None => RenderContext::with_fonts(1, 1, settings, self.fonts.clone()),
+        }
     }
 
     fn set_pointer_cursor(&mut self, conn: &Connection, icon: CursorIcon, force: bool) {
@@ -1324,32 +1361,20 @@ impl App {
         }
     }
 
+    /// Show `tooltip` under the bar on `output_id`, or hide the current one when
+    /// the pointer is over nothing that has one.
     fn update_tooltip(
         &mut self,
-        surface: &wl_surface::WlSurface,
-        x: f64,
-        y: f64,
+        output_id: OutputId,
+        tooltip: Option<Tooltip>,
         qh: &QueueHandle<App>,
     ) {
-        let requested_at = self.performance.start();
-        let request = self
-            .outputs
-            .values()
-            .find(|bar| bar.owns(surface))
-            .and_then(|bar| {
-                let tooltip = bar.tooltip_at(x, y)?;
-                Some((
-                    bar.output_id,
-                    bar.layer.clone(),
-                    bar.scale,
-                    bar.config.scaled_render_settings(bar.scale),
-                    tooltip,
-                ))
-            });
-        let Some((output_id, parent, scale, mut settings, tooltip)) = request else {
+        let Some(tooltip) = tooltip else {
             self.hide_tooltip();
             return;
         };
+        // Most motion stays over the widget whose tooltip is already up, so that
+        // is settled before anything is cloned or measured.
         if self
             .tooltip
             .as_ref()
@@ -1357,11 +1382,20 @@ impl App {
         {
             return;
         }
+        let requested_at = self.performance.start();
+        let Some(bar) = self.outputs.get(output_id) else {
+            self.hide_tooltip();
+            return;
+        };
+        let parent = bar.layer.clone();
+        let scale = bar.scale;
+        let mut settings = bar.config.scaled_render_settings(scale);
 
         let background = popup_background(settings.background);
         let foreground = settings.foreground;
         settings.background = (0, 0, 0, 0);
-        let mut ctx = RenderContext::with_fonts(1, 1, settings, self.fonts.clone());
+        self.hide_tooltip();
+        let mut ctx = self.popup_context(settings);
         let (physical_width, physical_height) = tooltip_size(&mut ctx, &tooltip.text);
         let divisor = scale.get();
         let width = physical_width.div_ceil(divisor);
@@ -1440,7 +1474,8 @@ impl App {
         let foreground = settings.foreground;
         let accent = settings.accent;
         settings.background = (0, 0, 0, 0);
-        let mut ctx = RenderContext::with_fonts(1, 1, settings, self.fonts.clone());
+        self.hide_tooltip();
+        let mut ctx = self.popup_context(settings);
         let scale = pending.scale.get();
         let physical_width = rows
             .iter()
@@ -1488,7 +1523,6 @@ impl App {
             popup.xdg_popup().grab(seat, pending.serial);
         }
         popup.wl_surface().commit();
-        self.tooltip = None;
         self.tray_menu = Some(TrayMenuSurface {
             popup,
             output_id: pending.output_id,
@@ -1675,6 +1709,7 @@ pub fn run_with_producers(
         tooltip: None,
         pending_tray_menu: None,
         tray_menu: None,
+        popup_ctx: None,
         fonts,
         config_watcher,
         producer_snapshot: ProducerSnapshot::default(),
@@ -2076,13 +2111,16 @@ impl PointerHandler for App {
                     );
                     continue;
                 }
-                let owner = self.outputs.values().find(|bar| bar.owns(&event.surface));
-                let clickable = owner.is_some_and(|bar| bar.is_clickable_at(x, y));
-                if owner.is_some() {
-                    self.update_tooltip(&event.surface, x, y, _qh);
+                let hover = self
+                    .outputs
+                    .values()
+                    .find(|bar| bar.owns(&event.surface))
+                    .map(|bar| (bar.output_id, bar.hover_at(x, y)));
+                if let Some((output_id, hover)) = hover {
+                    self.update_tooltip(output_id, hover.tooltip, _qh);
                     self.set_pointer_cursor(
                         conn,
-                        if clickable {
+                        if hover.clickable {
                             CursorIcon::Pointer
                         } else {
                             CursorIcon::Default
@@ -2509,6 +2547,53 @@ mod scroll_tests {
                 (0, 0, 3840, 76)
             );
         }
+    }
+
+    fn tooltip_pixels(ctx: &mut RenderContext, text: &str, size: (u32, u32)) -> Vec<u8> {
+        paint_tooltip(
+            ctx,
+            text,
+            size,
+            POPUP_FALLBACK_BACKGROUND,
+            (0xFF, 0xFF, 0xFF, 0xFF),
+        );
+        ctx.pixels().to_vec()
+    }
+
+    fn popup_settings() -> RenderSettings {
+        RenderSettings {
+            background: (0, 0, 0, 0),
+            ..Config::default().render_settings()
+        }
+    }
+
+    #[test]
+    fn a_reused_popup_context_paints_what_a_fresh_one_would() {
+        // One panel size for both, so the second paint lands on the first one's
+        // pixels rather than on a reallocated pixmap.
+        let mut reused = RenderContext::with_settings(1, 1, popup_settings());
+        let size = tooltip_size(&mut reused, "Hypridle inactive");
+        tooltip_pixels(&mut reused, "Hypridle inactive", size);
+
+        let mut fresh = RenderContext::with_settings(1, 1, popup_settings());
+        assert_eq!(
+            tooltip_pixels(&mut reused, "Hypridle active", size),
+            tooltip_pixels(&mut fresh, "Hypridle active", size)
+        );
+    }
+
+    #[test]
+    fn a_reused_popup_context_does_not_reshape_a_tooltip_it_has_shown() {
+        let mut ctx = RenderContext::with_settings(1, 1, popup_settings());
+        let size = tooltip_size(&mut ctx, "Hypridle active");
+        tooltip_pixels(&mut ctx, "Hypridle active", size);
+        ctx.take_stats();
+
+        ctx.set_settings(popup_settings());
+        let size = tooltip_size(&mut ctx, "Hypridle active");
+        tooltip_pixels(&mut ctx, "Hypridle active", size);
+
+        assert_eq!(ctx.take_stats().text_shapes, 0);
     }
 }
 

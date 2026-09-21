@@ -384,6 +384,16 @@ pub struct Tooltip {
     pub bounds: Bounds,
 }
 
+/// What the pointer is over: everything a pointer motion needs to know, resolved
+/// by [`Dashboard::hover_at`] in one hit-test.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hover {
+    /// Whether a primary or secondary click here would do something.
+    pub clickable: bool,
+    /// The tooltip to show here, if any.
+    pub tooltip: Option<Tooltip>,
+}
+
 /// How a widget chooses the glyph it draws before its label.
 ///
 /// Resolved from the `icon` config field: an absent value keeps the widget's
@@ -1162,10 +1172,25 @@ impl Dashboard {
             .find_map(|widget| widget.on_click(px, py, button))
     }
 
-    /// Whether any widget exposes a primary or secondary click at `(px, py)`.
-    pub fn is_clickable_at(&self, px: u32, py: u32) -> bool {
-        self.on_click(px, py, ClickButton::Left).is_some()
-            || self.on_click(px, py, ClickButton::Right).is_some()
+    /// Resolve what the pointer is over at `(px, py)`.
+    ///
+    /// Pointer motion arrives far more often than anything else the bar handles,
+    /// so this finds the one widget whose slot holds the pixel and asks only it,
+    /// rather than offering the pixel to every widget once per question. Slots
+    /// never overlap after [`layout`](Dashboard::layout), and a widget's
+    /// interactive regions lie inside its slot.
+    pub fn hover_at(&self, px: u32, py: u32) -> Hover {
+        let Some(widget) = self
+            .widgets()
+            .find(|widget| widget.bounds().contains(px, py))
+        else {
+            return Hover::default();
+        };
+        Hover {
+            clickable: widget.on_click(px, py, ClickButton::Left).is_some()
+                || widget.on_click(px, py, ClickButton::Right).is_some(),
+            tooltip: widget.tooltip_at(px, py),
+        }
     }
 
     /// Route one logical scroll step to the widget under the pointer.
@@ -1175,15 +1200,6 @@ impl Dashboard {
             .chain(&self.center)
             .chain(&self.right)
             .find_map(|widget| widget.on_scroll(px, py, direction))
-    }
-
-    /// Resolve tooltip content for the widget under `(px, py)`.
-    pub fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
-        self.left
-            .iter()
-            .chain(&self.center)
-            .chain(&self.right)
-            .find_map(|widget| widget.tooltip_at(px, py))
     }
 }
 
@@ -1369,8 +1385,76 @@ mod tests {
         let mut ctx = RenderContext::new(200, 32);
         dash.layout(&mut ctx, 200, 32);
 
-        assert!(dash.is_clickable_at(180, 16));
-        assert!(!dash.is_clickable_at(100, 16));
+        assert!(dash.hover_at(180, 16).clickable);
+        assert!(!dash.hover_at(100, 16).clickable);
+    }
+
+    /// Workspaces (clickable, no tooltip), a clock (neither) and Hypridle
+    /// (clickable with a tooltip), laid out on a 400x32 bar.
+    fn hoverable_dashboard() -> Dashboard {
+        let mut workspaces = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1));
+        workspaces.update(&Msg::Workspaces(Workspaces::new([1, 2], 1)));
+        let mut dash = Dashboard::with_zones(
+            vec![Box::new(workspaces)],
+            vec![Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1)))],
+            vec![Box::new(HypridleWidget::new(Bounds::new(0, 0, 1, 1)))],
+        );
+        dash.update(&at(12, 0, 0));
+        dash.update(&Msg::Hypridle(Hypridle::new(true)));
+        dash.layout(&mut RenderContext::new(400, 32), 400, 32);
+        dash
+    }
+
+    #[test]
+    fn hovering_a_widget_reports_its_click_action_and_tooltip_together() {
+        let dash = hoverable_dashboard();
+        let hypridle = dash.right[0].bounds();
+        let (px, py) = (
+            hypridle.x + hypridle.width / 2,
+            hypridle.y + hypridle.height / 2,
+        );
+
+        let hover = dash.hover_at(px, py);
+
+        assert!(hover.clickable);
+        assert_eq!(
+            hover.tooltip,
+            Some(Tooltip {
+                text: "Hypridle active".to_owned(),
+                bounds: hypridle,
+            })
+        );
+    }
+
+    #[test]
+    fn hovering_empty_bar_space_reports_nothing() {
+        let dash = hoverable_dashboard();
+        let gap = dash.left[0].bounds().x + dash.left[0].bounds().width + 1;
+        assert!(
+            !dash.center[0].bounds().contains(gap, 16),
+            "probe is in a gap"
+        );
+
+        assert_eq!(dash.hover_at(gap, 16), Hover::default());
+        assert_eq!(Dashboard::new(vec![]).hover_at(0, 0), Hover::default());
+    }
+
+    #[test]
+    fn hover_agrees_with_asking_every_widget_at_every_pixel() {
+        // `hover_at` consults only the widget whose slot holds the pixel. That is
+        // sound only while no widget answers outside its slot, so compare it
+        // against the exhaustive scan it stands in for, across the whole bar.
+        let dash = hoverable_dashboard();
+        for py in 0..32 {
+            for px in 0..400 {
+                let exhaustive = Hover {
+                    clickable: dash.on_click(px, py, ClickButton::Left).is_some()
+                        || dash.on_click(px, py, ClickButton::Right).is_some(),
+                    tooltip: dash.widgets().find_map(|widget| widget.tooltip_at(px, py)),
+                };
+                assert_eq!(dash.hover_at(px, py), exhaustive, "at ({px}, {py})");
+            }
+        }
     }
 
     #[test]
@@ -1458,8 +1542,10 @@ mod tests {
             panic!("fixed slots should give partial damage, got {damage:?}");
         };
         let differing: Vec<(u32, u32)> = before
-            .chunks_exact(4)
-            .zip(after.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks::<4>().0)
             .enumerate()
             .filter(|(_, (before, after))| before != after)
             .map(|(i, _)| (i as u32 % 400, i as u32 / 400))

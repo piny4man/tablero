@@ -214,6 +214,29 @@ inside the reported damage). Their effect on the compositor is not visible in
 Tablero's own metrics; compare Hyprland's frame time with its damage-tracking
 overlay (`debug:damage_blink`) when validating on a live bar.
 
+## Pointer motion and popups
+
+Pointer motion is the most frequent event a bar handles and never repaints it,
+so its cost is all in the hit-test. A motion event now resolves the cursor shape
+and the tooltip with one lookup: the dashboard finds the single widget whose slot
+holds the pixel and asks only that widget, instead of offering the pixel to every
+widget three times (left click, right click, tooltip). A unit test compares that
+lookup against the exhaustive scan at every pixel of a laid-out bar, which is
+what keeps the "a widget only answers inside its slot" assumption honest.
+
+Motion that stays over the widget whose tooltip is already showing returns before
+the render settings are cloned or anything is measured. When the tooltip does
+change, the popup takes over the render context of the last popup hidden rather
+than building an empty one, so a tooltip shown before is measured and painted
+from the text cache without shaping (`text_shapes` stays 0). Because that context
+now outlives a popup and the panel is translucent, popups clear their pixmap
+before painting; this also fixes a tray menu that redrew over its own previous
+paint when its items updated.
+
+Popups still allocate a shared-memory buffer per draw. A tooltip draws once in
+its life and a menu once per update, so the two-slot reuse the bar needs for its
+steady repaints would hold memory for no measurable gain.
+
 ## Follow-up acceptance criteria
 
 Use these for targeted fixes rather than changing animation or compositor
