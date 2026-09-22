@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use calloop::EventLoop;
 use calloop::channel::{Event as ChannelEvent, channel};
+use calloop::timer::{TimeoutAction, Timer};
 
-use tablero::redraw::RedrawScheduler;
+use tablero::redraw::{FRAME_CALLBACK_TIMEOUT, RedrawScheduler};
 use tablero::render::{Bounds, RenderContext};
 use tablero::widget::{ClockWidget, Damage, Dashboard, Msg, WorkspaceWidget, Workspaces};
 
@@ -142,4 +143,43 @@ fn a_repaint_waits_for_the_previous_frame_to_be_shown() {
     harness.scheduler.frame_done();
     harness.flush();
     assert_eq!(harness.frames.len(), 1);
+}
+
+#[test]
+fn a_deferred_repaint_paints_when_the_frame_callback_times_out_without_another_message() {
+    let mut harness = Harness::new();
+    let mut event_loop: EventLoop<Harness> = EventLoop::try_new().expect("event loop");
+    harness.scheduler.committed(Instant::now());
+    harness.apply(&workspaces(2), "workspaces");
+    harness.flush();
+    assert!(
+        harness.frames.is_empty(),
+        "the compositor still owes a frame"
+    );
+
+    // The host arms this deadline; nothing else is allowed to wake the loop.
+    let deadline = harness
+        .scheduler
+        .wake_deadline()
+        .expect("a blocked repaint must schedule a wake");
+    event_loop
+        .handle()
+        .insert_source(Timer::from_deadline(deadline), |_, _, h: &mut Harness| {
+            h.flush();
+            TimeoutAction::Drop
+        })
+        .expect("timer registers");
+
+    event_loop
+        .dispatch(
+            FRAME_CALLBACK_TIMEOUT + Duration::from_millis(200),
+            &mut harness,
+        )
+        .expect("dispatch");
+    assert_eq!(
+        harness.frames.len(),
+        1,
+        "the timeout woke the workspace repaint with no further message"
+    );
+    assert_eq!(harness.frames[0].0, "workspaces");
 }

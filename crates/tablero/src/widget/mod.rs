@@ -1584,4 +1584,71 @@ mod tests {
         assert_eq!(a.union(&b), Bounds::new(10, 0, 45, 30));
         assert_eq!(a.union(&a), a);
     }
+
+    /// ARC-style workspace cells at buffer scale 2: translucent rounded fill,
+    /// a border, and a fully transparent bar. Anti-aliased ink can land outside
+    /// the slot the damage union reports; those pixels must still be covered or
+    /// the compositor keeps the previous highlight.
+    #[test]
+    fn styled_workspace_pixels_at_scale_two_lie_inside_the_damage() {
+        let style = WidgetStyle {
+            background: Some((0x1c, 0x0e, 0x1e, 0xe8)),
+            foreground: (0x9a, 0x8a, 0x98, 0xff),
+            accent: (0x7d, 0xec, 0xff, 0xff),
+            border: Some((0x3d, 0x1f, 0x3a, 0xff)),
+            border_width: 1,
+            radius: 2,
+            ..WidgetStyle::default()
+        };
+        let mut workspaces = WorkspaceWidget::new(Bounds::new(0, 0, 1, 1)).with_style(style);
+        workspaces.update(&Msg::Workspaces(Workspaces::new([1, 2], 1)));
+        let mut dash = Dashboard::with_zones(
+            vec![Box::new(workspaces)],
+            vec![],
+            vec![Box::new(ClockWidget::new(Bounds::new(0, 0, 1, 1)))],
+        )
+        .with_spacing(4, 4);
+        dash.update(&at(12, 0, 0));
+
+        const WIDTH: u32 = 400;
+        const HEIGHT: u32 = 76;
+        let mut ctx = RenderContext::with_settings(
+            WIDTH,
+            HEIGHT,
+            crate::render::RenderSettings {
+                background: (0, 0, 0, 0),
+                scale: 2,
+                font_size: 30.0,
+                ..crate::render::RenderSettings::default()
+            },
+        );
+
+        let paint = |dash: &mut Dashboard, ctx: &mut RenderContext| {
+            dash.layout(ctx, WIDTH, HEIGHT);
+            let damage = dash.take_damage();
+            dash.draw(ctx);
+            (damage, ctx.pixels().to_vec())
+        };
+        let (_, before) = paint(&mut dash, &mut ctx);
+        assert!(dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2))));
+        let (damage, after) = paint(&mut dash, &mut ctx);
+
+        let Damage::Region(region) = damage else {
+            panic!("fixed slots should give partial damage, got {damage:?}");
+        };
+        let outside: Vec<(u32, u32)> = before
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| (i as u32 % WIDTH, i as u32 / WIDTH))
+            .filter(|&(x, y)| !region.contains(x, y))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "styled workspace pixels outside {region:?}: {outside:?}"
+        );
+    }
 }
