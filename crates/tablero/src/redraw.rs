@@ -14,7 +14,9 @@
 //! output's refresh and stops a hidden bar from painting frames nobody sees.
 //!
 //! A frame callback is requested only alongside a commit that carries damage,
-//! so an idle bar never runs a frame loop.
+//! so an idle bar never runs a frame loop. While a repaint is waiting on that
+//! callback, the host must wake at [`RedrawScheduler::wake_deadline`]: the
+//! timeout is not observed unless the loop actually runs.
 //!
 //! [`take_due`]: RedrawScheduler::take_due
 
@@ -78,6 +80,22 @@ impl RedrawScheduler {
     pub fn frame_done(&mut self) {
         self.awaiting_frame = None;
     }
+
+    /// When the host must wake if the compositor never delivers the frame
+    /// callback. `None` when no repaint is waiting, so an idle bar stays asleep.
+    ///
+    /// [`take_due`] only notices [`FRAME_CALLBACK_TIMEOUT`] when something else
+    /// has already woken the loop. A workspace change that arrives while a
+    /// callback is outstanding would otherwise sit until the next unrelated
+    /// event. The host arms a timer for this instant and flushes again.
+    ///
+    /// [`take_due`]: Self::take_due
+    pub fn wake_deadline(&self) -> Option<Instant> {
+        let since = self.awaiting_frame?;
+        self.cause
+            .is_some()
+            .then_some(since + FRAME_CALLBACK_TIMEOUT)
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +157,30 @@ mod tests {
         scheduler.committed(Instant::now());
         scheduler.frame_done();
         assert_eq!(scheduler.take_due(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_blocked_repaint_wakes_at_the_frame_callback_timeout() {
+        let mut scheduler = RedrawScheduler::new();
+        let committed = Instant::now();
+        scheduler.committed(committed);
+        assert_eq!(
+            scheduler.wake_deadline(),
+            None,
+            "nothing is waiting to paint"
+        );
+
+        scheduler.request("workspaces");
+        assert_eq!(
+            scheduler.wake_deadline(),
+            Some(committed + FRAME_CALLBACK_TIMEOUT)
+        );
+
+        scheduler.frame_done();
+        assert_eq!(
+            scheduler.wake_deadline(),
+            None,
+            "the callback arrived; the timeout must not also fire"
+        );
     }
 }

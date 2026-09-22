@@ -10,7 +10,8 @@
 //! `.socket.sock` answers one-shot JSON requests (`j/workspaces`,
 //! `j/activeworkspace`, `j/monitors`, `j/activewindow`), and `.socket2.sock`
 //! streams `EVENT>>DATA` lines. The producer queries an initial snapshot of
-//! both, then on each event stream line dispatches to the right endpoint:
+//! both, then on each coalesced burst of event lines dispatches to the right
+//! endpoint:
 //!
 //! - **Workspace events** (`is_workspace_event`) drive a `j/workspaces` +
 //!   `j/activeworkspace` + `j/monitors` refresh.
@@ -32,6 +33,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use log::warn;
 use serde::Deserialize;
@@ -395,31 +397,99 @@ impl Producer for HyprlandProducer {
     }
 }
 
-/// Drive both streams: seed workspaces and the per-monitor active window,
-/// then on each event stream line dispatch to the right endpoint.
+/// How long to wait for more socket2 lines before querying. A workspace switch
+/// emits several events within a few milliseconds; one snapshot covers the burst.
+const EVENT_COALESCE: Duration = Duration::from_millis(8);
+
+/// Pause before opening the event socket again after it drops.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// What one burst of socket2 lines asks the producer to do.
+struct EventWork {
+    /// Several workspace lines still need only one `j/workspaces` refresh.
+    refresh_workspaces: bool,
+    /// Focus and lifecycle lines, in arrival order, applied after that refresh.
+    focus_lines: Vec<String>,
+}
+
+/// Collapse a burst of event lines into one workspace refresh plus the focus
+/// lines that still have to be applied.
+fn event_work<'a>(lines: impl IntoIterator<Item = &'a str>) -> EventWork {
+    let mut refresh_workspaces = false;
+    let mut focus_lines = Vec::new();
+    for line in lines {
+        if is_workspace_event(line) {
+            refresh_workspaces = true;
+        }
+        let name = line.split(">>").next().unwrap_or("");
+        if is_focus_or_lifecycle_event(name) {
+            focus_lines.push(line.to_string());
+        }
+    }
+    EventWork {
+        refresh_workspaces,
+        focus_lines,
+    }
+}
+
+/// A closed render-loop channel stops the producer. Any other session failure
+/// reconnects, so a dropped event socket cannot freeze the workspace strip.
+fn reconnect_after(channel_closed: bool) -> bool {
+    !channel_closed
+}
+
+/// Why one Hyprland session ended.
+enum SessionEnd {
+    /// The render loop dropped the message channel. Do not reconnect.
+    Shutdown,
+    /// The event socket closed or could not be opened. Reconnect.
+    Disconnected(String),
+}
+
+impl SessionEnd {
+    fn channel_closed(&self) -> bool {
+        matches!(self, Self::Shutdown)
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::Shutdown => "render loop closed",
+            Self::Disconnected(reason) => reason,
+        }
+    }
+}
+
+/// Keep the Hyprland event stream alive.
 ///
-/// The active-window tracking is *per-monitor*: each output's bar binds to
-/// one Hyprland connector name and updates only on focus events for that
-/// monitor. The producer tracks the most recently focused monitor via
-/// `focusedmon>>` events; focus changes within that monitor (`activewindow>>`
-/// and `activewindowv2>>`) parse the `class,title` payload inline and emit
-/// without an extra IPC round-trip. Window lifecycle (`openwindow>>`,
-/// `closewindow>>`) and the focus-change re-query (`focusedmon>>`) still
-/// round-trip `j/activewindow` because the payload alone is not enough to
-/// know the post-state.
-///
-/// Returns `Ok(())` once the render loop has gone away (a [`send`] reports the
-/// channel closed) or the event socket reaches EOF. Transient query failures are
-/// logged and skipped rather than ending the stream.
+/// One session seeds the current snapshot, then reads `.socket2.sock`. Lines
+/// that arrive within [`EVENT_COALESCE`] share one workspace query. A dropped
+/// socket or a failed connect is logged and the session starts again, so the
+/// workspace strip cannot freeze while the rest of the bar keeps running.
+/// Returns `Ok(())` only when the render loop has closed the channel.
 ///
 /// [`send`]: MsgSender::send
 async fn run(tx: MsgSender) -> ProducerResult {
-    let dir = resolve_socket_dir()?;
+    loop {
+        let end = session(&tx).await;
+        if !reconnect_after(end.channel_closed()) {
+            return Ok(());
+        }
+        warn!("hyprland: {}; reconnecting", end.reason());
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
 
-    // Seed workspaces + active window before the first event arrives.
+/// One connection to the event socket: seed, then dispatch coalesced bursts
+/// until the channel closes or the socket drops.
+async fn session(tx: &MsgSender) -> SessionEnd {
+    let dir = match resolve_socket_dir() {
+        Ok(dir) => dir,
+        Err(error) => return SessionEnd::Disconnected(error.to_string()),
+    };
+
     if let Ok(snapshot) = fetch_snapshot(&dir).await {
         if tx.send(Msg::Workspaces(snapshot)).is_err() {
-            return Ok(());
+            return SessionEnd::Shutdown;
         }
     } else {
         warn!("hyprland: initial workspace query failed");
@@ -430,100 +500,127 @@ async fn run(tx: MsgSender) -> ProducerResult {
         last_focused_monitor = Some(monitor.clone());
         let window = (!window.is_empty()).then_some(window);
         if tx.send(Msg::ActiveWindow { monitor, window }).is_err() {
-            return Ok(());
+            return SessionEnd::Shutdown;
         }
     } else {
         warn!("hyprland: initial activewindow query failed");
     }
 
-    let events = UnixStream::connect(dir.join(".socket2.sock")).await?;
+    let events = match UnixStream::connect(dir.join(".socket2.sock")).await {
+        Ok(events) => events,
+        Err(error) => return SessionEnd::Disconnected(error.to_string()),
+    };
     let mut lines = BufReader::new(events).lines();
-    while let Some(line) = lines.next_line().await? {
-        let name = line.split(">>").next().unwrap_or("");
-
-        if is_workspace_event(&line) {
-            if let Ok(snapshot) = fetch_snapshot(&dir).await {
-                if tx.send(Msg::Workspaces(snapshot)).is_err() {
-                    return Ok(());
-                }
-            } else {
-                warn!("hyprland: workspace refresh failed");
-            }
-        }
-
-        if !is_focus_or_lifecycle_event(name) {
-            // Unrelated event (workspace events handled above; this drops
-            // the rest: submap toggles, config reloads, etc.).
-            continue;
-        }
-
-        match name {
-            "focusedmon" => {
-                // New focused monitor — re-query the active window so the
-                // title widget on the newly-focused monitor reflects the
-                // currently-active surface there. Non-focused monitors'
-                // bars stay untouched.
-                if let Some(mon) = parse_focusedmon(&line) {
-                    last_focused_monitor = Some(mon.clone());
-                    if let Ok(window) = fetch_activewindow(&dir).await {
-                        let window = (!window.is_empty()).then_some(window);
-                        if tx
-                            .send(Msg::ActiveWindow {
-                                monitor: mon,
-                                window,
-                            })
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                    } else {
-                        warn!("hyprland: focusedmon activewindow refresh failed");
+    loop {
+        let batch = match read_batch(&mut lines).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return SessionEnd::Disconnected("event socket closed".to_string()),
+            Err(error) => return SessionEnd::Disconnected(error.to_string()),
+        };
+        let work = event_work(batch.iter().map(String::as_str));
+        if work.refresh_workspaces {
+            match fetch_snapshot(&dir).await {
+                Ok(snapshot) => {
+                    if tx.send(Msg::Workspaces(snapshot)).is_err() {
+                        return SessionEnd::Shutdown;
                     }
                 }
+                Err(error) => warn!("hyprland: workspace refresh failed: {error}"),
             }
-            "activewindow" | "activewindowv2" => {
-                // Inline parse — no IPC round-trip. The active window is
-                // always on the most recently focused monitor (which
-                // `focusedmon>>` keeps in `last_focused_monitor`); events
-                // arriving before any `focusedmon>>` are dropped, which
-                // matches the cold-start "wait for first focus" behavior.
-                let Some(monitor) = last_focused_monitor.clone() else {
-                    continue;
-                };
-                let Some((class, title)) = parse_activewindow_stream(&line) else {
-                    continue;
-                };
-                if tx
-                    .send(Msg::ActiveWindow {
-                        monitor,
-                        window: Some(ActiveWindow::new(class, title)),
-                    })
-                    .is_err()
-                {
-                    return Ok(());
-                }
+        }
+        for line in &work.focus_lines {
+            if emit_focus_line(&dir, tx, &mut last_focused_monitor, line).await {
+                return SessionEnd::Shutdown;
             }
-            "openwindow" | "closewindow" => {
-                // Lifecycle event: Hyprland does not always re-emit
-                // `activewindow>>` after a focused window closes, so we
-                // re-query on these too. Same routing as `focusedmon`.
-                let Some(monitor) = last_focused_monitor.clone() else {
-                    continue;
-                };
-                if let Ok(window) = fetch_activewindow(&dir).await {
-                    let window = (!window.is_empty()).then_some(window);
-                    if tx.send(Msg::ActiveWindow { monitor, window }).is_err() {
-                        return Ok(());
-                    }
-                } else {
-                    warn!("hyprland: openwindow/closewindow refresh failed");
-                }
-            }
-            _ => {}
         }
     }
+}
 
-    Ok(())
+/// Read one event line, then any further lines that arrive before
+/// [`EVENT_COALESCE`] elapses, so a switch's burst shares one snapshot.
+async fn read_batch<R>(lines: &mut tokio::io::Lines<R>) -> io::Result<Option<Vec<String>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let Some(first) = lines.next_line().await? else {
+        return Ok(None);
+    };
+    let mut batch = vec![first];
+    let deadline = tokio::time::Instant::now() + EVENT_COALESCE;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, lines.next_line()).await {
+            Ok(Ok(Some(line))) => batch.push(line),
+            Ok(Ok(None)) | Err(_) => break,
+            Ok(Err(error)) => return Err(error),
+        }
+    }
+    Ok(Some(batch))
+}
+
+/// Apply one focus or lifecycle line. Returns whether the render loop has
+/// closed the channel.
+async fn emit_focus_line(
+    dir: &Path,
+    tx: &MsgSender,
+    last_focused_monitor: &mut Option<String>,
+    line: &str,
+) -> bool {
+    let name = line.split(">>").next().unwrap_or("");
+    match name {
+        "focusedmon" => {
+            let Some(mon) = parse_focusedmon(line) else {
+                return false;
+            };
+            *last_focused_monitor = Some(mon.clone());
+            match fetch_activewindow(dir).await {
+                Ok(window) => {
+                    let window = (!window.is_empty()).then_some(window);
+                    tx.send(Msg::ActiveWindow {
+                        monitor: mon,
+                        window,
+                    })
+                    .is_err()
+                }
+                Err(error) => {
+                    warn!("hyprland: focusedmon activewindow refresh failed: {error}");
+                    false
+                }
+            }
+        }
+        "activewindow" | "activewindowv2" => {
+            let Some(monitor) = last_focused_monitor.clone() else {
+                return false;
+            };
+            let Some((class, title)) = parse_activewindow_stream(line) else {
+                return false;
+            };
+            tx.send(Msg::ActiveWindow {
+                monitor,
+                window: Some(ActiveWindow::new(class, title)),
+            })
+            .is_err()
+        }
+        "openwindow" | "closewindow" => {
+            let Some(monitor) = last_focused_monitor.clone() else {
+                return false;
+            };
+            match fetch_activewindow(dir).await {
+                Ok(window) => {
+                    let window = (!window.is_empty()).then_some(window);
+                    tx.send(Msg::ActiveWindow { monitor, window }).is_err()
+                }
+                Err(error) => {
+                    warn!("hyprland: openwindow/closewindow refresh failed: {error}");
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +821,40 @@ mod tests {
         assert!(!is_focus_or_lifecycle_event("workspace"));
         assert!(!is_focus_or_lifecycle_event("workspacev2"));
         assert!(!is_focus_or_lifecycle_event("submap"));
+    }
+
+    #[test]
+    fn a_burst_of_workspace_lines_is_one_snapshot_fetch() {
+        let lines = [
+            "workspace>>2",
+            "workspacev2>>2,2",
+            "createworkspace>>4",
+            "destroyworkspace>>3",
+            "focusedmon>>DP-1,2",
+        ];
+        let work = event_work(lines);
+        assert_eq!(usize::from(work.refresh_workspaces), 1);
+        assert_eq!(
+            work.focus_lines,
+            vec!["focusedmon>>DP-1,2".to_string()],
+            "coalescing must not drop the focus line that arrived with the burst"
+        );
+    }
+
+    #[test]
+    fn a_burst_without_a_workspace_event_fetches_no_snapshot() {
+        let work = event_work(["activewindow>>class,title", "submap>>resize"]);
+        assert!(!work.refresh_workspaces);
+        assert_eq!(
+            work.focus_lines,
+            vec!["activewindow>>class,title".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_dropped_event_socket_reconnects_but_a_closed_channel_stops() {
+        assert!(reconnect_after(false));
+        assert!(!reconnect_after(true));
     }
 
     #[test]

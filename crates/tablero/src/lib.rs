@@ -62,7 +62,7 @@ use crate::widget::{
 use calloop::channel::Event as ChannelEvent;
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 use log::{debug, error, info, warn};
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
@@ -1054,6 +1054,14 @@ struct App {
     pending_workspace: Option<PendingWorkspace>,
     /// Workspace click whose state has arrived, awaiting the bar commit.
     committing_workspace: Option<PendingWorkspace>,
+    /// Calloop handle used to arm the frame-callback timeout. `None` until the
+    /// loop exists.
+    loop_handle: Option<LoopHandle<'static, App>>,
+    /// Armed timeout for a repaint blocked on a frame callback, if any.
+    redraw_wake: Option<RegistrationToken>,
+    /// Deadline that timeout will fire at, so a repeat flush does not replace
+    /// a timer that already matches.
+    redraw_wake_at: Option<Instant>,
     exit: bool,
 }
 
@@ -1294,6 +1302,48 @@ impl App {
                     pending.monitor.as_deref().unwrap_or("unknown")
                 ),
             );
+        }
+        self.arm_redraw_wake();
+    }
+
+    /// Wake the loop when a repaint is stuck behind a frame callback that may
+    /// never arrive. [`RedrawScheduler::take_due`] only notices the timeout if
+    /// something else has already woken the loop, so a workspace change that
+    /// lands in that window would otherwise sit until the next clock or
+    /// producer tick.
+    fn arm_redraw_wake(&mut self) {
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let deadline = self
+            .outputs
+            .values()
+            .filter_map(|surface| surface.redraw.wake_deadline())
+            .min();
+        if self.redraw_wake_at == deadline {
+            return;
+        }
+        if let Some(token) = self.redraw_wake.take() {
+            handle.remove(token);
+        }
+        self.redraw_wake_at = deadline;
+        let Some(deadline) = deadline else {
+            return;
+        };
+        match handle.insert_source(Timer::from_deadline(deadline), |_deadline, _, app| {
+            // This source is finished. Clear it before flushing so the flush
+            // can arm the next deadline without removing the timer that is
+            // currently firing.
+            app.redraw_wake = None;
+            app.redraw_wake_at = None;
+            app.flush_redraws();
+            TimeoutAction::Drop
+        }) {
+            Ok(token) => self.redraw_wake = Some(token),
+            Err(error) => {
+                self.redraw_wake_at = None;
+                error!("redraw timeout could not be armed: {error}");
+            }
         }
     }
 
@@ -1759,6 +1809,9 @@ pub fn run_with_producers(
         performance,
         pending_workspace: None,
         committing_workspace: None,
+        loop_handle: None,
+        redraw_wake: None,
+        redraw_wake_at: None,
         exit: false,
     };
 
@@ -1769,6 +1822,7 @@ pub fn run_with_producers(
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let handle = event_loop.handle();
+    app.loop_handle = Some(handle.clone());
 
     // Wayland events (output advertisements, configure, close, ...) wake the loop.
     WaylandSource::new(conn, event_queue).insert(handle.clone())?;
