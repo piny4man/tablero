@@ -502,6 +502,7 @@ fn reconcile_items(
 /// the producer.
 struct Watcher {
     items: Arc<Mutex<HashSet<String>>>,
+    host_registered: Arc<Mutex<bool>>,
 }
 
 #[interface(name = "org.kde.StatusNotifierWatcher")]
@@ -518,18 +519,17 @@ impl Watcher {
         let Some(owner) = header.sender().map(ToString::to_string) else {
             return;
         };
-        // A bare object path carries no bus name; the real address is the
-        // caller's unique name plus that path.
-        let address = if service.starts_with('/') {
-            format!("{owner}{service}")
-        } else {
-            service.to_string()
+        // A bare path is the caller's item. A name, or a name with a path
+        // stuck on (Electron), is watched under that name so a host adopting
+        // an already-exported item does not pin the registration to itself.
+        let Some((address, watched)) = registration_target(service, &owner) else {
+            return;
         };
         // Install the match rule before acknowledging registration so an app
         // that exits immediately cannot leave a stale address behind.
         let owner_lost = match DBusProxy::new(emitter.connection()).await {
             Ok(dbus) => dbus
-                .receive_name_owner_changed_with_args(&[(0, owner.as_str()), (2, "")])
+                .receive_name_owner_changed_with_args(&[(0, watched.as_str()), (2, "")])
                 .await
                 .ok(),
             Err(_) => None,
@@ -557,6 +557,7 @@ impl Watcher {
         if inserted && let Some(mut owner_lost) = owner_lost {
             let emitter = emitter.to_owned();
             let items = Arc::clone(&self.items);
+            let host_registered = Arc::clone(&self.host_registered);
             tokio::spawn(async move {
                 if owner_lost.next().await.is_none() {
                     return;
@@ -570,7 +571,10 @@ impl Watcher {
                             "failed to emit StatusNotifierItemUnregistered for {address}: {error}"
                         );
                     }
-                    let watcher = Watcher { items };
+                    let watcher = Watcher {
+                        items,
+                        host_registered,
+                    };
                     if let Err(error) = watcher
                         .registered_status_notifier_items_changed(&emitter)
                         .await
@@ -582,9 +586,36 @@ impl Watcher {
         }
     }
 
-    /// Register a host (the bar). The set of hosts is not tracked beyond
-    /// answering `IsStatusNotifierHostRegistered`, which is always true here.
-    async fn register_status_notifier_host(&self, _service: &str) {}
+    /// Register a host (the bar). The first registration flips
+    /// `IsStatusNotifierHostRegistered` and emits `StatusNotifierHostRegistered`
+    /// so a client that started before the watcher can leave its XEmbed fallback.
+    async fn register_status_notifier_host(
+        &self,
+        _service: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
+        let became = self
+            .host_registered
+            .lock()
+            .map(|mut registered| {
+                let was = *registered;
+                *registered = true;
+                !was
+            })
+            .unwrap_or(false);
+        if !became {
+            return;
+        }
+        if let Err(error) = Self::status_notifier_host_registered(&emitter).await {
+            warn!("failed to emit StatusNotifierHostRegistered: {error}");
+        }
+        if let Err(error) = self
+            .is_status_notifier_host_registered_changed(&emitter)
+            .await
+        {
+            warn!("failed to emit PropertiesChanged for host registration: {error}");
+        }
+    }
 
     /// The addresses of every currently registered item.
     #[zbus(property)]
@@ -595,11 +626,14 @@ impl Watcher {
             .unwrap_or_default()
     }
 
-    /// Whether a host is registered. Always true: this watcher only runs inside
-    /// our host.
+    /// Whether a host is registered. False until the first host registers, so
+    /// clients waiting on the property change are not stuck in the XEmbed fallback.
     #[zbus(property)]
     async fn is_status_notifier_host_registered(&self) -> bool {
-        true
+        self.host_registered
+            .lock()
+            .map(|registered| *registered)
+            .unwrap_or(false)
     }
 
     /// The implemented protocol version.
@@ -621,6 +655,27 @@ impl Watcher {
         emitter: &SignalEmitter<'_>,
         service: &str,
     ) -> zbus::Result<()>;
+
+    /// Emitted when the first host registers.
+    #[zbus(signal)]
+    async fn status_notifier_host_registered(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+/// Resolve a `RegisterStatusNotifierItem` argument to `(address, watched name)`.
+///
+/// A leading `/` is the caller's object path. Anything else is stored as given
+/// — including Electron's `name/path` concatenation — and the name before the
+/// first `/` is what disappears when the item exits.
+fn registration_target(service: &str, sender: &str) -> Option<(String, String)> {
+    let service = service.trim();
+    if service.is_empty() {
+        return None;
+    }
+    if service.starts_with('/') {
+        return Some((format!("{sender}{service}"), sender.to_string()));
+    }
+    let (name, _) = parse_item_address(service)?;
+    Some((service.to_string(), name))
 }
 
 fn remove_registered_item(items: &Mutex<HashSet<String>>, address: &str) -> bool {
@@ -641,9 +696,16 @@ trait StatusNotifierWatcher {
     /// Register the host (the bar) with the watcher.
     fn register_status_notifier_host(&self, service: &str) -> zbus::Result<()>;
 
+    /// Register an item. Used by the startup scan as well as real clients.
+    fn register_status_notifier_item(&self, service: &str) -> zbus::Result<()>;
+
     /// The addresses of every currently registered item.
     #[zbus(property)]
     fn registered_status_notifier_items(&self) -> zbus::Result<Vec<String>>;
+
+    /// Whether any host has registered. False until the first host does.
+    #[zbus(property)]
+    fn is_status_notifier_host_registered(&self) -> zbus::Result<bool>;
 
     /// An item registered.
     #[zbus(signal)]
@@ -652,6 +714,174 @@ trait StatusNotifierWatcher {
     /// An item unregistered.
     #[zbus(signal)]
     fn status_notifier_item_unregistered(&self, service: String) -> zbus::Result<()>;
+
+    /// A host registered. Clients that started first wait for this.
+    #[zbus(signal)]
+    fn status_notifier_host_registered(&self) -> zbus::Result<()>;
+}
+
+/// Interfaces an already-exported tray item may implement.
+const ITEM_INTERFACES: &[&str] = &[
+    "org.kde.StatusNotifierItem",
+    "org.freedesktop.StatusNotifierItem",
+];
+/// Bound on one introspection during the startup scan.
+const DISCOVER_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Adopt StatusNotifierItems already exported on the bus.
+///
+/// Apps that registered with a previous watcher, or that exported an item and
+/// are waiting to register, never call `RegisterStatusNotifierItem` on this
+/// watcher. One pass over the current names finds them. Later appearances are
+/// handled by [`watch_new_item_names`], not by polling.
+async fn adopt_existing_items(
+    conn: &Connection,
+    watcher: &StatusNotifierWatcherProxy<'_>,
+) -> zbus::Result<()> {
+    let names = DBusProxy::new(conn).await?.list_names().await?;
+    let found = futures_util::future::join_all(names.into_iter().map(|name| {
+        let conn = conn.clone();
+        async move {
+            let name = name.to_string();
+            if skip_discovery_name(&name) {
+                return None;
+            }
+            exported_item_address(&conn, &name).await
+        }
+    }))
+    .await;
+    for address in found.into_iter().flatten() {
+        if let Err(error) = watcher.register_status_notifier_item(&address).await {
+            warn!("sni: adopting {address} failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn skip_discovery_name(name: &str) -> bool {
+    name == "org.freedesktop.DBus"
+        || name == WATCHER_NAME
+        || name.starts_with("org.kde.StatusNotifierHost-")
+}
+
+async fn exported_item_address(conn: &Connection, name: &str) -> Option<String> {
+    // zbus returns the whole object tree from `/`, including child interfaces,
+    // so the path has to be parsed out of that tree rather than assumed.
+    let xml = introspect_path(conn, name, "/").await?;
+    let path = item_path_in_introspect(&xml)?;
+    Some(format!("{name}{path}"))
+}
+
+async fn introspect_path(conn: &Connection, name: &str, path: &str) -> Option<String> {
+    let proxy = zbus::fdo::IntrospectableProxy::builder(conn)
+        .destination(name)
+        .ok()?
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    match tokio::time::timeout(DISCOVER_TIMEOUT, proxy.introspect()).await {
+        Ok(Ok(xml)) => Some(xml),
+        _ => None,
+    }
+}
+
+/// Object path of the first node whose own interfaces include a tray item.
+///
+/// Nested `<node>` elements are not attributed to their parent: a root
+/// introspection document lists every child interface, and adopting `/` would
+/// miss the item.
+fn item_path_in_introspect(xml: &str) -> Option<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start..];
+        if rest.starts_with("</node>") {
+            stack.pop();
+            rest = &rest["</node>".len()..];
+            continue;
+        }
+        if let Some(name) = xml_attr_at(rest, "<node", "name") {
+            stack.push(name);
+            rest = skip_tag(rest);
+            continue;
+        }
+        if let Some(iface) = xml_attr_at(rest, "<interface", "name")
+            && ITEM_INTERFACES.contains(&iface)
+        {
+            return Some(object_path_from(&stack));
+        }
+        rest = skip_tag(rest);
+    }
+    None
+}
+
+fn object_path_from(stack: &[&str]) -> String {
+    if stack.is_empty() {
+        return "/".to_string();
+    }
+    let mut path = String::new();
+    for segment in stack {
+        path.push('/');
+        path.push_str(segment);
+    }
+    path
+}
+
+/// The quoted value of `attr` on a tag that starts with `tag`, if this fragment is that tag.
+fn xml_attr_at<'a>(xml: &'a str, tag: &str, attr: &str) -> Option<&'a str> {
+    if !xml.starts_with(tag) {
+        return None;
+    }
+    let header = xml.get(..xml.find('>')?)?;
+    let needle = format!("{attr}=");
+    let after = header.split_once(&needle)?.1;
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = after.get(1..)?;
+    let end = body.find(quote)?;
+    Some(&body[..end])
+}
+
+fn skip_tag(xml: &str) -> &str {
+    xml.find('>').map(|end| &xml[end + 1..]).unwrap_or("")
+}
+
+/// Probe a bus name that appears after startup and adopt it if it exports a tray item.
+async fn watch_new_item_names(conn: Connection, watcher: StatusNotifierWatcherProxy<'static>) {
+    let Ok(dbus) = DBusProxy::new(&conn).await else {
+        return;
+    };
+    let Ok(mut changes) = dbus.receive_name_owner_changed().await else {
+        return;
+    };
+    while let Some(change) = changes.next().await {
+        let Ok(args) = change.args() else {
+            continue;
+        };
+        if args
+            .new_owner()
+            .as_ref()
+            .is_none_or(|owner| owner.is_empty())
+        {
+            continue;
+        }
+        let name = args.name().to_string();
+        if skip_discovery_name(&name) {
+            continue;
+        }
+        // The unique name appears before the peer exports its object. One
+        // settle, not a poll, gives that export a chance to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(address) = exported_item_address(&conn, &name).await
+            && let Err(error) = watcher.register_status_notifier_item(&address).await
+        {
+            warn!("sni: adopting {address} failed: {error}");
+        }
+    }
 }
 
 /// The subset of `org.kde.StatusNotifierItem` the host reads and acts on. The
@@ -787,6 +1017,7 @@ impl Producer for SniHostProducer {
 async fn ensure_watcher(conn: &Connection) -> zbus::Result<()> {
     let watcher = Watcher {
         items: Arc::new(Mutex::new(HashSet::new())),
+        host_registered: Arc::new(Mutex::new(false)),
     };
     conn.object_server().at(WATCHER_PATH, watcher).await?;
     let reply = conn
@@ -886,6 +1117,10 @@ async fn run(tx: MsgSender) -> ProducerResult {
     // register with the watcher without waking this host.
     let mut lifecycle = lifecycle_stream(&watcher).await?;
     let mut lifecycle_closed = false;
+    if let Err(error) = adopt_existing_items(&conn, &watcher).await {
+        warn!("sni: adopting existing items failed: {error}");
+    }
+    tokio::spawn(watch_new_item_names(conn.clone(), watcher.clone()));
     let mut items = HashMap::new();
     let mut addresses = loop {
         match watcher.registered_status_notifier_items().await {
@@ -1322,7 +1557,19 @@ async fn activate(conn: &Connection, key: &str, x: i32, y: i32) -> zbus::Result<
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use zbus::interface;
     use zbus::zvariant::{OwnedValue, Value};
+
+    /// A StatusNotifierItem already on the bus when the watcher starts.
+    struct EarlyItem;
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl EarlyItem {
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "early"
+        }
+    }
 
     fn property(value: impl Into<Value<'static>>) -> OwnedValue {
         OwnedValue::try_from(value.into()).expect("owned DBus value")
@@ -1839,6 +2086,140 @@ mod tests {
                 wait_for_membership(&watcher, &[]).await;
                 wait_for_membership(&observer, &[]).await;
             });
+    }
+
+    /// A watcher with no host must say so, then announce the first host so a
+    /// client that started earlier can register. A concatenated Electron-style
+    /// address stays accepted.
+    #[test]
+    fn host_registration_announces_the_host_and_waiting_items_register() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let host = connect(&bus.address).await;
+                ensure_watcher(&host).await.expect("hosting the watcher");
+                // Default caching: the false → true flip is only visible if the
+                // watcher emits PropertiesChanged.
+                let observer = StatusNotifierWatcherProxy::new(&host)
+                    .await
+                    .expect("caching observer");
+                assert!(
+                    !observer
+                        .is_status_notifier_host_registered()
+                        .await
+                        .expect("host-registered read"),
+                    "a watcher with no host must not claim one is registered"
+                );
+                let mut announced = observer
+                    .receive_status_notifier_host_registered()
+                    .await
+                    .expect("host-registered signal subscription");
+
+                observer
+                    .register_status_notifier_host("org.kde.StatusNotifierHost-test")
+                    .await
+                    .expect("registering the host");
+                tokio::time::timeout(Duration::from_secs(2), announced.next())
+                    .await
+                    .expect("StatusNotifierHostRegistered")
+                    .expect("signal stream stayed open");
+                wait_for_host_registered(&observer).await;
+
+                let app = connect(&bus.address).await;
+                let waiting = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+                app.call_method(
+                    Some(WATCHER_NAME),
+                    WATCHER_PATH,
+                    Some("org.kde.StatusNotifierWatcher"),
+                    "RegisterStatusNotifierItem",
+                    &DEFAULT_ITEM_PATH,
+                )
+                .await
+                .expect("waiting item registers after the host signal");
+                let electron = "org.freedesktop.StatusNotifierItem-1-1/StatusNotifierItem/1";
+                app.call_method(
+                    Some(WATCHER_NAME),
+                    WATCHER_PATH,
+                    Some("org.kde.StatusNotifierWatcher"),
+                    "RegisterStatusNotifierItem",
+                    &electron,
+                )
+                .await
+                .expect("concatenated registration is accepted");
+
+                let watcher = build_watcher_proxy(&host).await.expect("watcher proxy");
+                let mut items = watcher
+                    .registered_status_notifier_items()
+                    .await
+                    .expect("membership after waiting registration");
+                items.sort();
+                let mut expected = vec![waiting, electron.to_string()];
+                expected.sort();
+                assert_eq!(items, expected);
+            });
+    }
+
+    /// An item exported before this watcher existed never calls Register. The
+    /// startup scan must adopt it, and dropping its name owner must remove it.
+    #[test]
+    fn startup_scan_adopts_an_item_exported_before_the_watcher() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let app = connect(&bus.address).await;
+                app.object_server()
+                    .at(DEFAULT_ITEM_PATH, EarlyItem)
+                    .await
+                    .expect("exporting the early item");
+                let expected = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+
+                let host = connect(&bus.address).await;
+                ensure_watcher(&host).await.expect("hosting the watcher");
+                let watcher = build_watcher_proxy(&host).await.expect("watcher proxy");
+                adopt_existing_items(&host, &watcher)
+                    .await
+                    .expect("startup scan");
+                wait_for_membership(&watcher, std::slice::from_ref(&expected)).await;
+
+                drop(app);
+                wait_for_membership(&watcher, &[]).await;
+            });
+    }
+
+    async fn wait_for_host_registered(proxy: &StatusNotifierWatcherProxy<'_>) {
+        let converged = async {
+            loop {
+                if proxy
+                    .is_status_notifier_host_registered()
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), converged)
+            .await
+            .expect("IsStatusNotifierHostRegistered flipped to true");
     }
 
     /// Poll `proxy` until its membership equals `expected`, panicking after a

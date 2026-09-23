@@ -653,6 +653,14 @@ surface placement and input need a live compositor. To verify on Hyprland:
       icon.
 
     **Protocol quirks** worth knowing when reading the code or debugging:
+    - **Electron trays must start after the bar.** Mullvad, Discord, and other
+      Electron apps check once whether `org.kde.StatusNotifierWatcher` exists.
+      If it does not, they fall back to GTK/XEmbed and never look again, so the
+      icon stays invisible on Wayland. Put `exec-once = tablero` ahead of those
+      apps. Quitting and starting the app again is the recovery if it lost the
+      race. Announcing the host (and adopting items already exported on the bus)
+      helps clients that wait, such as libappindicator and KStatusNotifierItem;
+      it does not resurrect an Electron process that already fell back.
     - **No watcher under bare compositors.** Hyprland (and similar) run no
       `org.kde.StatusNotifierWatcher`, so tablero serves one itself and only
       defers to an existing watcher when the well-known name is already owned.
