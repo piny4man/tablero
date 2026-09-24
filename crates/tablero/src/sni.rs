@@ -851,13 +851,20 @@ fn skip_tag(xml: &str) -> &str {
 }
 
 /// Probe a bus name that appears after startup and adopt it if it exports a tray item.
-async fn watch_new_item_names(conn: Connection, watcher: StatusNotifierWatcherProxy<'static>) {
+async fn watch_new_item_names(
+    conn: Connection,
+    watcher: StatusNotifierWatcherProxy<'static>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     let Ok(dbus) = DBusProxy::new(&conn).await else {
         return;
     };
     let Ok(mut changes) = dbus.receive_name_owner_changed().await else {
         return;
     };
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     while let Some(change) = changes.next().await {
         let Ok(args) = change.args() else {
             continue;
@@ -873,14 +880,22 @@ async fn watch_new_item_names(conn: Connection, watcher: StatusNotifierWatcherPr
         if skip_discovery_name(&name) {
             continue;
         }
-        // The unique name appears before the peer exports its object. One
-        // settle, not a poll, gives that export a chance to land.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if let Some(address) = exported_item_address(&conn, &name).await
-            && let Err(error) = watcher.register_status_notifier_item(&address).await
-        {
-            warn!("sni: adopting {address} failed: {error}");
-        }
+        // The name is advertised before the object may exist. Probe with a
+        // finite retry window, independently so one slow peer does not block
+        // the rest of the bus's name notifications.
+        let conn = conn.clone();
+        let watcher = watcher.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                if let Some(address) = exported_item_address(&conn, &name).await {
+                    if let Err(error) = watcher.register_status_notifier_item(&address).await {
+                        warn!("sni: adopting {address} failed: {error}");
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
     }
 }
 
@@ -1117,10 +1132,20 @@ async fn run(tx: MsgSender) -> ProducerResult {
     // register with the watcher without waking this host.
     let mut lifecycle = lifecycle_stream(&watcher).await?;
     let mut lifecycle_closed = false;
+    // Subscribe before scanning: a name created while introspection is in
+    // progress must be caught by either the scan or the subscription.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(watch_new_item_names(
+        conn.clone(),
+        watcher.clone(),
+        Some(ready_tx),
+    ));
+    if ready_rx.await.is_err() {
+        warn!("sni: bus name discovery unavailable; registered items still work");
+    }
     if let Err(error) = adopt_existing_items(&conn, &watcher).await {
         warn!("sni: adopting existing items failed: {error}");
     }
-    tokio::spawn(watch_new_item_names(conn.clone(), watcher.clone()));
     let mut items = HashMap::new();
     let mut addresses = loop {
         match watcher.registered_status_notifier_items().await {
@@ -2201,6 +2226,45 @@ mod tests {
 
                 drop(app);
                 wait_for_membership(&watcher, &[]).await;
+            });
+    }
+
+    /// A client may acquire its bus name before its item object is exported.
+    /// A one-shot 200ms probe misses it permanently.
+    #[test]
+    fn late_export_after_name_appearance_is_adopted() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let host = connect(&bus.address).await;
+                ensure_watcher(&host).await.expect("hosting the watcher");
+                let watcher = build_watcher_proxy(&host).await.expect("watcher proxy");
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(watch_new_item_names(
+                    host.clone(),
+                    watcher.clone(),
+                    Some(ready_tx),
+                ));
+                ready_rx.await.expect("name stream subscribed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let app = connect(&bus.address).await;
+                let expected = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                app.object_server()
+                    .at(DEFAULT_ITEM_PATH, EarlyItem)
+                    .await
+                    .expect("late item export");
+                wait_for_membership(&watcher, &[expected]).await;
+                task.abort();
             });
     }
 
