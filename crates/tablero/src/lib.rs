@@ -1111,6 +1111,16 @@ impl ProducerSnapshot {
     fn as_slice(&self) -> &[Msg] {
         &self.messages
     }
+
+    /// Replay the retained readings into a dashboard built after the producers
+    /// already emitted them — a bar for an output that appeared late. Without
+    /// this the new bar sits at every widget's initial reading (bluetooth
+    /// `unavailable`, blank network, empty tray) until each source next emits.
+    /// Mirrors what config hot-reload does for rebuilt dashboards; the cost is
+    /// one replay per output addition, nothing periodic.
+    fn seed_into(&self, dashboard: &mut Dashboard) {
+        replay_snapshot(dashboard, &self.messages);
+    }
 }
 
 /// Stable key for the latest-message map. Active-window is per-monitor so a
@@ -1187,6 +1197,15 @@ impl App {
             )
         });
         if built {
+            if let Some(surface) = self.outputs.get_mut(id) {
+                // A bar born after the producers emitted their one-shot initial
+                // snapshots would otherwise show every event-driven module at
+                // its initial reading until that source next emits. Replay what
+                // was retained — the same seeding config hot-reload uses — once,
+                // at creation; nothing periodic, no steady-state cost.
+                self.producer_snapshot.seed_into(&mut surface.dashboard);
+                surface.redraw.request("output-added");
+            }
             debug!(
                 "output {id} ({}) added; {} bar(s) live",
                 name.as_deref().unwrap_or("<unnamed>"),
@@ -2516,6 +2535,58 @@ mod scroll_tests {
                 (16, 37, 63, 255)
             );
         }
+    }
+
+    #[test]
+    fn a_bar_born_after_producers_started_is_seeded_from_the_retained_snapshot() {
+        use crate::widget::{Bluetooth, BluetoothState, Network, NetworkState};
+        // The one-shot readings a late-born bar would otherwise miss: the
+        // bluetooth adapter's initial state and NetworkManager's initial
+        // connectivity, exactly the classes that go stale on a hotplugged
+        // monitor until their source next emits.
+        let bt = Msg::Bluetooth(Bluetooth::new(BluetoothState::On, 0));
+        let net = Msg::Network(Some(Network::new(NetworkState::Wireless, Some("home-net"))));
+        let mut snapshot = ProducerSnapshot::default();
+        snapshot.note(&bt);
+        snapshot.note(&net);
+
+        let config = Config::from_toml_str("[bar]\nmodules-right = ['bluetooth', 'network']\n")
+            .expect("valid config");
+        let bounds = Bounds::new(0, 0, 320, 32);
+
+        // A bar that received the readings live, as the first output's does.
+        let mut live = config.build_dashboard(bounds, None);
+        assert!(live.update(&bt));
+        assert!(live.update(&net));
+
+        // A bar born after the producers emitted: seeding must leave it showing
+        // exactly what the live bar shows, so re-delivering the same readings is
+        // no visible change.
+        let mut seeded = config.build_dashboard(bounds, None);
+        snapshot.seed_into(&mut seeded);
+        assert!(
+            !seeded.update(&bt),
+            "seeded bar already shows the retained bluetooth reading"
+        );
+        assert!(
+            !seeded.update(&net),
+            "seeded bar already shows the retained network reading"
+        );
+
+        // Guard against a vacuous test: an unseeded fresh dashboard still
+        // changes on these readings, so the assertions above are meaningful.
+        let mut fresh = config.build_dashboard(bounds, None);
+        assert!(fresh.update(&bt));
+        assert!(fresh.update(&net));
+
+        // Seeded and live bars render identically, pixel for pixel.
+        let mut live_ctx = RenderContext::with_settings(320, 32, config.render_settings());
+        live.layout(&mut live_ctx, 320, 32);
+        live.draw(&mut live_ctx);
+        let mut seeded_ctx = RenderContext::with_settings(320, 32, config.render_settings());
+        seeded.layout(&mut seeded_ctx, 320, 32);
+        seeded.draw(&mut seeded_ctx);
+        assert_eq!(seeded_ctx.pixels(), live_ctx.pixels());
     }
 
     #[test]
