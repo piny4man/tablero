@@ -980,7 +980,7 @@ impl Config {
                     "appearance.theme_file requires a config file path; use load_from_path".into(),
                 )
             })?;
-            let theme_path = resolve_theme_file(value, path).map_err(&invalid)?;
+            let theme_path = resolve_theme_file(value, path).map_err(invalid)?;
             let theme =
                 swatches::Theme::load(theme_path).map_err(|error| invalid(error.to_string()))?;
             // Insert only absent keys in the raw document. Explicit values,
