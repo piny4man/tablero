@@ -1,6 +1,6 @@
 [package]
 name = "tablero"
-version = "0.4.7"
+version = "0.5.0"
 edition = "2024"
 authors = ["piny4man <development@pinya.dev>"]
 description = "A fast, native Wayland status bar for Hyprland"

@@ -19,6 +19,7 @@ pub mod clock;
 pub mod config;
 mod config_reload;
 pub mod icon;
+pub mod lifecycle;
 mod performance;
 pub mod redraw;
 pub mod render;
@@ -1667,6 +1668,24 @@ fn set_tray_command_position(command: &mut Command, origin: (i32, i32), local: (
 /// app/theme file changes and the bar hot-reloads theme/layout (producers keep their
 /// original set until restart). See [`run_with_producers`] for a custom set.
 pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    run_internal(config, config_path, None)
+}
+
+/// Run a named, session-local instance with lifecycle control enabled.
+/// The instance must be claimed before any Wayland surfaces are opened.
+pub fn run_instance(
+    config: Config,
+    config_path: Option<PathBuf>,
+    instance: lifecycle::Instance,
+) -> Result<(), Box<dyn Error>> {
+    run_internal(config, config_path, Some(instance))
+}
+
+fn run_internal(
+    config: Config,
+    config_path: Option<PathBuf>,
+    instance: Option<lifecycle::Instance>,
+) -> Result<(), Box<dyn Error>> {
     let mut producers: Vec<Box<dyn Producer>> = vec![Box::new(HyprlandProducer::new())];
     // Gate non-Hyprland sources so a minimal bar does not open PipeWire, host a
     // StatusNotifierWatcher, or poll sysfs/backlight unnecessarily.
@@ -1723,7 +1742,7 @@ pub fn run(config: Config, config_path: Option<PathBuf>) -> Result<(), Box<dyn E
                 .map_or_else(HypridleProducer::new, HypridleProducer::with_interval),
         ));
     }
-    run_with_producers(config, producers, config_path)
+    run_loop(config, producers, config_path, instance)
 }
 
 /// Run the config poll timer until the watcher no longer needs one. `polling`
@@ -1782,6 +1801,15 @@ pub fn run_with_producers(
     config: Config,
     producers: Vec<Box<dyn Producer>>,
     config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    run_loop(config, producers, config_path, None)
+}
+
+fn run_loop(
+    config: Config,
+    producers: Vec<Box<dyn Producer>>,
+    config_path: Option<PathBuf>,
+    mut instance: Option<lifecycle::Instance>,
 ) -> Result<(), Box<dyn Error>> {
     let performance = PerformanceLogger::from_env();
     let power_settings = power_profiles_settings(&config);
@@ -1939,8 +1967,35 @@ pub fn run_with_producers(
         Some(bridge)
     };
 
+    if let Some(instance) = &mut instance {
+        let metadata = instance.metadata.clone();
+        handle.insert_source(instance.listen()?, move |event, _, app| {
+            if let ChannelEvent::Msg(request) = event {
+                let result = match request.operation {
+                    lifecycle::Operation::Status => Ok(()),
+                    lifecycle::Operation::Reload => {
+                        let candidate = match &mut app.config_watcher {
+                            Some(watcher) => watcher.reload_now().map_err(|e| e.to_string()),
+                            None => Ok(Config::default()),
+                        };
+                        candidate.map(|config| app.reload_config(config))
+                    }
+                    lifecycle::Operation::Stop => {
+                        app.exit = true;
+                        Ok(())
+                    }
+                };
+                request.reply(&metadata, result);
+            }
+        })?;
+    }
+
     // A configure handled during the roundtrip above has a frame waiting.
     app.flush_redraws();
+
+    if let Some(instance) = &mut instance {
+        instance.notify_ready()?;
+    }
 
     let signal = event_loop.get_signal();
     event_loop.run(None, &mut app, move |app| {

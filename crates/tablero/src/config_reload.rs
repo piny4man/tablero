@@ -238,6 +238,27 @@ impl ConfigWatcher {
         }
     }
 
+    /// Explicit requests bypass debounce, but still reject incomplete or mixed reads.
+    pub(crate) fn reload_now(&mut self) -> Result<Config, ConfigError> {
+        let before = self.snapshot();
+        let config = Config::load_for_reload(&self.path)?;
+        if self.snapshot() != before {
+            return Err(ConfigError::Invalid {
+                path: Some(self.path.clone()),
+                message: "config or theme changed during reload; retry after saving".into(),
+            });
+        }
+        self.active_theme = config
+            .appearance
+            .theme_file
+            .as_deref()
+            .and_then(|value| resolve_theme_file(value, &self.path).ok());
+        self.sync_watches();
+        self.observed = Some(self.snapshot());
+        self.pending = None;
+        Ok(config)
+    }
+
     /// Returns a fully validated candidate only after a stable 400ms interval.
     /// The caller replaces UI state only on Ok; errors are emitted once per edit.
     pub(crate) fn poll(&mut self, now: Instant) -> Option<Result<Config, ConfigError>> {
@@ -290,6 +311,29 @@ impl ConfigWatcher {
 mod tests {
     use super::*;
     const THEME: &str = include_str!("../tests/fixtures/swatches.toml");
+
+    #[test]
+    fn explicit_reload_reads_immediately_and_preserves_active_theme_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let theme = dir.path().join("theme.toml");
+        fs::write(&path, "[appearance]\ntheme_file = 'theme.toml'").unwrap();
+        fs::write(&theme, THEME).unwrap();
+        let active = Config::load_from_path(&path).unwrap();
+        let mut watcher = ConfigWatcher::new(path.clone(), &active);
+        fs::write(&theme, THEME.replace("#80D4FF", "#010203")).unwrap();
+        assert_eq!(
+            watcher.reload_now().unwrap().theme.accent.to_rgba(),
+            (1, 2, 3, 255)
+        );
+        let previous = watcher.active_theme.clone();
+        fs::write(&path, "height = 'invalid'").unwrap();
+        assert!(watcher.reload_now().is_err());
+        assert_eq!(watcher.active_theme, previous);
+        fs::write(&path, "height = 40").unwrap();
+        assert_eq!(watcher.reload_now().unwrap().height, 40);
+        assert_eq!(watcher.active_theme, None);
+    }
 
     fn settled(watcher: &mut ConfigWatcher, now: &mut Instant) -> Result<Config, ConfigError> {
         *now += Duration::from_secs(1);

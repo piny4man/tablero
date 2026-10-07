@@ -54,6 +54,70 @@ RUST_LOG=info cargo run -p tablero
 For opt-in render and interaction timing, including the balanced-vs-performance
 A/B procedure and baseline, see [Interaction latency diagnostics](docs/interaction-latency.md).
 
+## Reload, restart, and development instances
+
+```sh
+tablero reload    # re-read the running bar's config and selected theme
+tablero restart   # replace the bar, or start it after a crash, in the background
+tablero --help
+```
+
+Config and selected theme files already **reload automatically on save**.
+`reload` forces an immediate validated read, keeps live widget readings, and
+reports invalid changes without replacing the working bar. If no instance is
+running, it reports an error and suggests `restart`. Adding a widget whose
+producer was not enabled at startup still requires `restart`.
+
+Commands target only the **current Wayland session** (`XDG_RUNTIME_DIR` and
+`WAYLAND_DISPLAY`) and the selected instance name, which defaults to `default`.
+One bar process is allowed per name per session; a second normal launch reports
+an error instead of opening duplicate bars. Other sessions are unaffected.
+
+`restart` validates configuration **before stopping** the working instance. It
+retains that instance's absolute config path and executable unless `--config`
+overrides the path. When the instance is stopped, it uses the invoking binary
+and the usual config path (or `--config`). Restart waits for startup readiness
+before reporting success, returns to the terminal, and detaches the new bar
+from it. Startup failures are reported to the caller; background stdout/stderr
+are discarded. This is manual recovery, not automatic crash supervision.
+
+### Run a development bar alongside your normal bar
+
+Use a separate instance name; debug builds are not automatically isolated:
+
+```sh
+# Normal installed bar (usually started by the compositor).
+tablero
+
+# In another terminal, from this repository:
+cargo run -p tablero -- --instance dev --config ./dev.toml
+
+# Control only the development bar:
+cargo run -p tablero -- reload --instance dev
+cargo run -p tablero -- restart --instance dev
+
+# Change its retained config path:
+cargo run -p tablero -- restart --instance dev --config ./another-dev.toml
+```
+
+Create a valid `dev.toml` before testing, for example by copying
+`crates/tablero/config.example.toml`. Relative config paths are resolved against
+the launch directory and retained as absolute paths. Omit `--config` to use the
+usual configuration; both bars then share it, so saved changes affect both.
+`reload` always uses the running instance's path: use `restart --config PATH`
+to select another file.
+
+Named instances keep **normal layer-shell placement and reserved space**.
+Running both may place two bars on each output and reserve space for both; there
+is no development overlay mode. A restart does not rebuild the binary: build the
+development executable first when testing code changes. If `dev` has crashed,
+use the development binary (or `cargo run`) to restart it and pass `--config`
+again if it used a custom path; a stopped instance has no retained metadata.
+
+These commands require both the controlling and running binaries to include
+lifecycle support. After updating an older installation, stop its old process
+and launch the updated binary once; commands cannot control pre-support bars.
+
 ## What it does
 
 - Opens a **top-anchored** layer-shell surface spanning the output width, with an
