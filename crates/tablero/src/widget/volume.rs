@@ -233,6 +233,7 @@ impl Widget for VolumeWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "VolumeWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // An absent volume leaves the template empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
@@ -246,6 +247,7 @@ impl Widget for VolumeWidget {
         );
     }
 
+    #[hotpath::measure(impl_type = "VolumeWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }

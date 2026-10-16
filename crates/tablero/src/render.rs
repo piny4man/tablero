@@ -226,6 +226,7 @@ impl TextCache {
     }
 
     /// The shaped form of `text` in the `key` box, shaping it on a miss.
+    #[hotpath::measure(impl_type = "TextCache")]
     fn get_or_shape(
         &mut self,
         font_system: &mut FontSystem,
@@ -259,6 +260,7 @@ impl TextCache {
     }
 }
 
+#[hotpath::measure]
 fn shape_text(
     font_system: &mut FontSystem,
     settings: &RenderSettings,
@@ -472,6 +474,7 @@ impl RenderContext {
 
     /// Fill the whole target with the configured background color, honoring its
     /// alpha (a transparent background lets the desktop show through).
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn fill_background(&mut self) {
         let (r, g, b, a) = self.settings.background;
         self.pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
@@ -488,6 +491,7 @@ impl RenderContext {
     /// shorter side (an over-large radius yields a stadium/circle, not
     /// artifacts). Nothing is drawn for a zero-area slot or a fully transparent
     /// color, so a widget with no background color draws no pill at all.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn fill_rounded_rect(&mut self, bounds: Bounds, color: (u8, u8, u8, u8), radius: f32) {
         let (r, g, b, a) = color;
         if bounds.width == 0 || bounds.height == 0 || a == 0 {
@@ -513,6 +517,7 @@ impl RenderContext {
     /// The stroke is inset by half its width so it stays inside the widget's
     /// layout slot. `radius` and `width` are physical pixels; callers scale
     /// logical widget geometry before invoking this primitive.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn stroke_rounded_rect(
         &mut self,
         bounds: Bounds,
@@ -548,6 +553,7 @@ impl RenderContext {
     /// line box is the full bound height), and never wraps. Glyphs are clipped
     /// to nothing outside the bounds only insofar as the shaping box limits
     /// them; callers size bounds to fit their content.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn draw_text(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8, u8)) {
         if bounds.width == 0 || bounds.height == 0 {
             return;
@@ -561,6 +567,7 @@ impl RenderContext {
     /// Intended for standalone icon glyphs whose font bearings can make the
     /// normal line-box alignment look off-center. Labels should keep using
     /// [`draw_text`](Self::draw_text) so their shared baseline remains stable.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn draw_text_centered(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8, u8)) {
         if text.is_empty() || bounds.width == 0 || bounds.height == 0 {
             return;
@@ -581,6 +588,7 @@ impl RenderContext {
     ///
     /// The ink extents cost a pass over the glyph grid, so they are computed
     /// only when `place` is handed them lazily — once per cached string.
+    #[hotpath::measure(impl_type = "RenderContext")]
     fn blit_text(
         &mut self,
         text: &str,
@@ -651,6 +659,7 @@ impl RenderContext {
     /// font, same `Shaping::Advanced` glyph fallback), so the measured width
     /// agrees with the drawn width up to the sub-pixel the `ceil` absorbs. Empty
     /// text measures zero, so an empty widget reserves no slot.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn measure_text(&mut self, text: &str) -> u32 {
         if text.is_empty() {
             return 0;
@@ -682,6 +691,7 @@ impl RenderContext {
     /// centered; nothing is drawn for an empty slot, an empty image, or a byte
     /// slice whose length does not match `img_w * img_h * 4`. This is the one
     /// raster-image primitive the tray widget needs beyond text.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn draw_icon(&mut self, rgba: &[u8], img_w: u32, img_h: u32, bounds: Bounds) {
         if bounds.width == 0 || bounds.height == 0 || img_w == 0 || img_h == 0 {
             return;
@@ -731,6 +741,7 @@ impl RenderContext {
     /// text beside it. A no-op for a zero-area slot or a fully transparent color.
     /// This is the vector counterpart to [`draw_icon`](Self::draw_icon)'s raster
     /// blit and the only path built-in icons take to the pixmap.
+    #[hotpath::measure(impl_type = "RenderContext")]
     pub fn draw_builtin_icon(
         &mut self,
         icon: BuiltinIcon,

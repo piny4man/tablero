@@ -52,6 +52,7 @@ pub struct CpuTimes {
 /// read. The numeric fields are `user nice system idle iowait irq softirq steal
 /// guest guest_nice`; `total` sums them and `idle` is `idle + iowait`. Returns
 /// `None` if the aggregate line is missing or malformed. Pure over its input.
+#[hotpath::measure]
 pub fn parse_cpu_times(proc_stat: &str) -> Option<CpuTimes> {
     let line = proc_stat
         .lines()
@@ -93,6 +94,7 @@ pub fn cpu_usage(prev: CpuTimes, cur: CpuTimes) -> f64 {
 /// estimate of what is reclaimable for new work, the figure a user reads as
 /// "free", so this matches what tools like `free` report. Returns `None` if
 /// either field is missing or `MemTotal` is zero. Pure over its input.
+#[hotpath::measure]
 pub fn parse_mem_usage(proc_meminfo: &str) -> Option<f64> {
     let mut total = None;
     let mut available = None;
@@ -119,6 +121,7 @@ fn parse_kb(field: &str) -> Option<u64> {
 
 /// Read and parse the current CPU counters, logging and degrading to `None` on
 /// any failure so a transient read error never ends the stream.
+#[hotpath::measure]
 fn read_cpu_times() -> Option<CpuTimes> {
     // procfs reads are served from kernel memory, not disk, so this does not
     // meaningfully block the runtime.
@@ -133,6 +136,7 @@ fn read_cpu_times() -> Option<CpuTimes> {
 
 /// Read and parse the current memory load, logging and degrading to `None` on
 /// any failure.
+#[hotpath::measure]
 fn read_mem_usage() -> Option<f64> {
     match fs::read_to_string("/proc/meminfo") {
         Ok(meminfo) => parse_mem_usage(&meminfo),

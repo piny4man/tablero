@@ -23,7 +23,9 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use hotpath::wrap::std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::future::{Either, select};
@@ -69,6 +71,7 @@ type RawPixmap = (i32, i32, Vec<u8>);
 type RawMenuLayout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
 
 /// Normalize one recursive DBusMenu layout node.
+#[hotpath::measure]
 pub fn parse_menu_layout(value: OwnedValue) -> Option<TrayMenuItem> {
     let (id, properties, children): RawMenuLayout = value.try_into().ok()?;
     parse_raw_menu_layout((id, properties, children))
@@ -237,6 +240,7 @@ fn absolute_icon_prefix_ok(path: &Path) -> bool {
 /// directory is probed for `<name>.png`, and the first hit wins. Names with
 /// path separators or `..` are rejected. Returns `None` when nothing matches,
 /// so a name the theme cannot satisfy degrades to no icon rather than an error.
+#[hotpath::measure]
 pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() {
@@ -260,6 +264,7 @@ pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Read an icon file if it exists and stays under [`MAX_ICON_FILE_BYTES`].
+#[hotpath::measure]
 async fn read_icon_file(path: &Path) -> Option<Vec<u8>> {
     let meta = tokio::fs::metadata(path).await.ok()?;
     if !meta.is_file() || meta.len() > MAX_ICON_FILE_BYTES {
@@ -322,6 +327,7 @@ pub fn menu_mode(menu_path: Option<&str>, item_is_menu: Option<bool>) -> TrayMen
 /// source uses it; one that ships neither yields `None` and shows its initial.
 ///
 /// The PNG read is async so it never blocks the single-worker producer runtime.
+#[hotpath::measure]
 async fn resolve_icon(
     icon_name: &str,
     pixmaps: &[RawPixmap],
@@ -335,6 +341,7 @@ async fn resolve_icon(
 /// Resolve `icon_name` against the item's `IconThemePath` and the standard system
 /// icon directories, decoding the first match. Any failure along the way (no
 /// file, unreadable, undecodable) yields `None`.
+#[hotpath::measure]
 async fn resolve_themed_icon(icon_name: &str, theme_path: &str) -> Option<TrayIcon> {
     let dirs = icon_search_dirs(theme_path);
     let file = find_icon_file(icon_name, &dirs)?;
@@ -405,6 +412,7 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
 /// never replies is treated as unreadable, exactly like a fast failure — the
 /// cached item is retained and the read is retried, so one hung peer can never
 /// park the producer.
+#[hotpath::measure]
 async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
     match tokio::time::timeout(CALL_TIMEOUT, read_item_props(conn, key)).await {
         Ok(item) => item,
@@ -417,6 +425,7 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
 
 /// The raw, unbounded property read behind [`read_item`]; separated so the
 /// caller can apply the timeout.
+#[hotpath::measure]
 async fn read_item_props(conn: &Connection, key: &str) -> Option<TrayItem> {
     let (name, path) = parse_item_address(key)?;
     let item = StatusNotifierItemProxy::builder(conn)
@@ -472,6 +481,7 @@ async fn reconcile_state(
 /// Watcher membership is authoritative for removal. A failed property read for
 /// an address that is still registered retains its cached item and requests a
 /// retry, preventing one transient DBus error from clearing the whole tray.
+#[hotpath::measure]
 fn reconcile_items(
     items: &mut HashMap<String, TrayItem>,
     addresses: &[String],
@@ -772,6 +782,7 @@ async fn exported_item_address(conn: &Connection, name: &str) -> Option<String> 
     Some(format!("{name}{path}"))
 }
 
+#[hotpath::measure]
 async fn introspect_path(conn: &Connection, name: &str, path: &str) -> Option<String> {
     let proxy = zbus::fdo::IntrospectableProxy::builder(conn)
         .destination(name)
@@ -1031,8 +1042,14 @@ impl Producer for SniHostProducer {
 /// watcher purely through its proxy.
 async fn ensure_watcher(conn: &Connection) -> zbus::Result<()> {
     let watcher = Watcher {
-        items: Arc::new(Mutex::new(HashSet::new())),
-        host_registered: Arc::new(Mutex::new(false)),
+        items: Arc::new(hotpath::mutex!(
+            std::sync::Mutex::new(HashSet::new()),
+            label = "sni-items".to_owned()
+        )),
+        host_registered: Arc::new(hotpath::mutex!(
+            std::sync::Mutex::new(false),
+            label = "sni-host-registered".to_owned()
+        )),
     };
     conn.object_server().at(WATCHER_PATH, watcher).await?;
     let reply = conn
@@ -1462,6 +1479,7 @@ async fn menu_proxy<'a>(
     ))
 }
 
+#[hotpath::measure]
 async fn open_menu(
     conn: &Connection,
     updates: &MsgSender,
@@ -1494,6 +1512,7 @@ async fn context_menu_fallback(
     result
 }
 
+#[hotpath::measure]
 async fn send_menu_layout(
     menu: &DBusMenuProxy<'_>,
     updates: &MsgSender,
@@ -1566,6 +1585,7 @@ async fn monitor_menu(conn: Connection, updates: MsgSender, key: String) -> zbus
     Ok(())
 }
 
+#[hotpath::measure]
 async fn activate_menu_item(conn: &Connection, key: &str, id: i32) -> zbus::Result<()> {
     let Some(menu) = menu_proxy(conn, key).await? else {
         return Ok(());
@@ -1625,7 +1645,7 @@ mod tests {
     #[test]
     fn owner_loss_allows_the_same_item_address_to_register_again() {
         let address = "org.example.Tray/StatusNotifierItem";
-        let items = Mutex::new(HashSet::from([address.to_string()]));
+        let items = hotpath::mutex!(std::sync::Mutex::new(HashSet::from([address.to_string()])));
 
         assert!(remove_registered_item(&items, address));
         assert!(items.lock().unwrap().insert(address.to_string()));

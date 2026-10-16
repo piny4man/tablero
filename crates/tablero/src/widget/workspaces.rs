@@ -301,6 +301,7 @@ impl Widget for WorkspaceWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "WorkspaceWidget")]
     fn measure(&self, _ctx: &mut RenderContext, height: u32) -> u32 {
         // One square cell per workspace, each as wide as the row is tall, matching
         // the cells [`item_cells`](WorkspaceWidget::item_cells) will draw (which
@@ -308,6 +309,7 @@ impl Widget for WorkspaceWidget {
         self.view().ids.len() as u32 * height
     }
 
+    #[hotpath::measure(impl_type = "WorkspaceWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         let active = self.view().active;
         let radius = (self.style.radius * ctx.scale_factor()) as f32;

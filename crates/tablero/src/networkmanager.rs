@@ -123,6 +123,7 @@ trait AccessPoint {
 /// warning rather than ending the stream — a transient DBus hiccup, or
 /// NetworkManager not running at all, never takes the source down; the widget
 /// simply stays blank.
+#[hotpath::measure]
 async fn read_snapshot(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> Option<Network> {
     match try_read(conn, nm).await {
         Ok(network) => Some(network),
@@ -135,6 +136,7 @@ async fn read_snapshot(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> Optio
 
 /// Read the overall state and primary connection, following it to a type and
 /// (on Wi-Fi) an SSID, then fold them into a normalized snapshot.
+#[hotpath::measure]
 async fn try_read(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> zbus::Result<Network> {
     let state = nm.state().await?;
     let primary = nm.primary_connection().await?;
@@ -166,6 +168,7 @@ async fn try_read(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> zbus::Resu
 /// any of those simply yields `None`, so the widget falls back to the bare
 /// `"wifi"` label rather than erroring. The raw bytes are decoded lossily — an
 /// SSID is not guaranteed to be valid UTF-8.
+#[hotpath::measure]
 async fn read_ssid(conn: &Connection, active: &ActiveConnectionProxy<'_>) -> Option<String> {
     let device_path = active.devices().await.ok()?.into_iter().next()?;
     let wireless = WirelessDeviceProxy::builder(conn)

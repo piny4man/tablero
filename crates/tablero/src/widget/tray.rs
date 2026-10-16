@@ -431,12 +431,14 @@ impl Widget for TrayWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "TrayWidget")]
     fn measure(&self, _ctx: &mut RenderContext, height: u32) -> u32 {
         // One square cell per item, each as wide as the row is tall, matching the
         // cells [`item_cells`](TrayWidget::item_cells) will draw.
         self.len() as u32 * height
     }
 
+    #[hotpath::measure(impl_type = "TrayWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         let scale = ctx.scale_factor();
         let radius = (self.style.radius * scale) as f32;

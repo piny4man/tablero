@@ -3,6 +3,8 @@
 This is the repeatable investigation procedure and the first local baseline for
 [NUKE-69](https://linear.app/tiendacables/issue/NUKE-69). It separates work done
 inside Tablero from compositor presentation and from the other desktop apps.
+For a per-function breakdown of where that time and memory go, see
+[Profiling with hotpath](hotpath-profiling.md).
 
 ## Diagnostic logging
 

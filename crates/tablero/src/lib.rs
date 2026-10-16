@@ -274,6 +274,7 @@ impl Surface {
     ///
     /// `seed` is replayed into the fresh dashboard so widgets keep the last
     /// producer snapshot instead of going blank until the next event.
+    #[hotpath::measure(impl_type = "Surface")]
     fn apply_config(&mut self, config: Config, seed: &[Msg]) {
         let height = config.height;
         let height_changed = self.height != height;
@@ -316,6 +317,7 @@ impl Surface {
     /// reported a visible change. This is the steady-state redraw policy: the
     /// loop stays idle when an update changes nothing on screen, and a burst of
     /// changes shares the one frame [`Surface::flush`] paints.
+    #[hotpath::measure(impl_type = "Surface")]
     fn handle(&mut self, msg: &Msg) -> bool {
         let changed = self.dashboard.update(msg);
         if changed {
@@ -422,6 +424,7 @@ impl Surface {
     ///
     /// Uses two alternating SHM slots: when the compositor has released the
     /// next slot, its mmap is reused instead of allocating a new one.
+    #[hotpath::measure(impl_type = "Surface")]
     fn draw(&mut self, pool: &mut SlotPool, cause: &'static str) -> bool {
         let started = self.performance.start();
 
@@ -489,6 +492,7 @@ impl Surface {
         committed
     }
 
+    #[hotpath::measure(impl_type = "Surface")]
     fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
         let started = self.performance.start();
         // Zero for a surface's first frame, so its counters are still logged.
@@ -558,6 +562,7 @@ impl Surface {
         );
     }
 
+    #[hotpath::measure(impl_type = "Surface")]
     fn paint_new_buffer(
         &mut self,
         pool: &mut SlotPool,
@@ -587,6 +592,7 @@ impl Surface {
     /// compositor re-composites (and re-blurs) just that part of the strip. The
     /// buffer itself is always painted in full, so either slot is a complete
     /// frame whichever the compositor shows.
+    #[hotpath::measure(impl_type = "Surface")]
     fn commit_buffer(&mut self, idx: usize, width: u32, height: u32, damage: Damage) -> bool {
         let Some(buffer) = self.buffers[idx].as_ref() else {
             return false;
@@ -760,6 +766,7 @@ impl TrayMenuSurface {
         })
     }
 
+    #[hotpath::measure(impl_type = "TrayMenuSurface")]
     fn update(&mut self, menu: &TrayMenu, pool: &mut SlotPool) -> bool {
         if menu.revision < self.revision {
             return true;
@@ -779,6 +786,7 @@ impl TrayMenuSurface {
         true
     }
 
+    #[hotpath::measure(impl_type = "TrayMenuSurface")]
     fn draw(&mut self, pool: &mut SlotPool) {
         if !self.configured {
             return;
@@ -900,6 +908,7 @@ impl TooltipSurface {
         self.popup.wl_surface() == surface
     }
 
+    #[hotpath::measure(impl_type = "TooltipSurface")]
     fn draw(&mut self, pool: &mut SlotPool) {
         if !self.configured {
             return;
@@ -949,6 +958,7 @@ impl TooltipSurface {
 }
 
 /// Paint a tooltip panel of physical `size` holding `text` into `ctx`.
+#[hotpath::measure]
 fn paint_tooltip(
     ctx: &mut RenderContext,
     text: &str,
@@ -1082,6 +1092,7 @@ struct ProducerSnapshot {
     messages: Vec<Msg>,
 }
 
+#[hotpath::measure]
 fn replay_snapshot(dashboard: &mut Dashboard, seed: &[Msg]) {
     for msg in seed {
         let _ = dashboard.update(msg);
@@ -1090,6 +1101,7 @@ fn replay_snapshot(dashboard: &mut Dashboard, seed: &[Msg]) {
 }
 
 impl ProducerSnapshot {
+    #[hotpath::measure(impl_type = "ProducerSnapshot")]
     fn note(&mut self, msg: &Msg) {
         if matches!(
             msg,
@@ -1175,6 +1187,7 @@ impl App {
     /// for an output we already show never rebuilds or replaces its surface. The
     /// connector name selects the output's resolved config and scopes its
     /// workspace widget to that monitor.
+    #[hotpath::measure(impl_type = "App")]
     fn add_output(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<App>) {
         let id = output_key(&output);
         let name = self.output_state.info(&output).and_then(|info| info.name);
@@ -1219,6 +1232,7 @@ impl App {
     ///
     /// Producers already running stay as-is; newly required modules need a
     /// process restart. Invalid files are logged and ignored by the watcher.
+    #[hotpath::measure(impl_type = "App")]
     fn reload_config(&mut self, config: Config) {
         self.outputs.set_base(config);
         self.hide_tooltip();
@@ -1282,6 +1296,7 @@ impl App {
     /// Fan a message out to every output's dashboard; the ones that changed
     /// repaint at the next [`App::flush_redraws`]. The clock timer and every
     /// producer reach all bars this way.
+    #[hotpath::measure(impl_type = "App")]
     fn handle_all(&mut self, msg: &Msg) {
         self.producer_snapshot.note(msg);
         let mut changed = false;
@@ -1306,6 +1321,7 @@ impl App {
 
     /// Paint every bar with a repaint pending. Runs once per loop dispatch, after
     /// all of that dispatch's messages and Wayland events have been applied.
+    #[hotpath::measure(impl_type = "App")]
     fn flush_redraws(&mut self) {
         let App { pool, outputs, .. } = self;
         let mut committed = false;
@@ -1367,6 +1383,7 @@ impl App {
         }
     }
 
+    #[hotpath::measure(impl_type = "App")]
     fn handle_message(&mut self, msg: &Msg, qh: &QueueHandle<App>) {
         if let Msg::TrayMenu(menu) = msg {
             if let Some(shown) = self
@@ -1436,6 +1453,7 @@ impl App {
 
     /// Show `tooltip` under the bar on `output_id`, or hide the current one when
     /// the pointer is over nothing that has one.
+    #[hotpath::measure(impl_type = "App")]
     fn update_tooltip(
         &mut self,
         output_id: OutputId,
@@ -1528,6 +1546,7 @@ impl App {
         });
     }
 
+    #[hotpath::measure(impl_type = "App")]
     fn show_tray_menu(&mut self, menu: &TrayMenu, qh: &QueueHandle<App>) {
         let Some(pending) = self
             .pending_tray_menu
@@ -2261,6 +2280,7 @@ impl SeatHandler for App {
 }
 
 impl PointerHandler for App {
+    #[hotpath::measure(impl_type = "App")]
     fn pointer_frame(
         &mut self,
         conn: &Connection,

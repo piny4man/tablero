@@ -79,6 +79,7 @@ pub fn parse_workspace_entries(json: &str) -> serde_json::Result<Vec<(i32, Optio
 
 /// Parse the JSON array returned by `j/workspaces` into its workspace ids,
 /// discarding the per-monitor membership.
+#[hotpath::measure]
 pub fn parse_workspaces(json: &str) -> serde_json::Result<Vec<i32>> {
     Ok(parse_workspace_entries(json)?
         .into_iter()
@@ -122,6 +123,7 @@ struct RawActiveWindow {
 /// A bare `{}` (no focused window / empty desktop) parses to an empty
 /// snapshot, which the [`TitleWidget`](crate::widget::TitleWidget) treats as "no
 /// window" and reserves no slot.
+#[hotpath::measure]
 pub fn parse_active_window(json: &str) -> serde_json::Result<ActiveWindow> {
     let raw: RawActiveWindow = serde_json::from_str(json)?;
     Ok(ActiveWindow::new(raw.class, raw.title))
@@ -135,6 +137,7 @@ pub fn parse_active_window(json: &str) -> serde_json::Result<ActiveWindow> {
 /// payload that does not match the `,`-separated two-field shape — callers
 /// should only invoke this on lines already confirmed to be an
 /// `activewindow`-family event.
+#[hotpath::measure]
 pub fn parse_activewindow_stream(line: &str) -> Option<(String, String)> {
     let (name, rest) = line.split_once(">>")?;
     if name != "activewindow" && name != "activewindowv2" {
@@ -149,6 +152,7 @@ pub fn parse_activewindow_stream(line: &str) -> Option<(String, String)> {
 ///
 /// Pure over its inputs: the integration tests drive the full
 /// parse → message → widget path through this without a live compositor.
+#[hotpath::measure]
 pub fn snapshot_from_json(
     workspaces_json: &str,
     active_json: &str,
@@ -192,6 +196,7 @@ pub fn snapshot_with_monitors(
 /// uses `hl.dsp.focus({ workspace = N })` — the same dispatcher Hyprland's own
 /// keybindings invoke. The legacy `dispatch workspace N` string form no longer
 /// parses under the Lua config (it becomes invalid Lua).
+#[hotpath::measure]
 pub fn dispatch_request(command: &Command) -> Option<String> {
     match command {
         Command::SwitchWorkspace(id) => {
@@ -300,6 +305,7 @@ fn resolve_socket_dir() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
 }
 
 /// Send a one-shot request to `.socket.sock` and return the full response.
+#[hotpath::measure]
 async fn query(dir: &Path, request: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(dir.join(".socket.sock")).await?;
     stream.write_all(request.as_bytes()).await?;
@@ -310,6 +316,7 @@ async fn query(dir: &Path, request: &str) -> io::Result<String> {
 
 /// Query the workspace, active-workspace and monitor endpoints and fold them
 /// into a normalized, monitor-aware snapshot.
+#[hotpath::measure]
 async fn fetch_snapshot(dir: &Path) -> Result<Workspaces, Box<dyn Error + Send + Sync>> {
     let workspaces_json = query(dir, "j/workspaces").await?;
     let active_json = query(dir, "j/activeworkspace").await?;
@@ -328,6 +335,7 @@ async fn fetch_snapshot(dir: &Path) -> Result<Workspaces, Box<dyn Error + Send +
 /// parser folds that into an empty snapshot, which the
 /// [`TitleWidget`](crate::TitleWidget) treats as "no window" and reserves no
 /// slot for.
+#[hotpath::measure]
 async fn fetch_activewindow(dir: &Path) -> Result<ActiveWindow, Box<dyn Error + Send + Sync>> {
     let json = query(dir, "j/activewindow").await?;
     Ok(parse_active_window(&json)?)
@@ -414,6 +422,7 @@ struct EventWork {
 
 /// Collapse a burst of event lines into one workspace refresh plus the focus
 /// lines that still have to be applied.
+#[hotpath::measure]
 fn event_work<'a>(lines: impl IntoIterator<Item = &'a str>) -> EventWork {
     let mut refresh_workspaces = false;
     let mut focus_lines = Vec::new();
@@ -538,6 +547,7 @@ async fn session(tx: &MsgSender) -> SessionEnd {
 
 /// Read one event line, then any further lines that arrive before
 /// [`EVENT_COALESCE`] elapses, so a switch's burst shares one snapshot.
+#[hotpath::measure]
 async fn read_batch<R>(lines: &mut tokio::io::Lines<R>) -> io::Result<Option<Vec<String>>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -563,6 +573,7 @@ where
 
 /// Apply one focus or lifecycle line. Returns whether the render loop has
 /// closed the channel.
+#[hotpath::measure]
 async fn emit_focus_line(
     dir: &Path,
     tx: &MsgSender,

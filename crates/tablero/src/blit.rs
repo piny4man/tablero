@@ -23,6 +23,7 @@ pub fn rgba_to_argb8888(rgba: &[u8]) -> Vec<u8> {
 ///
 /// Converts `min(rgba.len(), dst.len())` rounded down to whole pixels; any
 /// trailing bytes in `dst` are left untouched.
+#[hotpath::measure]
 pub fn write_argb8888(rgba: &[u8], dst: &mut [u8]) {
     for (src, out) in rgba
         .as_chunks::<4>()

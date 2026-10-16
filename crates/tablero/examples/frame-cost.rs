@@ -15,6 +15,9 @@
 //!
 //! Each frame changes the system widget's value, as a live bar's most frequent
 //! redraw does, so the numbers include the text-cache misses that causes.
+//!
+//! Add `--features hotpath` (or `hotpath-alloc`) for a per-function timing (or
+//! allocation) breakdown when it exits; see `docs/hotpath-profiling.md`.
 
 use std::time::{Duration, Instant};
 
@@ -44,6 +47,7 @@ fn report(name: &str, samples: &mut [Duration]) {
     );
 }
 
+#[hotpath::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let config = match args.next() {

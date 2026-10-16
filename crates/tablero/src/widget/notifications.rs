@@ -163,6 +163,7 @@ impl Widget for NotificationsWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "NotificationsWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // An absent daemon leaves the template empty, so the content paints
         // nothing: the dashboard has already cleared the background.
@@ -188,6 +189,7 @@ impl Widget for NotificationsWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "NotificationsWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }

@@ -113,6 +113,7 @@ async fn properties_proxy(
         .await
 }
 
+#[hotpath::measure]
 async fn read_snapshot(conn: &Connection, endpoint: Endpoint) -> zbus::Result<PowerProfilesState> {
     let proxy = properties_proxy(conn, endpoint).await?;
     let interface = InterfaceName::try_from(endpoint.interface())?;
@@ -142,6 +143,7 @@ async fn find_endpoint(conn: &Connection) -> Option<(Endpoint, PowerProfilesStat
     None
 }
 
+#[hotpath::measure]
 fn compose(
     ppd: Option<PowerProfilesState>,
     platform: Option<PlatformKind>,

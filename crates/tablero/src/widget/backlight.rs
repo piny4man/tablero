@@ -198,6 +198,7 @@ impl Widget for BacklightWidget {
         true
     }
 
+    #[hotpath::measure(impl_type = "BacklightWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         if let Some(backlight) = &self.state {
             draw_icon_content(
@@ -211,6 +212,7 @@ impl Widget for BacklightWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "BacklightWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         match &self.state {
             Some(backlight) => measure_icon_content(

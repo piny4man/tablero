@@ -1034,6 +1034,7 @@ impl Dashboard {
     /// Returns `true` if at least one widget reported a visible change, i.e. the
     /// frame is now dirty and should be redrawn. Every widget is updated even
     /// once a change is seen, so each keeps its state current.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn update(&mut self, msg: &Msg) -> bool {
         let mut dirty = false;
         for (widget, changed) in self
@@ -1096,6 +1097,7 @@ impl Dashboard {
     /// [`margin`](Dashboard::with_spacing). A widget that measures zero is parked
     /// at zero width and reserves no space. Geometry is authored in logical
     /// pixels and scaled here by the context's output scale.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn layout(&mut self, ctx: &mut RenderContext, width: u32, height: u32) {
         let scale = ctx.scale_factor();
         let margin = self.margin * scale;
@@ -1151,6 +1153,7 @@ impl Dashboard {
 
     /// Clear the background and paint every widget, left zone then center then
     /// right.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn draw(&self, ctx: &mut RenderContext) {
         ctx.fill_background();
         for widget in self.left.iter().chain(&self.center).chain(&self.right) {
@@ -1164,6 +1167,7 @@ impl Dashboard {
     /// claims the pixel, or `None` if none do — clicks on empty space or
     /// display-only widgets produce nothing. Zones never overlap after
     /// [`layout`](Dashboard::layout), so order only breaks ties on empty space.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
         self.left
             .iter()
@@ -1179,6 +1183,7 @@ impl Dashboard {
     /// rather than offering the pixel to every widget once per question. Slots
     /// never overlap after [`layout`](Dashboard::layout), and a widget's
     /// interactive regions lie inside its slot.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn hover_at(&self, px: u32, py: u32) -> Hover {
         let Some(widget) = self
             .widgets()
@@ -1194,6 +1199,7 @@ impl Dashboard {
     }
 
     /// Route one logical scroll step to the widget under the pointer.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn on_scroll(&self, px: u32, py: u32, direction: ScrollDirection) -> Option<Command> {
         self.left
             .iter()
@@ -1206,6 +1212,7 @@ impl Dashboard {
 /// Measure every widget in `widgets` against the inner pill `height`, returning a
 /// width per widget (parallel to the slice). A width of zero means the widget has
 /// nothing to show and should reserve no slot.
+#[hotpath::measure]
 fn measure_zone(widgets: &[Box<dyn Widget>], ctx: &mut RenderContext, height: u32) -> Vec<u32> {
     let mut widths = Vec::with_capacity(widgets.len());
     for widget in widgets {
