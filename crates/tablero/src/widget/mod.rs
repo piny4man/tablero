@@ -392,6 +392,9 @@ pub struct Hover {
     pub clickable: bool,
     /// The tooltip to show here, if any.
     pub tooltip: Option<Tooltip>,
+    /// The hovered widget's index (zone order) when it is interactive —
+    /// clickable or with a tooltip — and so worth highlighting.
+    pub widget: Option<usize>,
 }
 
 /// How a widget chooses the glyph it draws before its label.
@@ -440,6 +443,50 @@ pub struct StateColors {
     pub border: Option<(u8, u8, u8, u8)>,
 }
 
+/// Hover highlight colors from a `[widget.<name>.hover]` table. Each unset
+/// field keeps the widget's current color, except the background, which
+/// defaults to a tenth of the foreground mixed into the pill (or bar)
+/// background — a subtle lift that works on any theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoverColors {
+    /// Pill fill while hovered.
+    pub background: Option<(u8, u8, u8, u8)>,
+    /// Text/glyph color while hovered.
+    pub foreground: Option<(u8, u8, u8, u8)>,
+    /// Border color while hovered.
+    pub border: Option<(u8, u8, u8, u8)>,
+}
+
+impl HoverColors {
+    /// The hovered form of `colors`, painted on a bar of `bar_background`.
+    pub fn apply(self, colors: StateColors, bar_background: (u8, u8, u8, u8)) -> StateColors {
+        let mix =
+            |base: u8, ink: u8| ((u32::from(base) * 90 + u32::from(ink) * 10 + 50) / 100) as u8;
+        let (br, bg, bb, ba) = colors.background.unwrap_or(bar_background);
+        let (fr, fg, fb, fa) = colors.foreground;
+        StateColors {
+            background: Some(self.background.unwrap_or((
+                mix(br, fr),
+                mix(bg, fg),
+                mix(bb, fb),
+                mix(ba, fa),
+            ))),
+            foreground: self.foreground.unwrap_or(colors.foreground),
+            border: self.border.or(colors.border),
+        }
+    }
+}
+
+/// The colors a pill paints with: `colors`, or their hovered form while the
+/// pointer is over the widget.
+fn paint_colors(ctx: &RenderContext, style: &WidgetStyle, colors: StateColors) -> StateColors {
+    if ctx.hovered() {
+        style.hover.apply(colors, ctx.settings().background)
+    } else {
+        colors
+    }
+}
+
 /// The fully-resolved visual style for one widget.
 ///
 /// Built from a `[widget.<name>]` config table folded onto the theme (see
@@ -468,6 +515,9 @@ pub struct WidgetStyle {
     pub padding: u32,
     /// Which glyph to draw before the label.
     pub icon: IconSetting,
+    /// Icon size in logical pixels: the built-in icon's edge, or a text
+    /// glyph's font size. `None` follows the bar font size.
+    pub icon_size: Option<u32>,
     /// Percent below which a discharging battery uses [`warn`](WidgetStyle::warn).
     pub warn_threshold: u32,
     /// Colors for a low/warning state (e.g. low battery).
@@ -476,6 +526,8 @@ pub struct WidgetStyle {
     pub attention: StateColors,
     /// Colors for a battery while it is charging.
     pub charging: StateColors,
+    /// Colors while the pointer is over an interactive widget.
+    pub hover: HoverColors,
 }
 
 impl Default for WidgetStyle {
@@ -489,6 +541,7 @@ impl Default for WidgetStyle {
             radius: DEFAULT_RADIUS,
             padding: DEFAULT_PADDING,
             icon: IconSetting::Default,
+            icon_size: None,
             warn_threshold: DEFAULT_WARN_THRESHOLD,
             warn: StateColors {
                 background: Some(ALERT_BACKGROUND),
@@ -505,6 +558,7 @@ impl Default for WidgetStyle {
                 foreground: CHARGING_FOREGROUND,
                 border: None,
             },
+            hover: HoverColors::default(),
         }
     }
 }
@@ -550,6 +604,66 @@ impl WidgetStyle {
     }
 }
 
+/// Check that every `{name}` placeholder in `format` is one of `allowed` and
+/// that braces pair up. The error reads as the tail of a sentence naming the
+/// config key, e.g. `contains unsupported placeholder `{nope}``.
+pub fn validate_placeholders(format: &str, allowed: &[&str]) -> Result<(), String> {
+    let mut rest = format;
+    while !rest.is_empty() {
+        let next_open = rest.find('{');
+        let next_close = rest.find('}');
+        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
+            return Err("contains an unmatched `}`".to_string());
+        }
+        let Some(open) = next_open else {
+            break;
+        };
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('}') else {
+            return Err("contains an unmatched `{`".to_string());
+        };
+        let placeholder = &rest[..close];
+        if !allowed.contains(&placeholder) {
+            return Err(format!(
+                "contains unsupported placeholder `{{{placeholder}}}`"
+            ));
+        }
+        rest = &rest[close + 1..];
+    }
+    Ok(())
+}
+
+/// Substitute each `{name}` in `format` with its value from `values`, in one
+/// pass. Placeholders not listed (notably `{icon}`) are kept verbatim so the
+/// icon layout helpers can still find them.
+pub(crate) fn expand(format: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(format.len());
+    let mut rest = format;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        let value = tail.find('}').and_then(|close| {
+            let name = &tail[1..close];
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value, close))
+        });
+        match value {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &tail[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Join a glyph and a label with a single space, dropping either when empty.
 ///
 /// So `("\u{f017}", "08:09")` → `"\u{f017} 08:09"`, `("", "08:09")` → `"08:09"`
@@ -587,6 +701,7 @@ pub(crate) fn draw_text_pill(
     if text.is_empty() || bounds.width == 0 || bounds.height == 0 {
         return;
     }
+    let colors = paint_colors(ctx, style, colors);
     let scale = ctx.scale_factor();
     if let Some(bg) = colors.background {
         ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
@@ -621,6 +736,7 @@ pub(crate) fn draw_icon_pill(
     if icon.is_empty() || bounds.width == 0 || bounds.height == 0 {
         return;
     }
+    let colors = paint_colors(ctx, style, colors);
     let scale = ctx.scale_factor();
     if let Some(bg) = colors.background {
         ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
@@ -744,19 +860,52 @@ pub(crate) fn measure_icon_content(
 ) -> u32 {
     match icon {
         ResolvedIcon::Builtin(_) => {
-            let edge = ctx.icon_edge();
+            let edge = builtin_edge(ctx, style);
             let boxes = icon_boxes(ctx, edge, template);
-            if boxes.is_empty() {
-                return 0;
-            }
-            let gap = icon_gap(edge);
-            let content: u32 =
-                boxes.iter().map(|b| b.width).sum::<u32>() + gap * (boxes.len() as u32 - 1);
-            content + 2 * style.padding * ctx.scale_factor()
+            measure_boxes(ctx, style, &boxes, icon_gap(edge))
+        }
+        ResolvedIcon::Text(glyph) if style.icon_size.is_some() => {
+            let (boxes, gap, _) = sized_glyph_boxes(ctx, style, glyph, template);
+            measure_boxes(ctx, style, &boxes, gap)
         }
         ResolvedIcon::None => measure_text_pill(ctx, style, &icon_as_text(template, None)),
         ResolvedIcon::Text(s) => measure_text_pill(ctx, style, &icon_as_text(template, Some(s))),
     }
+}
+
+/// The built-in icon edge in physical pixels: the style's `icon-size`, or the
+/// bar font size.
+fn builtin_edge(ctx: &RenderContext, style: &WidgetStyle) -> u32 {
+    style
+        .icon_size
+        .map_or_else(|| ctx.icon_edge(), |size| size * ctx.scale_factor())
+}
+
+/// Boxes for a text glyph enlarged to the style's `icon-size`: the glyph box
+/// is as wide as the glyph at that size, while labels keep the bar font.
+/// Returns the boxes, the gap between them, and the glyph's font size.
+fn sized_glyph_boxes(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    glyph: &str,
+    template: &str,
+) -> (Vec<ContentBox>, u32, Option<f32>) {
+    let size = style
+        .icon_size
+        .map(|size| (size * ctx.scale_factor()) as f32);
+    let width = ctx.measure_text_sized(glyph.trim(), size);
+    let gap = icon_gap(size.map_or_else(|| ctx.icon_edge(), |size| size as u32));
+    (icon_boxes(ctx, width, template), gap, size)
+}
+
+/// The pill width for `boxes` separated by `gap`, plus the style's padding;
+/// zero when there is nothing to show.
+fn measure_boxes(ctx: &RenderContext, style: &WidgetStyle, boxes: &[ContentBox], gap: u32) -> u32 {
+    if boxes.is_empty() {
+        return 0;
+    }
+    let content: u32 = boxes.iter().map(|b| b.width).sum::<u32>() + gap * (boxes.len() as u32 - 1);
+    content + 2 * style.padding * ctx.scale_factor()
 }
 
 /// Paint an icon `template` resolved for `icon`, in `colors`.
@@ -778,6 +927,24 @@ pub(crate) fn draw_icon_content(
     match icon {
         ResolvedIcon::Builtin(builtin) => {
             draw_builtin_content(ctx, style, bounds, &[*builtin], template, colors);
+        }
+        ResolvedIcon::Text(glyph) if style.icon_size.is_some() => {
+            if bounds.width == 0 || bounds.height == 0 {
+                return;
+            }
+            let (boxes, gap, size) = sized_glyph_boxes(ctx, style, glyph, template);
+            let glyph = glyph.trim();
+            draw_boxes(
+                ctx,
+                style,
+                bounds,
+                &boxes,
+                gap,
+                colors,
+                |ctx, _, slot, color| {
+                    ctx.draw_text_centered_sized(glyph, slot, color, size);
+                },
+            );
         }
         ResolvedIcon::None => {
             draw_text_pill(ctx, style, bounds, &icon_as_text(template, None), colors);
@@ -824,11 +991,40 @@ fn draw_builtin_content(
     if bounds.width == 0 || bounds.height == 0 || icons.is_empty() {
         return;
     }
-    let edge = ctx.icon_edge();
+    let edge = builtin_edge(ctx, style);
     let boxes = icon_boxes(ctx, edge, template);
+    draw_boxes(
+        ctx,
+        style,
+        bounds,
+        &boxes,
+        icon_gap(edge),
+        colors,
+        |ctx, slot_index, slot, color| {
+            let builtin = icons[slot_index.min(icons.len() - 1)];
+            let iy = slot.y + slot.height.saturating_sub(edge) / 2;
+            ctx.draw_builtin_icon(builtin, Bounds::new(slot.x, iy, edge, edge), color);
+        },
+    );
+}
+
+/// Paint the pill behind `boxes`, then lay them out left to right `gap`
+/// apart: text runs at the bar font, and each icon slot handed to
+/// `draw_icon` with its index among the icon slots, its full-height box, and
+/// the foreground color.
+fn draw_boxes(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    boxes: &[ContentBox],
+    gap: u32,
+    colors: StateColors,
+    mut draw_icon: impl FnMut(&mut RenderContext, usize, Bounds, (u8, u8, u8, u8)),
+) {
     if boxes.is_empty() {
         return;
     }
+    let colors = paint_colors(ctx, style, colors);
     let scale = ctx.scale_factor();
     if let Some(bg) = colors.background {
         ctx.fill_rounded_rect(bounds, bg, (style.radius * scale) as f32);
@@ -841,7 +1037,6 @@ fn draw_builtin_content(
             (style.border_width * scale) as f32,
         );
     }
-    let gap = icon_gap(edge);
     let pad = style.padding * scale;
     let mut x = bounds.x + pad;
     let mut icon_slot = 0;
@@ -851,10 +1046,9 @@ fn draw_builtin_content(
         }
         match &content.text {
             None => {
-                let builtin = icons[icon_slot.min(icons.len() - 1)];
+                let slot = Bounds::new(x, bounds.y, content.width, bounds.height);
+                draw_icon(ctx, icon_slot, slot, colors.foreground);
                 icon_slot += 1;
-                let iy = bounds.y + bounds.height.saturating_sub(edge) / 2;
-                ctx.draw_builtin_icon(builtin, Bounds::new(x, iy, edge, edge), colors.foreground);
             }
             Some(text) => {
                 ctx.draw_text(
@@ -980,6 +1174,8 @@ pub struct Dashboard {
     /// Every widget's slot as of the last `take_damage`; `None` until a frame
     /// has been accounted for, or after [`invalidate`](Dashboard::invalidate).
     painted: Option<Vec<Bounds>>,
+    /// The widget (zone order) under the pointer, painted highlighted.
+    hovered: Option<usize>,
 }
 
 /// The part of a freshly painted frame that differs from the one before it.
@@ -1028,6 +1224,7 @@ impl Dashboard {
             gap: 0,
             changed: vec![false; widgets],
             painted: None,
+            hovered: None,
         }
     }
 
@@ -1091,6 +1288,22 @@ impl Dashboard {
     /// frame that was painted but never reached the compositor.
     pub fn invalidate(&mut self) {
         self.painted = None;
+    }
+
+    /// Highlight the widget at zone-order `index`, or none. Returns `true`
+    /// when the highlight moved; only the old and new slots are marked
+    /// changed, so the next frame repaints just those two pills. An index
+    /// past the end (a hover left over from before a reload) counts as none.
+    pub fn set_hovered(&mut self, index: Option<usize>) -> bool {
+        let index = index.filter(|&i| i < self.changed.len());
+        if index == self.hovered {
+            return false;
+        }
+        for i in [self.hovered, index].into_iter().flatten() {
+            self.changed[i] = true;
+        }
+        self.hovered = index;
+        true
     }
 
     fn widgets(&self) -> impl Iterator<Item = &Box<dyn Widget>> {
@@ -1167,9 +1380,11 @@ impl Dashboard {
     #[hotpath::measure(impl_type = "Dashboard")]
     pub fn draw(&self, ctx: &mut RenderContext) {
         ctx.fill_background();
-        for widget in self.left.iter().chain(&self.center).chain(&self.right) {
+        for (index, widget) in self.widgets().enumerate() {
+            ctx.set_hovered(self.hovered == Some(index));
             widget.draw(ctx);
         }
+        ctx.set_hovered(false);
     }
 
     /// Repaint only what `damage` covers, on top of the previous frame still in
@@ -1196,11 +1411,13 @@ impl Dashboard {
             region = grown;
         }
         ctx.fill_background_in(region);
-        for widget in self.widgets() {
+        for (index, widget) in self.widgets().enumerate() {
             if widget.bounds().intersects(&region) {
+                ctx.set_hovered(self.hovered == Some(index));
                 widget.draw(ctx);
             }
         }
+        ctx.set_hovered(false);
         Damage::Region(region)
     }
 
@@ -1228,16 +1445,20 @@ impl Dashboard {
     /// interactive regions lie inside its slot.
     #[hotpath::measure(impl_type = "Dashboard")]
     pub fn hover_at(&self, px: u32, py: u32) -> Hover {
-        let Some(widget) = self
+        let Some((index, widget)) = self
             .widgets()
-            .find(|widget| widget.bounds().contains(px, py))
+            .enumerate()
+            .find(|(_, widget)| widget.bounds().contains(px, py))
         else {
             return Hover::default();
         };
+        let clickable = widget.on_click(px, py, ClickButton::Left).is_some()
+            || widget.on_click(px, py, ClickButton::Right).is_some();
+        let tooltip = widget.tooltip_at(px, py);
         Hover {
-            clickable: widget.on_click(px, py, ClickButton::Left).is_some()
-                || widget.on_click(px, py, ClickButton::Right).is_some(),
-            tooltip: widget.tooltip_at(px, py),
+            widget: (clickable || tooltip.is_some()).then_some(index),
+            clickable,
+            tooltip,
         }
     }
 
@@ -1328,6 +1549,41 @@ mod tests {
         assert!(!dash.update(&at(12, 0, 30)));
         // A new minute flips the displayed text: dirty again.
         assert!(dash.update(&at(12, 1, 0)));
+    }
+
+    #[test]
+    fn validate_placeholders_accepts_only_allowed_names() {
+        assert_eq!(
+            validate_placeholders("{icon}{percent}%", &["icon", "percent"]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_placeholders("{icon} {nope}", &["icon"]),
+            Err("contains unsupported placeholder `{nope}`".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_placeholders_rejects_unmatched_braces() {
+        assert_eq!(
+            validate_placeholders("{icon", &["icon"]),
+            Err("contains an unmatched `{`".to_string())
+        );
+        assert_eq!(
+            validate_placeholders("icon}", &["icon"]),
+            Err("contains an unmatched `}`".to_string())
+        );
+    }
+
+    #[test]
+    fn expand_fills_values_and_keeps_icon_marker() {
+        assert_eq!(
+            expand(
+                "{icon}{percent}% {state}",
+                &[("percent", "42"), ("state", "on")]
+            ),
+            "{icon}42% on"
+        );
     }
 
     #[test]
@@ -1497,14 +1753,180 @@ mod tests {
         let dash = hoverable_dashboard();
         for py in 0..32 {
             for px in 0..400 {
+                let clickable = dash.on_click(px, py, ClickButton::Left).is_some()
+                    || dash.on_click(px, py, ClickButton::Right).is_some();
+                let tooltip = dash.widgets().find_map(|widget| widget.tooltip_at(px, py));
+                let widget = (clickable || tooltip.is_some())
+                    .then(|| dash.widgets().position(|w| w.bounds().contains(px, py)))
+                    .flatten();
                 let exhaustive = Hover {
-                    clickable: dash.on_click(px, py, ClickButton::Left).is_some()
-                        || dash.on_click(px, py, ClickButton::Right).is_some(),
-                    tooltip: dash.widgets().find_map(|widget| widget.tooltip_at(px, py)),
+                    clickable,
+                    tooltip,
+                    widget,
                 };
                 assert_eq!(dash.hover_at(px, py), exhaustive, "at ({px}, {py})");
             }
         }
+    }
+
+    #[test]
+    fn hover_names_only_interactive_widgets() {
+        let dash = hoverable_dashboard();
+        let center = |b: Bounds| (b.x + b.width / 2, b.y + b.height / 2);
+        let (px, py) = center(dash.right[0].bounds());
+        assert_eq!(dash.hover_at(px, py).widget, Some(2));
+        // The clock neither clicks nor shows a tooltip: nothing to highlight.
+        let (px, py) = center(dash.center[0].bounds());
+        assert_eq!(dash.hover_at(px, py).widget, None);
+    }
+
+    #[test]
+    fn changing_the_hovered_widget_damages_only_the_old_and_new_slots() {
+        let mut dash = hoverable_dashboard();
+        let mut ctx = RenderContext::new(400, 32);
+        dash.layout(&mut ctx, 400, 32);
+        let _ = dash.take_damage();
+
+        assert!(!dash.set_hovered(None));
+        assert!(dash.set_hovered(Some(2)));
+        assert_eq!(dash.take_damage(), Damage::Region(dash.right[0].bounds()));
+        assert!(!dash.set_hovered(Some(2)));
+        assert!(dash.set_hovered(Some(0)));
+        assert_eq!(
+            dash.take_damage(),
+            Damage::Region(dash.left[0].bounds().union(&dash.right[0].bounds()))
+        );
+        assert!(dash.set_hovered(None));
+        assert_eq!(dash.take_damage(), Damage::Region(dash.left[0].bounds()));
+        // An out-of-range index (a stale hover after a reload) is ignored.
+        assert!(!dash.set_hovered(Some(99)));
+    }
+
+    #[test]
+    fn a_hovered_pill_paints_its_hover_colors() {
+        let style = WidgetStyle {
+            hover: HoverColors {
+                background: Some((0xFF, 0, 0, 0xFF)),
+                ..HoverColors::default()
+            },
+            ..WidgetStyle::default()
+        };
+        let mut idle = HypridleWidget::new(Bounds::new(0, 0, 1, 1)).with_style(style);
+        idle.update(&Msg::Hypridle(Hypridle::new(true)));
+        let mut dash = Dashboard::new(vec![Box::new(idle)]);
+        let mut ctx = RenderContext::new(200, 32);
+        dash.layout(&mut ctx, 200, 32);
+        let slot = dash.left[0].bounds();
+        let probe = |ctx: &RenderContext| {
+            let i = ((slot.y + slot.height / 2) * 200 + slot.x + 2) as usize * 4;
+            ctx.pixels()[i..i + 4].to_vec()
+        };
+
+        dash.draw(&mut ctx);
+        assert_ne!(probe(&ctx), [0xFF, 0, 0, 0xFF]);
+        dash.set_hovered(Some(0));
+        dash.draw(&mut ctx);
+        assert_eq!(probe(&ctx), [0xFF, 0, 0, 0xFF]);
+        dash.set_hovered(None);
+        dash.draw(&mut ctx);
+        assert_ne!(probe(&ctx), [0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn default_hover_mixes_a_tenth_of_the_foreground_into_the_background() {
+        let hover = HoverColors::default();
+        let base = StateColors {
+            background: Some((0, 0, 0, 0xFF)),
+            foreground: (200, 100, 50, 0xFF),
+            border: None,
+        };
+        let colors = hover.apply(base, (10, 10, 10, 0xFF));
+        assert_eq!(colors.background, Some((20, 10, 5, 0xFF)));
+        assert_eq!(colors.foreground, base.foreground);
+        // No pill: the mix starts from the bar background.
+        let flat = hover.apply(
+            StateColors {
+                background: None,
+                ..base
+            },
+            (0, 0, 0, 0),
+        );
+        assert_eq!(flat.background, Some((20, 10, 5, 26)));
+        let custom = HoverColors {
+            background: Some((1, 2, 3, 4)),
+            foreground: Some((5, 6, 7, 8)),
+            border: Some((9, 9, 9, 9)),
+        }
+        .apply(base, (0, 0, 0, 0));
+        assert_eq!(
+            custom,
+            StateColors {
+                background: Some((1, 2, 3, 4)),
+                foreground: (5, 6, 7, 8),
+                border: Some((9, 9, 9, 9)),
+            }
+        );
+    }
+
+    /// Rows of `ctx` holding any pixel brighter than the dark background.
+    fn ink_rows(ctx: &RenderContext, width: u32) -> u32 {
+        ctx.pixels()
+            .chunks(width as usize * 4)
+            .filter(|row| row.chunks(4).any(|px| px[0] > 0x80))
+            .count() as u32
+    }
+
+    #[test]
+    fn icon_size_sizes_a_builtin_icon_slot() {
+        let mut ctx = RenderContext::new(200, 48);
+        let style = WidgetStyle {
+            icon_size: Some(30),
+            padding: 0,
+            ..WidgetStyle::default()
+        };
+        let icon = ResolvedIcon::Builtin(BuiltinIcon::Power);
+        assert_eq!(measure_icon_content(&mut ctx, &style, &icon, "{icon}"), 30);
+        let default = WidgetStyle {
+            padding: 0,
+            ..WidgetStyle::default()
+        };
+        assert_eq!(
+            measure_icon_content(&mut ctx, &default, &icon, "{icon}"),
+            ctx.icon_edge()
+        );
+    }
+
+    #[test]
+    fn icon_size_enlarges_a_text_glyph_but_not_its_label() {
+        let draw = |icon_size: Option<u32>, template: &str| {
+            let mut ctx = RenderContext::new(200, 48);
+            let style = WidgetStyle {
+                icon_size,
+                ..WidgetStyle::default()
+            };
+            let icon = ResolvedIcon::Text("█".into());
+            let width = measure_icon_content(&mut ctx, &style, &icon, template);
+            ctx.fill_background();
+            draw_icon_content(
+                &mut ctx,
+                &style,
+                Bounds::new(0, 0, 200, 48),
+                &icon,
+                template,
+                style.base_colors(),
+            );
+            (width, ink_rows(&ctx, 200))
+        };
+        let (small_w, small_h) = draw(None, "{icon}");
+        let (big_w, big_h) = draw(Some(32), "{icon}");
+        assert!(big_w > small_w, "{big_w} > {small_w}");
+        assert!(big_h > small_h, "{big_h} > {small_h}");
+        // A label next to the glyph keeps the bar font size: the pill grows
+        // only by the glyph's extra width.
+        let (label_small, _) = draw(None, "{icon}50%");
+        let (label_big, _) = draw(Some(32), "{icon}50%");
+        assert!(label_big > label_small);
+        assert!(label_big - label_small < big_w);
     }
 
     #[test]

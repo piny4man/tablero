@@ -15,29 +15,7 @@ use super::{
 
 /// Validate the placeholders accepted by [`UpdatesWidget`].
 pub fn validate_updates_format(format: &str) -> Result<(), String> {
-    let mut rest = format;
-    while !rest.is_empty() {
-        let next_open = rest.find('{');
-        let next_close = rest.find('}');
-        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
-            return Err("contains an unmatched `}`".to_string());
-        }
-        let Some(open) = next_open else {
-            break;
-        };
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('}') else {
-            return Err("contains an unmatched `{`".to_string());
-        };
-        let placeholder = &rest[..close];
-        if !matches!(placeholder, "count" | "icon") {
-            return Err(format!(
-                "contains unsupported placeholder `{{{placeholder}}}`"
-            ));
-        }
-        rest = &rest[close + 1..];
-    }
-    Ok(())
+    super::validate_placeholders(format, &["count", "icon"])
 }
 
 /// One package with an available version upgrade.

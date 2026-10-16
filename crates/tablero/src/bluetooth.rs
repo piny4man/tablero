@@ -183,6 +183,36 @@ fn summarize(
     (adapter_count, powered, connected)
 }
 
+/// The display names of every connected device, sorted for a stable tooltip.
+///
+/// Each device contributes its user-facing `Alias`, falling back to the
+/// remote `Name`, then to a generic label — so the list length always matches
+/// the connected count.
+fn connected_device_names(
+    objects: &HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>,
+) -> Vec<String> {
+    let read_str = |props: &HashMap<String, OwnedValue>, key: &str| {
+        props
+            .get(key)
+            .and_then(|value| <&str>::try_from(value).ok())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    };
+    let mut names: Vec<String> = objects
+        .values()
+        .filter_map(|interfaces| interfaces.get(DEVICE_IFACE))
+        .filter(|props| read_bool(props, "Connected") == Some(true))
+        .map(|props| {
+            read_str(props, "Alias")
+                .or_else(|| read_str(props, "Name"))
+                .unwrap_or_else(|| "Unknown device".to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// The subset of `org.freedesktop.DBus.ObjectManager` BlueZ implements, used
 /// to enumerate adapters and devices in one round trip. zbus generates
 /// `ObjectManagerProxy` from this.
@@ -213,6 +243,7 @@ async fn read_snapshot(om: &ObjectManagerProxy<'_>) -> Bluetooth {
         Ok(objects) => {
             let (adapter_count, powered, connected) = summarize(&objects);
             bluetooth_from_bluez(adapter_count, powered, connected)
+                .with_devices(connected_device_names(&objects))
         }
         Err(e) => {
             warn!("bluetooth: reading BlueZ state failed: {e}");
@@ -224,7 +255,8 @@ async fn read_snapshot(om: &ObjectManagerProxy<'_>) -> Bluetooth {
 /// Whether a signal from BlueZ could change the [`Bluetooth`] snapshot.
 ///
 /// Objects coming and going always can. Of the property changes only an
-/// adapter's `Powered` and a device's `Connected` are displayed; the rest —
+/// adapter's `Powered` and a device's `Connected` and `Alias` are displayed
+/// (the alias in the tooltip); the rest —
 /// notably the `RSSI` updates that stream in for every nearby device while
 /// something is scanning — must not cost a re-read each.
 fn signal_changes_state(message: &Message) -> bool {
@@ -253,7 +285,7 @@ fn property_change_is_displayed<'a>(
 ) -> bool {
     match interface {
         ADAPTER_IFACE => names.any(|name| name == "Powered"),
-        DEVICE_IFACE => names.any(|name| name == "Connected"),
+        DEVICE_IFACE => names.any(|name| matches!(name, "Connected" | "Alias")),
         _ => false,
     }
 }
@@ -354,10 +386,10 @@ async fn run(tx: MsgSender, resync: Duration) -> ProducerResult {
 /// Send `snapshot` unless it is what the widget already shows. Returns `false`
 /// once the render loop has gone away.
 fn send_if_changed(tx: &MsgSender, sent: &mut Option<Bluetooth>, snapshot: Bluetooth) -> bool {
-    if *sent == Some(snapshot) {
+    if sent.as_ref() == Some(&snapshot) {
         return true;
     }
-    *sent = Some(snapshot);
+    *sent = Some(snapshot.clone());
     tx.send(Msg::Bluetooth(snapshot)).is_ok()
 }
 
@@ -580,6 +612,47 @@ mod tests {
     }
 
     #[test]
+    fn connected_device_names_prefer_alias_then_name_and_are_sorted() {
+        let mut objects = empty_objects();
+        let mut named = |path: &str, connected: bool, alias: Option<&str>, name: Option<&str>| {
+            let mut props = device_with(Some(connected));
+            if let Some(alias) = alias {
+                props.insert(
+                    "Alias".to_string(),
+                    OwnedValue::from(zbus::zvariant::Str::from(alias)),
+                );
+            }
+            if let Some(name) = name {
+                props.insert(
+                    "Name".to_string(),
+                    OwnedValue::from(zbus::zvariant::Str::from(name)),
+                );
+            }
+            insert_device(&mut objects, path, props);
+        };
+        named("/org/bluez/hci0/dev_1", true, Some("Mouse"), Some("MX"));
+        named("/org/bluez/hci0/dev_2", true, None, Some("Buds"));
+        named("/org/bluez/hci0/dev_3", false, Some("Speaker"), None);
+        named("/org/bluez/hci0/dev_4", true, None, None);
+        assert_eq!(
+            connected_device_names(&objects),
+            ["Buds", "Mouse", "Unknown device"]
+        );
+    }
+
+    #[test]
+    fn a_device_alias_change_is_displayed() {
+        assert!(property_change_is_displayed(
+            DEVICE_IFACE,
+            ["Alias"].into_iter()
+        ));
+        assert!(!property_change_is_displayed(
+            DEVICE_IFACE,
+            ["RSSI"].into_iter()
+        ));
+    }
+
+    #[test]
     fn summarize_ignores_devices_with_unknown_connected() {
         // A device that hasn't reported Connected yet counts as zero — we
         // only count affirmative `Connected = true` readings.
@@ -708,7 +781,7 @@ mod tests {
         let connected = Bluetooth::new(BluetoothState::On, 1);
         let mut sent = None;
 
-        for snapshot in [on, on, connected, connected] {
+        for snapshot in [on.clone(), on.clone(), connected.clone(), connected.clone()] {
             assert!(send_if_changed(&tx, &mut sent, snapshot));
         }
 

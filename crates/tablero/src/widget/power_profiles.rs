@@ -184,32 +184,17 @@ impl PowerProfilesState {
 
 /// Validate power-profile label and tooltip placeholders.
 pub fn validate_power_profiles_format(format: &str) -> Result<(), String> {
-    let mut rest = format;
-    while !rest.is_empty() {
-        let next_open = rest.find('{');
-        let next_close = rest.find('}');
-        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
-            return Err("contains an unmatched `}`".to_string());
-        }
-        let Some(open) = next_open else {
-            break;
-        };
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('}') else {
-            return Err("contains an unmatched `{`".to_string());
-        };
-        let placeholder = &rest[..close];
-        if !matches!(
-            placeholder,
-            "icon" | "profile" | "driver" | "cpu_driver" | "platform_driver" | "hardware"
-        ) {
-            return Err(format!(
-                "contains unsupported placeholder `{{{placeholder}}}`"
-            ));
-        }
-        rest = &rest[close + 1..];
-    }
-    Ok(())
+    super::validate_placeholders(
+        format,
+        &[
+            "icon",
+            "profile",
+            "driver",
+            "cpu_driver",
+            "platform_driver",
+            "hardware",
+        ],
+    )
 }
 
 /// A text widget showing and rotating power-profiles-daemon profiles.

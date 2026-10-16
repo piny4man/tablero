@@ -376,6 +376,14 @@ impl Surface {
             .hover_at((x * scale) as u32, (y * scale) as u32)
     }
 
+    /// Highlight the interactive widget under the pointer (or none),
+    /// requesting a repaint of just the affected pills when it moves.
+    fn set_hovered(&mut self, widget: Option<usize>) {
+        if self.dashboard.set_hovered(widget) {
+            self.redraw.request("hover");
+        }
+    }
+
     /// Resolve one logical scroll step against the widget under `(x, y)`.
     fn on_scroll(&self, x: f64, y: f64, direction: ScrollDirection) -> Option<Command> {
         if x < 0.0 || y < 0.0 {
@@ -2366,9 +2374,13 @@ impl PointerHandler for App {
                 }
                 let hover = self
                     .outputs
-                    .values()
+                    .values_mut()
                     .find(|bar| bar.owns(&event.surface))
-                    .map(|bar| (bar.output_id, bar.hover_at(x, y)));
+                    .map(|bar| {
+                        let hover = bar.hover_at(x, y);
+                        bar.set_hovered(hover.widget);
+                        (bar.output_id, hover)
+                    });
                 if let Some((output_id, hover)) = hover {
                     self.update_tooltip(output_id, hover.tooltip, _qh);
                     self.set_pointer_cursor(
@@ -2384,7 +2396,12 @@ impl PointerHandler for App {
                     warn!("pointer enter on unknown surface id={}", event.surface.id());
                 }
             } else if matches!(event.kind, PointerEventKind::Leave { .. }) {
-                if self.outputs.values().any(|bar| bar.owns(&event.surface)) {
+                if let Some(bar) = self
+                    .outputs
+                    .values_mut()
+                    .find(|bar| bar.owns(&event.surface))
+                {
+                    bar.set_hovered(None);
                     self.hide_tooltip();
                     self.pointer_cursor = CursorIcon::Default;
                 } else if self
@@ -2541,6 +2558,12 @@ fn scroll_directions(
     } else {
         // Continuous devices report pixels; ten pixels is one deliberate step.
         vertical.absolute / 10.0
+    };
+    // Under natural scrolling the compositor flips the axis and flags it;
+    // undo the flip so a slider follows the fingers, as GTK does.
+    let delta = match vertical.relative_direction {
+        Some(wl_pointer::AxisRelativeDirection::Inverted) => -delta,
+        _ => delta,
     };
     *remainder += delta;
     let mut directions = Vec::new();
@@ -2739,6 +2762,26 @@ mod scroll_tests {
                 },
                 &mut remainder,
             ),
+            vec![ScrollDirection::Decrease]
+        );
+    }
+
+    #[test]
+    fn natural_scrolling_follows_the_fingers() {
+        // With natural scrolling the compositor inverts the axis and says so;
+        // a slider follows the physical motion, as GTK does.
+        let mut remainder = 0.0;
+        let inverted = |value120| AxisScroll {
+            value120,
+            relative_direction: Some(wl_pointer::AxisRelativeDirection::Inverted),
+            ..AxisScroll::default()
+        };
+        assert_eq!(
+            scroll_directions(inverted(120), &mut remainder),
+            vec![ScrollDirection::Increase]
+        );
+        assert_eq!(
+            scroll_directions(inverted(-120), &mut remainder),
             vec![ScrollDirection::Decrease]
         );
     }

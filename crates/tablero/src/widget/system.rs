@@ -7,15 +7,22 @@
 //! Both readings are whole-percent CPU and memory load, shown compactly at a
 //! glance: a cpu icon and a memory icon each labeling their own percent, or the
 //! spelled-out `CPU x% MEM y%` when icons are opted out — basic system pressure
-//! without opening another tool.
+//! without opening another tool. Hovering shows CPU load and memory used over
+//! total in a tooltip.
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    Msg, ResolvedIcon, Widget, WidgetStyle, draw_builtin_icons, draw_icon_content,
+    Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_builtin_icons, draw_icon_content, expand,
     measure_icon_content,
 };
+
+/// Placeholders accepted by the system `format` and `tooltip-format`.
+pub const SYSTEM_PLACEHOLDERS: &[&str] = &["icon", "cpu", "mem"];
+
+/// Kibibytes in one gibibyte.
+const KIB_PER_GIB: u64 = 1024 * 1024;
 
 /// The built-in icons for the readout's two slots: cpu load, then memory load.
 const SYSTEM_ICONS: [BuiltinIcon; 2] = [BuiltinIcon::System, BuiltinIcon::Memory];
@@ -28,11 +35,13 @@ const SYSTEM_ICONS: [BuiltinIcon; 2] = [BuiltinIcon::System, BuiltinIcon::Memory
 /// `0..=100` and rounded to a whole percent, and a `NaN` reading degrades to `0`
 /// rather than panicking. Equality is therefore a faithful "does this look
 /// different on screen?" test — sub-percent jitter from sampling never forces a
-/// repaint.
+/// repaint. Memory used/total ride along in tenths of a GiB for the tooltip,
+/// so kilobyte-level churn never counts as a change either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemStats {
     cpu: u8,
     mem: u8,
+    memory: Option<(u32, u32)>,
 }
 
 impl SystemStats {
@@ -45,7 +54,23 @@ impl SystemStats {
         Self {
             cpu: normalize_percent(cpu),
             mem: normalize_percent(mem),
+            memory: None,
         }
+    }
+
+    /// Attach memory used and total in kibibytes, kept in tenths of a GiB.
+    pub fn with_memory(mut self, used_kib: u64, total_kib: u64) -> Self {
+        let tenths = |kib: u64| {
+            u32::try_from((kib * 10 + KIB_PER_GIB / 2) / KIB_PER_GIB).unwrap_or(u32::MAX)
+        };
+        self.memory = (total_kib > 0).then(|| (tenths(used_kib.min(total_kib)), tenths(total_kib)));
+        self
+    }
+
+    /// Memory used and total in GiB (one decimal), when known.
+    pub fn memory_gib(self) -> Option<(f64, f64)> {
+        self.memory
+            .map(|(used, total)| (f64::from(used) / 10.0, f64::from(total) / 10.0))
     }
 
     /// The normalized CPU load, `0..=100`.
@@ -90,6 +115,10 @@ pub struct SystemWidget {
     bounds: Bounds,
     state: Option<SystemStats>,
     style: WidgetStyle,
+    /// A custom label format; `None` keeps the built-in per-stat layout.
+    format: Option<String>,
+    tooltip: bool,
+    tooltip_format: Option<String>,
 }
 
 impl SystemWidget {
@@ -101,7 +130,69 @@ impl SystemWidget {
             bounds,
             state: None,
             style: WidgetStyle::default(),
+            format: None,
+            tooltip: true,
+            tooltip_format: None,
         }
+    }
+
+    /// Set the label format (`{icon}`, `{cpu}`, `{mem}`). With built-in icons,
+    /// successive `{icon}` markers draw the cpu then the memory icon.
+    pub fn with_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.format = format;
+        }
+        self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, tooltip: Option<bool>) -> Self {
+        if let Some(tooltip) = tooltip {
+            self.tooltip = tooltip;
+        }
+        self
+    }
+
+    /// Set a custom tooltip format (same placeholders as `format`).
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.tooltip_format = format;
+        }
+        self
+    }
+
+    fn expand(format: &str, stats: SystemStats) -> String {
+        expand(
+            format,
+            &[
+                ("cpu", &stats.cpu().to_string()),
+                ("mem", &stats.mem().to_string()),
+            ],
+        )
+    }
+
+    /// CPU load and memory used over total, or the custom `tooltip-format`.
+    pub fn tooltip_text(&self) -> Option<String> {
+        if !self.tooltip {
+            return None;
+        }
+        let stats = self.state?;
+        if let Some(format) = &self.tooltip_format {
+            let icon = match self.icon() {
+                ResolvedIcon::Text(icon) => icon,
+                _ => String::new(),
+            };
+            return Some(Self::expand(format, stats).replace("{icon}", &icon));
+        }
+        Some(match stats.memory_gib() {
+            Some((used, total)) => format!("CPU {}%\nMemory {used:.1}/{total:.1} GiB", stats.cpu()),
+            None => format!("CPU {}%\nMemory {}%", stats.cpu(), stats.mem()),
+        })
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        let b = self.bounds;
+        px >= b.x && px < b.x + b.width && py >= b.y && py < b.y + b.height
     }
 
     /// Set the resolved visual style, consuming and returning `self` so it
@@ -128,6 +219,9 @@ impl SystemWidget {
         let Some(stats) = self.state else {
             return String::new();
         };
+        if let Some(format) = &self.format {
+            return Self::expand(format, stats);
+        }
         match self.icon() {
             ResolvedIcon::Builtin(_) => {
                 format!("{{icon}} {}% {{icon}} {}%", stats.cpu(), stats.mem())
@@ -156,8 +250,11 @@ impl Widget for SystemWidget {
                 if self.state == Some(*next) {
                     return false;
                 }
+                // Memory totals only reach the tooltip; repaint only when the
+                // pill itself changes.
+                let before = (self.template(), self.icon());
                 self.state = Some(*next);
-                true
+                (self.template(), self.icon()) != before
             }
             _ => false,
         }
@@ -198,6 +295,16 @@ impl Widget for SystemWidget {
 
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
+    }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_text()?,
+            bounds: self.bounds,
+        })
     }
 }
 
@@ -320,6 +427,74 @@ mod tests {
         widget.update(&stats(12.0, 47.0));
         assert_eq!(widget.icon(), ResolvedIcon::None);
         assert_eq!(widget.template(), "{icon} CPU 12% MEM 47%");
+    }
+
+    const GIB: u64 = 1024 * 1024;
+
+    fn stats_gib(cpu: f64, used_kib: u64, total_kib: u64) -> Msg {
+        Msg::System(
+            SystemStats::new(cpu, used_kib as f64 / total_kib as f64 * 100.0)
+                .with_memory(used_kib, total_kib),
+        )
+    }
+
+    #[test]
+    fn memory_totals_are_kept_in_tenths_of_a_gib() {
+        let s = SystemStats::new(1.0, 40.0).with_memory(GIB * 61 / 10, GIB * 155 / 10);
+        assert_eq!(s.memory_gib(), Some((6.1, 15.5)));
+        assert_eq!(SystemStats::new(1.0, 40.0).memory_gib(), None);
+    }
+
+    #[test]
+    fn custom_format_expands_cpu_and_mem() {
+        let mut widget =
+            SystemWidget::new(Bounds::new(0, 0, 320, 32)).with_format(Some("{icon}{cpu}%".into()));
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(widget.template(), "{icon}12%");
+        // Memory is off the label, so a memory-only move does not redraw.
+        assert!(!widget.update(&stats(12.0, 60.0)));
+        assert!(widget.update(&stats(13.0, 60.0)));
+    }
+
+    #[test]
+    fn default_tooltip_shows_cpu_and_memory_used_over_total() {
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.tooltip_text(), None);
+        widget.update(&stats_gib(12.0, GIB * 61 / 10, GIB * 155 / 10));
+        assert_eq!(
+            widget.tooltip_at(10, 10).map(|tip| tip.text).as_deref(),
+            Some("CPU 12%\nMemory 6.1/15.5 GiB")
+        );
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("CPU 12%\nMemory 47%")
+        );
+        assert_eq!(widget.tooltip_at(400, 10), None);
+    }
+
+    #[test]
+    fn a_memory_total_change_updates_the_tooltip_without_a_redraw() {
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(widget.update(&stats_gib(12.0, GIB * 4, GIB * 16)));
+        // 25% either way, but 4.0 → 4.1 GiB used.
+        let next = Msg::System(SystemStats::new(12.0, 25.0).with_memory(GIB * 41 / 10, GIB * 16));
+        assert!(!widget.update(&next));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("CPU 12%\nMemory 4.1/16.0 GiB")
+        );
+    }
+
+    #[test]
+    fn tooltip_format_and_opt_out() {
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_tooltip_format(Some("{cpu}/{mem}".into()));
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("12/47"));
+        let mut widget = SystemWidget::new(Bounds::new(0, 0, 320, 32)).with_tooltip(Some(false));
+        widget.update(&stats(12.0, 47.0));
+        assert_eq!(widget.tooltip_at(10, 10), None);
     }
 
     #[test]

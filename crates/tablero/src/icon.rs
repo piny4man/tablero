@@ -43,16 +43,22 @@ pub enum BuiltinIcon {
     /// A backlight/brightness level on a seven-step ramp, `0` (off) to `6`
     /// (full). Values above `6` saturate to the full-brightness icon.
     Backlight(u8),
-    /// A wireless (Wi-Fi) network link.
-    NetworkWireless,
+    /// A wireless (Wi-Fi) network link at a signal level on a four-step
+    /// ramp: `0` lights only the dot, each step lights one more arc, and `3`
+    /// (or above) lights them all. Unlit arcs are drawn faintly.
+    NetworkWireless(u8),
     /// A wired (Ethernet) network link.
     NetworkWired,
     /// System CPU load.
     System,
     /// System memory load.
     Memory,
-    /// A Bluetooth adapter.
+    /// A powered Bluetooth adapter with nothing connected.
     Bluetooth,
+    /// A Bluetooth adapter that is off or missing.
+    BluetoothOff,
+    /// A powered Bluetooth adapter with connected devices.
+    BluetoothConnected,
     /// Pending package updates.
     Updates,
     /// Notifications enabled.
@@ -100,11 +106,13 @@ impl BuiltinIcon {
                 5 => "bright-5",
                 _ => "bright-full",
             },
-            BuiltinIcon::NetworkWireless => "wifi-filled",
+            BuiltinIcon::NetworkWireless(_) => "wifi-filled",
             BuiltinIcon::NetworkWired => "ethernet-filled",
             BuiltinIcon::System => "cpu-filled",
             BuiltinIcon::Memory => "memory-filled",
             BuiltinIcon::Bluetooth => "bluetooth-outline",
+            BuiltinIcon::BluetoothOff => "bluetooth-off",
+            BuiltinIcon::BluetoothConnected => "bluetooth-connected",
             BuiltinIcon::Updates => "box5-filled",
             BuiltinIcon::Notifications => "bell-filled",
             BuiltinIcon::NotificationsOff => "bell-off2-filled",
@@ -121,6 +129,25 @@ impl BuiltinIcon {
             BuiltinIcon::VolumeMedium => "volume-down-filled",
             BuiltinIcon::VolumeHigh => "volume-up-filled",
             BuiltinIcon::VolumeMuted => "volume-x-filled",
+        }
+    }
+
+    /// The alpha for sub-path `index` of `count`, given the requested `alpha`.
+    ///
+    /// Every sub-path is fully opaque except on the Wi-Fi ramp, whose art runs
+    /// outer arc → middle arc → inner arc → dot: the last `level + 1` sub-paths
+    /// are lit and the rest are dimmed so the full shape stays readable.
+    fn path_alpha(self, index: usize, count: usize, alpha: u8) -> u8 {
+        match self {
+            BuiltinIcon::NetworkWireless(level) => {
+                let lit = (usize::from(level) + 1).min(count);
+                if index + lit >= count {
+                    alpha
+                } else {
+                    (u16::from(alpha) * 3 / 10) as u8
+                }
+            }
+            _ => alpha,
         }
     }
 
@@ -173,14 +200,16 @@ pub fn draw_into(pixmap: &mut Pixmap, icon: BuiltinIcon, bounds: Bounds, color: 
     let transform = Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
 
     let (r, g, b, a) = color;
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(r, g, b, a);
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
 
-    for sub in raw.paths {
+    for (index, sub) in raw.paths.iter().enumerate() {
         let Some(path) = build_path(sub.cmds) else {
             continue;
         };
+        paint.set_color_rgba8(r, g, b, icon.path_alpha(index, raw.paths.len(), a));
         let rule = if sub.even_odd {
             FillRule::EvenOdd
         } else {
@@ -204,11 +233,14 @@ mod tests {
             BuiltinIcon::BatteryHalf,
             BuiltinIcon::BatteryFull,
             BuiltinIcon::BatteryCharging,
-            BuiltinIcon::NetworkWireless,
+            BuiltinIcon::NetworkWireless(0),
+            BuiltinIcon::NetworkWireless(3),
             BuiltinIcon::NetworkWired,
             BuiltinIcon::System,
             BuiltinIcon::Memory,
             BuiltinIcon::Bluetooth,
+            BuiltinIcon::BluetoothOff,
+            BuiltinIcon::BluetoothConnected,
             BuiltinIcon::Updates,
             BuiltinIcon::Notifications,
             BuiltinIcon::NotificationsOff,
@@ -256,6 +288,26 @@ mod tests {
         assert_eq!(BuiltinIcon::Backlight(6).stem(), "bright-full");
         assert_eq!(BuiltinIcon::Backlight(99).stem(), "bright-full");
         assert_eq!(BuiltinIcon::Backlight(0).stem(), "bright-empty");
+    }
+
+    #[test]
+    fn wifi_levels_light_the_dot_first_then_one_arc_per_level() {
+        // Sub-paths run outer arc, middle arc, inner arc, dot.
+        let lit = |level| {
+            (0..4)
+                .map(|index| BuiltinIcon::NetworkWireless(level).path_alpha(index, 4, 200) == 200)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lit(0), [false, false, false, true]);
+        assert_eq!(lit(1), [false, false, true, true]);
+        assert_eq!(lit(2), [false, true, true, true]);
+        assert_eq!(lit(3), [true, true, true, true]);
+        assert_eq!(lit(9), [true, true, true, true]);
+        // Unlit arcs stay faintly visible rather than vanishing.
+        let dim = BuiltinIcon::NetworkWireless(0).path_alpha(0, 4, 200);
+        assert!(dim > 0 && dim < 200, "dim alpha {dim}");
+        // Other icons paint every sub-path at full alpha.
+        assert_eq!(BuiltinIcon::Clock.path_alpha(0, 2, 200), 200);
     }
 
     #[test]

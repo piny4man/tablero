@@ -8,13 +8,14 @@
 //! NetworkManager exposes an overall `State` plus a `PrimaryConnection` object
 //! path on `org.freedesktop.NetworkManager`. The producer reads those, follows
 //! the primary active connection to its `Type` (and, on Wi-Fi, traverses
-//! device → access point for the `Ssid`), normalizes
+//! device → access point for the `Ssid` and `Strength`), normalizes
 //! the readings into a [`Network`], then re-reads and re-emits whenever the state
-//! or primary connection changes. Normalization lives in [`network_from_nm`], a
+//! or primary connection changes, or the active access point's strength moves. Normalization lives in [`network_from_nm`], a
 //! pure function the tests drive directly — the full DBus value → message →
 //! widget path is covered without a live system bus.
 
-use futures_util::stream::{StreamExt, select_all};
+use futures_util::future::{Either, select};
+use futures_util::stream::{BoxStream, StreamExt, select_all};
 use log::warn;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, proxy};
@@ -106,7 +107,8 @@ trait WirelessDevice {
     fn active_access_point(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
-/// The subset of `org.freedesktop.NetworkManager.AccessPoint` carrying the SSID.
+/// The subset of `org.freedesktop.NetworkManager.AccessPoint` carrying the SSID
+/// and signal strength.
 #[proxy(
     interface = "org.freedesktop.NetworkManager.AccessPoint",
     default_service = "org.freedesktop.NetworkManager"
@@ -115,6 +117,17 @@ trait AccessPoint {
     /// The network name as raw bytes (not necessarily valid UTF-8).
     #[zbus(property)]
     fn ssid(&self) -> zbus::Result<Vec<u8>>;
+
+    /// The signal quality in percent.
+    #[zbus(property)]
+    fn strength(&self) -> zbus::Result<u8>;
+}
+
+/// The active access point a wireless snapshot was read from: its proxy (to
+/// watch `Strength`) alongside the object path identifying it.
+struct ActiveAp {
+    path: OwnedObjectPath,
+    proxy: AccessPointProxy<'static>,
 }
 
 /// Read NetworkManager's current connectivity and normalize it into a snapshot.
@@ -124,25 +137,33 @@ trait AccessPoint {
 /// NetworkManager not running at all, never takes the source down; the widget
 /// simply stays blank.
 #[hotpath::measure]
-async fn read_snapshot(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> Option<Network> {
+async fn read_snapshot(
+    conn: &Connection,
+    nm: &NetworkManagerProxy<'_>,
+) -> (Option<Network>, Option<ActiveAp>) {
     match try_read(conn, nm).await {
-        Ok(network) => Some(network),
+        Ok((network, ap)) => (Some(network), ap),
         Err(e) => {
             warn!("networkmanager: reading network state failed: {e}");
-            None
+            (None, None)
         }
     }
 }
 
 /// Read the overall state and primary connection, following it to a type and
-/// (on Wi-Fi) an SSID, then fold them into a normalized snapshot.
+/// (on Wi-Fi) an SSID and signal strength, then fold them into a normalized
+/// snapshot, returning the access point it came from so its strength can be
+/// watched.
 #[hotpath::measure]
-async fn try_read(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> zbus::Result<Network> {
+async fn try_read(
+    conn: &Connection,
+    nm: &NetworkManagerProxy<'_>,
+) -> zbus::Result<(Network, Option<ActiveAp>)> {
     let state = nm.state().await?;
     let primary = nm.primary_connection().await?;
     // "/" is NetworkManager's "no primary connection": nothing to classify.
     if primary.as_str() == "/" {
-        return Ok(network_from_nm(state, None, None));
+        return Ok((network_from_nm(state, None, None), None));
     }
 
     let active = ActiveConnectionProxy::builder(conn)
@@ -150,26 +171,42 @@ async fn try_read(conn: &Connection, nm: &NetworkManagerProxy<'_>) -> zbus::Resu
         .build()
         .await?;
     let conn_type = active.type_().await?;
-    // The SSID lives several hops away and only matters on Wi-Fi; a missing one
-    // degrades to no name rather than failing the whole read.
-    let ssid = if conn_type == "802-11-wireless" {
-        read_ssid(conn, &active).await
+    // The access point lives several hops away and only matters on Wi-Fi; a
+    // missing one degrades to no name or strength rather than failing the read.
+    let ap = if conn_type == "802-11-wireless" {
+        read_access_point(conn, &active).await
     } else {
         None
     };
+    let (ssid, signal) = match &ap {
+        Some(ap) => {
+            let ssid = ap
+                .proxy
+                .ssid()
+                .await
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            (ssid, ap.proxy.strength().await.ok())
+        }
+        None => (None, None),
+    };
 
-    Ok(network_from_nm(state, Some(&conn_type), ssid.as_deref()))
+    let network = network_from_nm(state, Some(&conn_type), ssid.as_deref()).with_signal(signal);
+    Ok((network, ap))
 }
 
-/// Best-effort SSID lookup for a wireless connection: connection → device →
-/// active access point → `Ssid`.
+/// Best-effort access point lookup for a wireless connection: connection →
+/// device → active access point.
 ///
 /// Every hop can be absent (no device, no associated AP) or fail transiently;
 /// any of those simply yields `None`, so the widget falls back to the bare
-/// `"wifi"` label rather than erroring. The raw bytes are decoded lossily — an
-/// SSID is not guaranteed to be valid UTF-8.
+/// Wi-Fi icon rather than erroring. The SSID bytes are decoded lossily by the
+/// caller — an SSID is not guaranteed to be valid UTF-8.
 #[hotpath::measure]
-async fn read_ssid(conn: &Connection, active: &ActiveConnectionProxy<'_>) -> Option<String> {
+async fn read_access_point(
+    conn: &Connection,
+    active: &ActiveConnectionProxy<'_>,
+) -> Option<ActiveAp> {
     let device_path = active.devices().await.ok()?.into_iter().next()?;
     let wireless = WirelessDeviceProxy::builder(conn)
         .path(device_path)
@@ -181,14 +218,16 @@ async fn read_ssid(conn: &Connection, active: &ActiveConnectionProxy<'_>) -> Opt
     if ap_path.as_str() == "/" {
         return None;
     }
-    let access_point = AccessPointProxy::builder(conn)
-        .path(ap_path)
+    let proxy = AccessPointProxy::builder(conn)
+        .path(ap_path.clone())
         .ok()?
         .build()
         .await
         .ok()?;
-    let bytes = access_point.ssid().await.ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(ActiveAp {
+        path: ap_path,
+        proxy,
+    })
 }
 
 /// A [`Producer`] that streams NetworkManager connectivity changes into the
@@ -235,14 +274,6 @@ async fn run(tx: MsgSender) -> ProducerResult {
     let conn = Connection::system().await?;
     let nm = NetworkManagerProxy::new(&conn).await?;
 
-    // Seed the bar with the current connectivity before the first change signal.
-    if tx
-        .send(Msg::Network(read_snapshot(&conn, &nm).await))
-        .is_err()
-    {
-        return Ok(());
-    }
-
     // Either the overall state or the primary connection changing warrants a
     // re-read; merge the two property streams and re-emit a fresh snapshot on
     // each tick. An unchanged snapshot is harmless — the widget reports no
@@ -254,16 +285,47 @@ async fn run(tx: MsgSender) -> ProducerResult {
             .map(|_| ())
             .boxed(),
     ]);
-    while changes.next().await.is_some() {
-        if tx
-            .send(Msg::Network(read_snapshot(&conn, &nm).await))
-            .is_err()
-        {
+    // The active access point's strength is watched too, re-subscribing only
+    // when the access point itself changes so a roam or reconnect follows it.
+    let mut watched: Option<OwnedObjectPath> = None;
+    let mut strength: Option<BoxStream<'static, ()>> = None;
+
+    loop {
+        let (snapshot, ap) = read_snapshot(&conn, &nm).await;
+        if tx.send(Msg::Network(snapshot)).is_err() {
             return Ok(());
         }
-    }
+        let path = ap.as_ref().map(|ap| ap.path.clone());
+        if path != watched {
+            strength = match ap {
+                Some(ap) => Some(
+                    ap.proxy
+                        .receive_strength_changed()
+                        .await
+                        .map(|_| ())
+                        .boxed(),
+                ),
+                None => None,
+            };
+            watched = path;
+        }
 
-    Ok(())
+        match strength.as_mut() {
+            Some(signal) => match select(changes.next(), signal.next()).await {
+                Either::Left((None, _)) => return Ok(()),
+                Either::Right((None, _)) => {
+                    strength = None;
+                    watched = None;
+                }
+                _ => {}
+            },
+            None => {
+                if changes.next().await.is_none() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -12,27 +12,38 @@
 //! audio server usually means the user has none, not that the user is interested
 //! in seeing a placeholder.
 //!
-//! The level bucket drives the icon, not the label — the label is the bare
-//! `Vol N%` (or `Mute`) the user reads at a glance, and the icon is a small
-//! visual hint that swaps between the low/medium/high/muted speaker glyphs as
-//! the level crosses its thresholds. Keeping the label short is what keeps the
-//! widget narrow enough to live in the right cluster next to the other status
-//! pills.
+//! The level bucket drives the icon, and the label is the bare `N%` the user
+//! reads at a glance (the `format` key can reshape it). A muted sink shows the
+//! muted icon alone; the level, device, and mute state live in the hover
+//! tooltip. Keeping the pill short is what keeps the widget narrow enough to
+//! live in the right cluster next to the other status pills.
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    LaunchSpec, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
+    IconSetting, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
+    expand, measure_icon_content,
 };
+
+/// The default label: the level icon followed by the bare percentage.
+const DEFAULT_FORMAT: &str = "{icon}{percent}%";
+
+/// Placeholders accepted by the volume `format` and `tooltip-format`.
+pub const VOLUME_PLACEHOLDERS: &[&str] = &["icon", "percent", "device"];
+
+/// Validate a volume `format` or `tooltip-format`.
+pub fn validate_volume_format(format: &str) -> Result<(), String> {
+    super::validate_placeholders(format, VOLUME_PLACEHOLDERS)
+}
 
 /// The kind of audio output the active sink represents, derived from the
 /// PipeWire `device.icon-name` (preferred) or `device.form-factor` (fallback).
 ///
 /// The variant is retained on the snapshot so a sink switch counts as a visible
 /// change worth repainting, even though the rendered icon now follows the
-/// level bucket rather than the device. It is not surfaced in the label — that
-/// stays `Vol N%` or `Mute` regardless of which device is active.
+/// level bucket rather than the device. It is not surfaced in the default
+/// label; the tooltip and the `{device}` placeholder name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     /// Headphones (`device.icon-name` in `audio-headphones*` or
@@ -53,6 +64,21 @@ pub enum DeviceKind {
     /// Anything the heuristics could not classify (no icon, unknown form
     /// factor, or a custom value).
     Other,
+}
+
+impl DeviceKind {
+    /// A short human-readable name, used by the tooltip and `{device}`.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceKind::Headphones => "Headphones",
+            DeviceKind::Headset => "Headset",
+            DeviceKind::Speakers => "Speakers",
+            DeviceKind::Monitor => "Monitor",
+            DeviceKind::Phone => "Phone",
+            DeviceKind::Tv => "TV",
+            DeviceKind::Other => "Other",
+        }
+    }
 }
 
 /// A normalized snapshot of the active output sink: the playback level (whole
@@ -104,18 +130,16 @@ impl Volume {
         self.device
     }
 
-    /// The display label, e.g. `"Vol 42%"` or `"Mute"` when muted.
+    /// A short plain-text summary, e.g. `"42%"` or `"Muted"`.
     ///
-    /// The label is intentionally device-blind: keeping the rendered text short
-    /// is what lets the widget live next to the other status pills without
-    /// pushing them off the bar, and the device kind already surfaces as the
-    /// glyph. Keeping this a pure function makes the rendered text deterministic
-    /// and unit-testable without painting pixels.
+    /// The summary is intentionally device-blind so it stays short. Keeping
+    /// this a pure function makes the reading deterministic and unit-testable
+    /// without painting pixels.
     pub fn label(self) -> String {
         if self.muted {
-            "Mute".to_string()
+            "Muted".to_string()
         } else {
-            format!("Vol {}%", self.level)
+            format!("{}%", self.level)
         }
     }
 }
@@ -151,6 +175,15 @@ pub struct VolumeWidget {
     state: Option<Volume>,
     style: WidgetStyle,
     on_click: Option<LaunchSpec>,
+    format: String,
+    /// A user-supplied low-to-high `{icon}` ramp; `None` keeps the built-in
+    /// speaker art.
+    format_icons: Option<Vec<String>>,
+    /// A user-supplied muted glyph; `None` keeps the built-in muted art.
+    muted_icon: Option<String>,
+    tooltip: bool,
+    /// A custom tooltip template; `None` uses the built-in summary.
+    tooltip_format: Option<String>,
 }
 
 impl VolumeWidget {
@@ -163,7 +196,48 @@ impl VolumeWidget {
             state: None,
             style: WidgetStyle::default(),
             on_click: None,
+            format: DEFAULT_FORMAT.to_string(),
+            format_icons: None,
+            muted_icon: None,
+            tooltip: true,
+            tooltip_format: None,
         }
+    }
+
+    /// Set the label format (`{icon}`, `{percent}`, `{device}`).
+    pub fn with_format(mut self, format: Option<String>) -> Self {
+        if let Some(format) = format {
+            self.format = format;
+        }
+        self
+    }
+
+    /// Set a low-to-high text icon ramp for the unmuted levels.
+    pub fn with_format_icons(mut self, icons: Option<Vec<String>>) -> Self {
+        self.format_icons = icons.filter(|icons| !icons.is_empty());
+        self
+    }
+
+    /// Set the text glyph shown while muted.
+    pub fn with_muted_icon(mut self, icon: Option<String>) -> Self {
+        self.muted_icon = icon;
+        self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, tooltip: Option<bool>) -> Self {
+        if let Some(tooltip) = tooltip {
+            self.tooltip = tooltip;
+        }
+        self
+    }
+
+    /// Set a custom tooltip format (same placeholders as `format`).
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.tooltip_format = format;
+        }
+        self
     }
 
     /// Set the resolved visual style, consuming and returning `self` so it
@@ -191,19 +265,75 @@ impl VolumeWidget {
         self.state.map(Volume::label).unwrap_or_default()
     }
 
-    /// The pill template: an `{icon}` slot paired with the level label. Empty
-    /// before the first reading, so the widget reserves no slot.
+    /// The pill template: the configured format with `{percent}`/`{device}`
+    /// filled in, or the bare `{icon}` while muted. Empty before the first
+    /// reading, so the widget reserves no slot.
     fn template(&self) -> String {
         match &self.state {
-            Some(volume) => format!("{{icon}} {}", volume.label()),
+            Some(volume) if volume.muted() => "{icon}".to_string(),
+            Some(volume) => self.expand(&self.format, *volume),
             None => String::new(),
         }
     }
 
+    fn expand(&self, format: &str, volume: Volume) -> String {
+        expand(
+            format,
+            &[
+                ("percent", &volume.level().to_string()),
+                ("device", volume.device().label()),
+            ],
+        )
+    }
+
+    /// The expanded hover tooltip, when enabled and a reading exists.
+    pub fn tooltip_text(&self) -> Option<String> {
+        if !self.tooltip {
+            return None;
+        }
+        let volume = self.state?;
+        Some(match &self.tooltip_format {
+            Some(format) => {
+                let icon = match self.icon() {
+                    ResolvedIcon::Text(icon) => icon,
+                    _ => String::new(),
+                };
+                self.expand(format, volume).replace("{icon}", &icon)
+            }
+            None => {
+                let mut text = format!(
+                    "Volume: {}%\nDevice: {}",
+                    volume.level(),
+                    volume.device().label()
+                );
+                if volume.muted() {
+                    text.push_str("\nMuted");
+                }
+                text
+            }
+        })
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        let b = self.bounds;
+        px >= b.x && px < b.x + b.width && py >= b.y && py < b.y + b.height
+    }
+
     /// The speaker icon for the current level bucket — muted, then low/medium/high
     /// by percent — resolved against the style so a custom `icon`/`icon = "none"`
-    /// still overrides it. `None` before the first reading (nothing to show).
+    /// still overrides it, and against any `format-icons` text ramp or muted
+    /// glyph. `None` before the first reading (nothing to show).
     fn icon(&self) -> ResolvedIcon {
+        if let (IconSetting::Default, Some(volume)) = (&self.style.icon, &self.state) {
+            if volume.muted() {
+                if let Some(icon) = &self.muted_icon {
+                    return ResolvedIcon::Text(icon.clone());
+                }
+            } else if let Some(icons) = &self.format_icons {
+                let index = (usize::from(volume.level()) * icons.len()) / 101;
+                return ResolvedIcon::Text(icons[index].clone());
+            }
+        }
         let default = match &self.state {
             // 0% is silent whether or not the mute flag is set, so it reads as
             // muted rather than as the quietest audible step.
@@ -268,11 +398,20 @@ impl Widget for VolumeWidget {
         // Only interactive when an on-click path was configured at build time;
         // otherwise the default (None) is correct.
         let path = self.on_click.as_ref()?;
-        let b = self.bounds;
-        if px < b.x || px >= b.x + b.width || py < b.y || py >= b.y + b.height {
+        if !self.contains(px, py) {
             return None;
         }
         Some(super::Command::RunProgram(path.clone()))
+    }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_text()?,
+            bounds: self.bounds,
+        })
     }
 }
 
@@ -313,25 +452,21 @@ mod tests {
     }
 
     #[test]
-    fn label_shows_vol_n_percent_when_unmuted() {
+    fn label_shows_the_bare_percent_when_unmuted() {
         assert_eq!(
             Volume::new(0.42, false, DeviceKind::Speakers).label(),
-            "Vol 42%"
+            "42%"
         );
     }
 
     #[test]
     fn label_shows_mute_when_muted() {
-        // Mute always reads "Mute" — the level is irrelevant.
+        // Mute always reads "Muted" — the level is irrelevant.
         assert_eq!(
             Volume::new(0.42, true, DeviceKind::Speakers).label(),
-            "Mute"
+            "Muted"
         );
-        assert_eq!(Volume::new(0.0, true, DeviceKind::Other).label(), "Mute");
-        assert_eq!(
-            Volume::new(1.0, true, DeviceKind::Headphones).label(),
-            "Mute"
-        );
+        assert_eq!(Volume::new(0.0, true, DeviceKind::Other).label(), "Muted");
     }
 
     #[test]
@@ -347,7 +482,7 @@ mod tests {
             DeviceKind::Tv,
             DeviceKind::Other,
         ] {
-            assert_eq!(Volume::new(0.5, false, device).label(), "Vol 50%");
+            assert_eq!(Volume::new(0.5, false, device).label(), "50%");
         }
     }
 
@@ -356,7 +491,7 @@ mod tests {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
         assert_eq!(widget.label(), "");
         assert!(widget.update(&vol(0.42, false, DeviceKind::Speakers)));
-        assert_eq!(widget.label(), "Vol 42%");
+        assert_eq!(widget.label(), "42%");
     }
 
     #[test]
@@ -365,7 +500,7 @@ mod tests {
         assert!(widget.update(&vol(0.42, false, DeviceKind::Speakers)));
         // Sub-percent jitter normalizes to the same whole percent: no repaint.
         assert!(!widget.update(&vol(0.424, false, DeviceKind::Speakers)));
-        assert_eq!(widget.label(), "Vol 42%");
+        assert_eq!(widget.label(), "42%");
     }
 
     #[test]
@@ -373,7 +508,7 @@ mod tests {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(widget.update(&vol(0.42, false, DeviceKind::Speakers)));
         assert!(widget.update(&vol(0.65, false, DeviceKind::Speakers)));
-        assert_eq!(widget.label(), "Vol 65%");
+        assert_eq!(widget.label(), "65%");
     }
 
     #[test]
@@ -381,7 +516,7 @@ mod tests {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(widget.update(&vol(0.42, false, DeviceKind::Speakers)));
         assert!(widget.update(&vol(0.42, true, DeviceKind::Speakers)));
-        assert_eq!(widget.label(), "Mute");
+        assert_eq!(widget.label(), "Muted");
     }
 
     #[test]
@@ -389,7 +524,7 @@ mod tests {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
         assert!(widget.update(&vol(0.42, true, DeviceKind::Speakers)));
         assert!(widget.update(&vol(0.42, false, DeviceKind::Speakers)));
-        assert_eq!(widget.label(), "Vol 42%");
+        assert_eq!(widget.label(), "42%");
     }
 
     #[test]
@@ -426,7 +561,7 @@ mod tests {
         widget.update(&vol(0.42, false, DeviceKind::Speakers));
         let tick = Msg::Tick(Local.with_ymd_and_hms(2026, 6, 27, 8, 0, 0).unwrap());
         assert!(!widget.update(&tick));
-        assert_eq!(widget.label(), "Vol 42%");
+        assert_eq!(widget.label(), "42%");
     }
 
     #[test]
@@ -473,9 +608,10 @@ mod tests {
     fn template_pairs_the_icon_slot_with_the_label() {
         let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
         widget.update(&vol(0.42, false, DeviceKind::Speakers));
-        assert_eq!(widget.template(), "{icon} Vol 42%");
+        assert_eq!(widget.template(), "{icon}42%");
+        // Muted shows the muted icon alone; the level moves to the tooltip.
         widget.update(&vol(0.42, true, DeviceKind::Speakers));
-        assert_eq!(widget.template(), "{icon} Mute");
+        assert_eq!(widget.template(), "{icon}");
     }
 
     #[test]
@@ -501,7 +637,7 @@ mod tests {
         widget.update(&vol(0.5, false, DeviceKind::Speakers));
         assert_eq!(widget.icon(), ResolvedIcon::None);
         // The level label still shows even with the icon opted out.
-        assert_eq!(widget.template(), "{icon} Vol 50%");
+        assert_eq!(widget.template(), "{icon}50%");
     }
 
     #[test]
@@ -511,6 +647,73 @@ mod tests {
         assert_eq!(widget.measure(&mut ctx, 32), 0);
         widget.update(&vol(0.5, false, DeviceKind::Speakers));
         assert!(widget.measure(&mut ctx, 32) > 0);
+    }
+
+    #[test]
+    fn custom_format_expands_percent_and_device() {
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format(Some("{icon} {percent}% {device}".into()));
+        widget.update(&vol(0.42, false, DeviceKind::Headphones));
+        assert_eq!(widget.template(), "{icon} 42% Headphones");
+    }
+
+    #[test]
+    fn format_icons_ramp_picks_by_level_and_muted_icon_wins() {
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format_icons(Some(vec!["a".into(), "b".into(), "c".into()]))
+            .with_muted_icon(Some("m".into()));
+        widget.update(&vol(0.10, false, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("a".into()));
+        widget.update(&vol(0.50, false, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("b".into()));
+        widget.update(&vol(1.0, false, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("c".into()));
+        widget.update(&vol(1.0, true, DeviceKind::Speakers));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("m".into()));
+    }
+
+    #[test]
+    fn a_ramp_without_a_muted_icon_keeps_the_built_in_muted_art() {
+        let mut widget =
+            VolumeWidget::new(Bounds::new(0, 0, 320, 32)).with_format_icons(Some(vec!["a".into()]));
+        widget.update(&vol(0.5, true, DeviceKind::Speakers));
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::VolumeMuted)
+        );
+    }
+
+    #[test]
+    fn default_tooltip_lists_level_device_and_mute() {
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.tooltip_text(), None);
+        widget.update(&vol(0.42, false, DeviceKind::Speakers));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Volume: 42%\nDevice: Speakers")
+        );
+        widget.update(&vol(0.42, true, DeviceKind::Headset));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Volume: 42%\nDevice: Headset\nMuted")
+        );
+    }
+
+    #[test]
+    fn tooltip_format_and_opt_out() {
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_tooltip_format(Some("{device} at {percent}%".into()));
+        widget.update(&vol(0.42, false, DeviceKind::Tv));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("TV at 42%"));
+        assert_eq!(
+            widget.tooltip_at(10, 10).map(|tip| tip.text),
+            Some("TV at 42%".to_string())
+        );
+        assert_eq!(widget.tooltip_at(400, 10), None);
+
+        let mut widget = VolumeWidget::new(Bounds::new(0, 0, 320, 32)).with_tooltip(Some(false));
+        widget.update(&vol(0.42, false, DeviceKind::Tv));
+        assert_eq!(widget.tooltip_at(10, 10), None);
     }
 
     #[test]

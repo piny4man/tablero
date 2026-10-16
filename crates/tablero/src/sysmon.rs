@@ -98,6 +98,14 @@ pub fn cpu_usage(prev: CpuTimes, cur: CpuTimes) -> f64 {
 /// either field is missing or `MemTotal` is zero. Pure over its input.
 #[hotpath::measure]
 pub fn parse_mem_usage(proc_meminfo: &str) -> Option<f64> {
+    let (used, total) = parse_mem_kib(proc_meminfo)?;
+    Some(used as f64 / total as f64 * 100.0)
+}
+
+/// Parse `/proc/meminfo` into `(used, total)` kibibytes, where used is
+/// `MemTotal - MemAvailable`. Returns `None` if either field is missing or
+/// `MemTotal` is zero. Pure over its input.
+pub fn parse_mem_kib(proc_meminfo: &str) -> Option<(u64, u64)> {
     let mut total = None;
     let mut available = None;
     for line in proc_meminfo.lines() {
@@ -112,8 +120,7 @@ pub fn parse_mem_usage(proc_meminfo: &str) -> Option<f64> {
     if total == 0 {
         return None;
     }
-    let used = total.saturating_sub(available);
-    Some(used as f64 / total as f64 * 100.0)
+    Some((total.saturating_sub(available), total))
 }
 
 /// Parse the leading kibibyte value of a `/proc/meminfo` field (e.g. `  16384 kB`).
@@ -152,12 +159,12 @@ fn read_cpu_times(reader: &mut ProcReader) -> Option<CpuTimes> {
     }
 }
 
-/// Read and parse the current memory load, logging and degrading to `None` on
-/// any failure.
+/// Read and parse the current `(used, total)` memory in kibibytes, logging and
+/// degrading to `None` on any failure.
 #[hotpath::measure]
-fn read_mem_usage(reader: &mut ProcReader) -> Option<f64> {
+fn read_mem_kib(reader: &mut ProcReader) -> Option<(u64, u64)> {
     match reader.read("/proc/meminfo") {
-        Ok(meminfo) => parse_mem_usage(meminfo),
+        Ok(meminfo) => parse_mem_kib(meminfo),
         Err(e) => {
             warn!("sysmon: reading /proc/meminfo failed: {e}");
             None
@@ -236,9 +243,14 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
             prev = cur;
         }
 
-        let mem = read_mem_usage(&mut reader).unwrap_or(0.0);
+        let stats = match read_mem_kib(&mut reader) {
+            Some((used, total)) => {
+                SystemStats::new(cpu, used as f64 / total as f64 * 100.0).with_memory(used, total)
+            }
+            None => SystemStats::new(cpu, 0.0),
+        };
 
-        if !send_if_changed(&tx, &mut sent, SystemStats::new(cpu, mem)) {
+        if !send_if_changed(&tx, &mut sent, stats) {
             return Ok(());
         }
     }
@@ -407,6 +419,12 @@ Cached:          3000000 kB
         // 16000000 total, 8000000 available -> 8000000 used -> 50%.
         let mem = parse_mem_usage(PROC_MEMINFO).expect("mem fields present");
         assert!((mem - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_mem_kib_is_used_and_total() {
+        assert_eq!(parse_mem_kib(PROC_MEMINFO), Some((8_000_000, 16_000_000)));
+        assert_eq!(parse_mem_kib("MemTotal: 16000000 kB\n"), None);
     }
 
     #[test]

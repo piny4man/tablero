@@ -107,13 +107,13 @@ fn common_volume_states_render_expected_labels() {
     assert_eq!(
         labels,
         vec![
-            "Vol 50%".to_string(),
-            "Mute".to_string(),
+            "50%".to_string(),
+            "Muted".to_string(),
             String::new(),
-            "Vol 25%".to_string(),
+            "25%".to_string(),
         ]
     );
-    // First reading is dirty (empty → "Vol 50%"); mute flips the label;
+    // First reading is dirty (empty → "50%"); mute flips the label;
     // None empties the label; the fourth reading re-paints. Every message
     // causes a visible change, so four redraws.
     assert_eq!(redraws, 4, "every reading changes the visible state");
@@ -128,7 +128,7 @@ fn identical_reading_is_not_a_redraw() {
         vol(0.42, false, DeviceKind::Speakers),
         vol(0.424, false, DeviceKind::Speakers),
     ]);
-    assert_eq!(labels, vec!["Vol 42%".to_string(), "Vol 42%".to_string()]);
+    assert_eq!(labels, vec!["42%".to_string(), "42%".to_string()]);
     assert_eq!(redraws, 1, "no-op state changes must not repaint");
 }
 
@@ -138,7 +138,7 @@ fn a_new_level_is_a_visible_change() {
         vol(0.42, false, DeviceKind::Speakers),
         vol(0.65, false, DeviceKind::Speakers),
     ]);
-    assert_eq!(labels, vec!["Vol 42%".to_string(), "Vol 65%".to_string()]);
+    assert_eq!(labels, vec!["42%".to_string(), "65%".to_string()]);
     assert_eq!(redraws, 2);
 }
 
@@ -148,7 +148,7 @@ fn a_toggle_to_mute_is_a_visible_change() {
         vol(0.42, false, DeviceKind::Speakers),
         vol(0.42, true, DeviceKind::Speakers),
     ]);
-    assert_eq!(labels, vec!["Vol 42%".to_string(), "Mute".to_string()]);
+    assert_eq!(labels, vec!["42%".to_string(), "Muted".to_string()]);
     assert_eq!(redraws, 2);
 }
 
@@ -158,7 +158,7 @@ fn a_toggle_back_from_mute_is_a_visible_change() {
         vol(0.42, true, DeviceKind::Speakers),
         vol(0.42, false, DeviceKind::Speakers),
     ]);
-    assert_eq!(labels, vec!["Mute".to_string(), "Vol 42%".to_string()]);
+    assert_eq!(labels, vec!["Muted".to_string(), "42%".to_string()]);
     assert_eq!(redraws, 2);
 }
 
