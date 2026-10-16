@@ -79,12 +79,19 @@ use serde::de::{Deserializer, Error as _};
 use crate::render::{Bounds, RenderSettings};
 use crate::scale::Scale;
 use crate::widget::{
-    BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HypridleWidget,
-    IconSetting, LaunchSpec, NetworkWidget, NotificationsWidget, PowerProfilesWidget, PowerWidget,
-    StateColors, SystemWidget, TitleWidget, TrayWidget, UpdatesWidget, VolumeWidget, Widget,
-    WidgetStyle, WorkspaceWidget, backlight::validate_backlight_format,
-    battery::validate_battery_format, power_profiles::validate_power_profiles_format,
+    BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HoverColors,
+    HypridleWidget, IconSetting, LaunchSpec, NetworkWidget, NotificationsWidget,
+    PowerProfilesWidget, PowerWidget, StateColors, SystemWidget, TitleWidget, TrayWidget,
+    UpdatesWidget, VolumeWidget, Widget, WidgetStyle, WorkspaceWidget,
+    backlight::validate_backlight_format,
+    battery::BATTERY_PLACEHOLDERS,
+    bluetooth::{BLUETOOTH_ICON_NAMES, BLUETOOTH_PLACEHOLDERS},
+    network::{NETWORK_ICON_NAMES, NETWORK_PLACEHOLDERS},
+    power_profiles::validate_power_profiles_format,
+    system::SYSTEM_PLACEHOLDERS,
     updates::validate_updates_format,
+    validate_placeholders,
+    volume::VOLUME_PLACEHOLDERS,
 };
 
 /// Default bar height in pixels.
@@ -376,6 +383,9 @@ pub struct WidgetStyleConfig {
     pub attention: StateColorConfig,
     /// Colors used while a battery is charging.
     pub charging: StateColorConfig,
+    /// Colors while the pointer is over the widget; unset channels keep the
+    /// widget's own colors, and the background defaults to a subtle lift.
+    pub hover: StateColorConfig,
     /// Program (and optional args) run when the widget is clicked.
     ///
     /// When `Some`, a click inside the widget's bounds emits a
@@ -425,13 +435,22 @@ pub struct WidgetStyleConfig {
     pub interval: Option<u64>,
 }
 
-/// The two Waybar-style shapes accepted by `format-icons`.
+/// The Waybar-style shapes accepted by `format-icons`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum FormatIconsConfig {
-    /// Ordered low-to-high icon ramp, used by backlight.
+    /// Ordered low-to-high icon ramp, used by backlight, volume, and network.
     Ramp(Vec<String>),
-    /// Named state icons, used by power-profiles-daemon.
+    /// A low-to-high ramp plus named state icons, e.g.
+    /// `{ levels = [..], muted = "…" }` for volume.
+    Leveled {
+        /// Ordered low-to-high icon ramp.
+        levels: Vec<String>,
+        /// Named state icons alongside the ramp.
+        #[serde(flatten)]
+        named: BTreeMap<String, String>,
+    },
+    /// Named state icons, used by power-profiles-daemon and bluetooth.
     Named(BTreeMap<String, String>),
 }
 
@@ -446,15 +465,41 @@ impl FormatIconsConfig {
     fn ramp(&self) -> Option<&Vec<String>> {
         match self {
             Self::Ramp(icons) => Some(icons),
-            Self::Named(_) => None,
+            Self::Leveled { .. } | Self::Named(_) => None,
         }
     }
 
     fn named(&self) -> Option<&BTreeMap<String, String>> {
         match self {
             Self::Named(icons) => Some(icons),
+            Self::Ramp(_) | Self::Leveled { .. } => None,
+        }
+    }
+
+    /// The low-to-high ramp of a plain array or a `{ levels = [..] }` table.
+    fn levels(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Ramp(icons) | Self::Leveled { levels: icons, .. } => Some(icons),
+            Self::Named(_) => None,
+        }
+    }
+
+    /// The named state icon `key` from a table shape, if set.
+    fn extra(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Leveled { named, .. } | Self::Named(named) => named.get(key).map(String::as_str),
             Self::Ramp(_) => None,
         }
+    }
+
+    /// The named state icons of a table shape (empty for a plain ramp).
+    fn names(&self) -> impl Iterator<Item = (&String, &String)> {
+        match self {
+            Self::Leveled { named, .. } | Self::Named(named) => Some(named.iter()),
+            Self::Ramp(_) => None,
+        }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -499,6 +544,11 @@ impl WidgetStyleConfig {
                     border,
                 },
             ),
+            hover: HoverColors {
+                background: self.hover.background.map(Color::to_rgba),
+                foreground: self.hover.foreground.map(Color::to_rgba),
+                border: self.hover.border.map(Color::to_rgba),
+            },
         }
     }
 
@@ -575,6 +625,7 @@ impl WidgetStyleConfig {
         self.warn.apply(&mut base.warn);
         self.attention.apply(&mut base.attention);
         self.charging.apply(&mut base.charging);
+        self.hover.apply(&mut base.hover);
     }
 }
 
@@ -1028,6 +1079,10 @@ impl Config {
             &self.widget.power_profiles_daemon,
         )?;
         validate_updates_config("widget.updates", &self.widget.updates)?;
+        validate_volume_config("widget.volume", &self.widget.volume)?;
+        validate_network_config("widget.network", &self.widget.network)?;
+        validate_bluetooth_config("widget.bluetooth", &self.widget.bluetooth)?;
+        validate_formats("widget.system", &self.widget.system, SYSTEM_PLACEHOLDERS)?;
         validate_interval("widget.system", &self.widget.system)?;
         validate_interval("widget.updates", &self.widget.updates)?;
         validate_interval("widget.hypridle", &self.widget.hypridle)?;
@@ -1072,6 +1127,23 @@ impl Config {
             validate_updates_config(
                 &format!("monitor {who:?} widget.updates"),
                 &monitor.widget.updates,
+            )?;
+            validate_volume_config(
+                &format!("monitor {who:?} widget.volume"),
+                &monitor.widget.volume,
+            )?;
+            validate_network_config(
+                &format!("monitor {who:?} widget.network"),
+                &monitor.widget.network,
+            )?;
+            validate_bluetooth_config(
+                &format!("monitor {who:?} widget.bluetooth"),
+                &monitor.widget.bluetooth,
+            )?;
+            validate_formats(
+                &format!("monitor {who:?} widget.system"),
+                &monitor.widget.system,
+                SYSTEM_PLACEHOLDERS,
             )?;
         }
         Ok(())
@@ -1235,10 +1307,7 @@ fn validate_backlight_config(field: &str, config: &WidgetStyleConfig) -> Result<
 }
 
 fn validate_battery_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
-    if let Some(format) = &config.format {
-        validate_battery_format(format).map_err(|error| format!("{field}.format {error}"))?;
-    }
-    Ok(())
+    validate_formats(field, config, BATTERY_PLACEHOLDERS)
 }
 
 fn validate_power_profiles_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
@@ -1282,6 +1351,79 @@ fn validate_updates_config(field: &str, config: &WidgetStyleConfig) -> Result<()
     Ok(())
 }
 
+/// Check `format` and `tooltip-format` against a widget's placeholder set.
+fn validate_formats(
+    field: &str,
+    config: &WidgetStyleConfig,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(format) = &config.format {
+        validate_placeholders(format, allowed)
+            .map_err(|error| format!("{field}.format {error}"))?;
+    }
+    if let Some(format) = &config.tooltip_format {
+        validate_placeholders(format, allowed)
+            .map_err(|error| format!("{field}.tooltip-format {error}"))?;
+    }
+    Ok(())
+}
+
+/// Check a `format-icons` value that is a level ramp, a `{ levels = [..] }`
+/// table, or a table of named state icons, where only `names` are allowed.
+fn validate_level_icons(
+    field: &str,
+    config: &WidgetStyleConfig,
+    names: &[&str],
+) -> Result<(), String> {
+    let Some(icons) = &config.format_icons else {
+        return Ok(());
+    };
+    if let Some(levels) = icons.levels()
+        && (levels.is_empty() || levels.iter().any(String::is_empty))
+    {
+        return Err(format!(
+            "{field}.format-icons levels must be non-empty icons"
+        ));
+    }
+    for (name, icon) in icons.names() {
+        if !names.contains(&name.as_str()) {
+            return Err(format!(
+                "{field}.format-icons has unsupported name {name:?}; expected one of {names:?}"
+            ));
+        }
+        if icon.is_empty() {
+            return Err(format!(
+                "{field}.format-icons.{name} must be a non-empty icon"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_volume_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    validate_formats(field, config, VOLUME_PLACEHOLDERS)?;
+    validate_level_icons(field, config, &["muted"])
+}
+
+fn validate_network_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    validate_formats(field, config, NETWORK_PLACEHOLDERS)?;
+    validate_level_icons(field, config, NETWORK_ICON_NAMES)
+}
+
+fn validate_bluetooth_config(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
+    validate_formats(field, config, BLUETOOTH_PLACEHOLDERS)?;
+    if config
+        .format_icons
+        .as_ref()
+        .is_some_and(|icons| icons.levels().is_some())
+    {
+        return Err(format!(
+            "{field}.format-icons must be a table of named icons ({BLUETOOTH_ICON_NAMES:?})"
+        ));
+    }
+    validate_level_icons(field, config, BLUETOOTH_ICON_NAMES)
+}
+
 fn validate_interval(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
     match config.interval {
         Some(seconds) if !(1..=MAX_INTERVAL_SECS).contains(&seconds) => Err(format!(
@@ -1304,8 +1446,9 @@ impl WidgetKind {
     /// (bluetooth, volume, updates, power, network, clock) accepts the argument
     /// here so per-monitor `on-click` overrides apply uniformly. `on_click_right`
     /// is the matching right-click handler, honored by network, clock, and
-    /// power. `tooltip`/`tooltip_format` configure hover tooltips; today the
-    /// power widget and power-profiles-daemon consume them.
+    /// power. `tooltip`/`tooltip_format` configure hover tooltips for the
+    /// widgets that build here with defaults; the configured format, tooltip,
+    /// and `format-icons` fields are wired in `Config::build_dashboard`.
     pub fn build(
         self,
         bounds: Bounds,
@@ -1432,7 +1575,9 @@ impl Config {
                         WidgetKind::Battery => Box::new(
                             BatteryWidget::new(bounds)
                                 .with_style(style)
-                                .with_format(style_config.format.clone()),
+                                .with_format(style_config.format.clone())
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone()),
                         ) as Box<dyn Widget>,
                         WidgetKind::Backlight => Box::new(
                             BacklightWidget::new(bounds)
@@ -1476,12 +1621,65 @@ impl Config {
                                 .with_tooltip(style_config.tooltip)
                                 .with_tooltip_format(style_config.tooltip_format.clone()),
                         ),
-                        WidgetKind::Network => Box::new(
-                            NetworkWidget::new(bounds)
+                        WidgetKind::Network => {
+                            let icons = style_config.format_icons.as_ref();
+                            let mut widget = NetworkWidget::new(bounds)
                                 .with_style(style)
                                 .with_on_click(style_config.on_click.clone())
-                                .with_on_click_right(style_config.on_click_right.clone()),
+                                .with_on_click_right(style_config.on_click_right.clone())
+                                .with_format(style_config.format.clone())
+                                .with_format_icons(
+                                    icons.and_then(FormatIconsConfig::levels).cloned(),
+                                )
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone());
+                            for name in NETWORK_ICON_NAMES {
+                                widget = widget.with_state_icon(
+                                    name,
+                                    icons.and_then(|i| i.extra(name)).map(str::to_owned),
+                                );
+                            }
+                            Box::new(widget) as Box<dyn Widget>
+                        }
+                        WidgetKind::System => Box::new(
+                            SystemWidget::new(bounds)
+                                .with_style(style)
+                                .with_format(style_config.format.clone())
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone()),
                         ) as Box<dyn Widget>,
+                        WidgetKind::Bluetooth => Box::new(
+                            BluetoothWidget::new(bounds)
+                                .with_style(style)
+                                .with_on_click(style_config.on_click.clone())
+                                .with_format(style_config.format.clone())
+                                .with_format_icons(
+                                    style_config
+                                        .format_icons
+                                        .as_ref()
+                                        .and_then(FormatIconsConfig::named)
+                                        .cloned(),
+                                )
+                                .with_tooltip(style_config.tooltip)
+                                .with_tooltip_format(style_config.tooltip_format.clone()),
+                        ) as Box<dyn Widget>,
+                        WidgetKind::Volume => {
+                            let icons = style_config.format_icons.as_ref();
+                            Box::new(
+                                VolumeWidget::new(bounds)
+                                    .with_style(style)
+                                    .with_on_click(style_config.on_click.clone())
+                                    .with_format(style_config.format.clone())
+                                    .with_format_icons(
+                                        icons.and_then(FormatIconsConfig::levels).cloned(),
+                                    )
+                                    .with_muted_icon(
+                                        icons.and_then(|i| i.extra("muted")).map(str::to_owned),
+                                    )
+                                    .with_tooltip(style_config.tooltip)
+                                    .with_tooltip_format(style_config.tooltip_format.clone()),
+                            ) as Box<dyn Widget>
+                        }
                         WidgetKind::Clock => Box::new(
                             ClockWidget::new(bounds)
                                 .with_style(style)
@@ -2875,6 +3073,152 @@ mod tests {
             );
             assert!(error.to_string().contains("widget.backlight"));
         }
+    }
+
+    #[test]
+    fn volume_format_icons_accept_a_ramp_or_levels_with_a_muted_glyph() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.volume]
+            format = "{icon}{percent}%"
+            tooltip-format = "{device}: {percent}%"
+            format-icons = { levels = ["lo", "hi"], muted = "m" }
+            "#,
+        )
+        .unwrap();
+        let icons = config.widget.volume.format_icons.as_ref().unwrap();
+        assert_eq!(
+            icons.levels().map(Vec::as_slice),
+            Some(&["lo".to_string(), "hi".to_string()][..])
+        );
+        assert_eq!(icons.extra("muted"), Some("m"));
+
+        let config =
+            Config::from_toml_str("[widget.volume]\nformat-icons = [\"a\", \"b\"]").unwrap();
+        let icons = config.widget.volume.format_icons.as_ref().unwrap();
+        assert_eq!(icons.levels().map(Vec::len), Some(2));
+        assert_eq!(icons.extra("muted"), None);
+    }
+
+    #[test]
+    fn invalid_volume_configuration_is_rejected() {
+        for doc in [
+            "[widget.volume]\nformat = \"{watts}\"",
+            "[widget.volume]\ntooltip-format = \"{nope}\"",
+            "[widget.volume]\nformat-icons = []",
+            "[widget.volume]\nformat-icons = { levels = [], muted = \"m\" }",
+            "[widget.volume]\nformat-icons = { loud = \"x\" }",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err().to_string();
+            assert!(error.contains("widget.volume"), "{doc}: {error}");
+        }
+    }
+
+    #[test]
+    fn network_format_icons_take_a_ramp_and_state_names() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.network]
+            format = "{icon}"
+            tooltip-format = "{ssid} {signal}%"
+            format-icons = { levels = ["0", "1"], disconnected = "off", wired = "eth" }
+            "#,
+        )
+        .unwrap();
+        let icons = config.widget.network.format_icons.as_ref().unwrap();
+        assert_eq!(icons.levels().map(Vec::len), Some(2));
+        assert_eq!(icons.extra("disconnected"), Some("off"));
+    }
+
+    #[test]
+    fn invalid_network_configuration_is_rejected() {
+        for doc in [
+            "[widget.network]\nformat = \"{percent}\"",
+            "[widget.network]\ntooltip-format = \"{nope}\"",
+            "[widget.network]\nformat-icons = []",
+            "[widget.network]\nformat-icons = { muted = \"x\" }",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err().to_string();
+            assert!(error.contains("widget.network"), "{doc}: {error}");
+        }
+    }
+
+    #[test]
+    fn bluetooth_takes_named_state_icons() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.bluetooth]
+            format = "{icon}{count}"
+            tooltip-format = "{state}"
+            format-icons = { on = "B", off = "X", connected = "C" }
+            "#,
+        )
+        .unwrap();
+        let icons = config.widget.bluetooth.format_icons.as_ref().unwrap();
+        assert_eq!(icons.extra("connected"), Some("C"));
+    }
+
+    #[test]
+    fn invalid_bluetooth_configuration_is_rejected() {
+        for doc in [
+            "[widget.bluetooth]\nformat = \"{percent}\"",
+            "[widget.bluetooth]\ntooltip-format = \"{ssid}\"",
+            "[widget.bluetooth]\nformat-icons = [\"a\", \"b\"]",
+            "[widget.bluetooth]\nformat-icons = { muted = \"x\" }",
+            "[widget.bluetooth]\nformat-icons = { on = \"\" }",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err().to_string();
+            assert!(error.contains("widget.bluetooth"), "{doc}: {error}");
+        }
+    }
+
+    #[test]
+    fn invalid_system_configuration_is_rejected() {
+        assert!(Config::from_toml_str("[widget.system]\nformat = \"{icon}{cpu}% {mem}%\"").is_ok());
+        for doc in [
+            "[widget.system]\nformat = \"{percent}\"",
+            "[widget.system]\ntooltip-format = \"{cpu\"",
+        ] {
+            let error = Config::from_toml_str(doc).unwrap_err().to_string();
+            assert!(error.contains("widget.system"), "{doc}: {error}");
+        }
+    }
+
+    #[test]
+    fn battery_tooltip_format_is_validated() {
+        assert!(
+            Config::from_toml_str("[widget.battery]\ntooltip-format = \"{percent} {time}\"")
+                .is_ok()
+        );
+        let error = Config::from_toml_str("[widget.battery]\ntooltip-format = \"{ssid}\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("widget.battery.tooltip-format"), "{error}");
+    }
+
+    #[test]
+    fn hover_colors_resolve_and_merge_per_monitor() {
+        let config = Config::from_toml_str(
+            r##"
+            [widget.volume.hover]
+            background = "#202020"
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.volume.hover]
+            foreground = "#ff0000"
+            "##,
+        )
+        .unwrap();
+        let hover = config.widget.volume.resolve(&config.theme).hover;
+        assert_eq!(hover.background, Some((0x20, 0x20, 0x20, 0xFF)));
+        assert_eq!(hover.foreground, None);
+        let mut merged = config.widget.volume.clone();
+        config.monitors[0].widget.volume.apply(&mut merged);
+        let hover = merged.resolve(&config.theme).hover;
+        assert_eq!(hover.background, Some((0x20, 0x20, 0x20, 0xFF)));
+        assert_eq!(hover.foreground, Some((0xFF, 0, 0, 0xFF)));
+        assert!(Config::from_toml_str("[widget.volume.hover]\nglow = \"#fff\"").is_err());
     }
 
     #[test]

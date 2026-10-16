@@ -13,34 +13,16 @@ use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    Msg, ResolvedIcon, StateColors, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
+    Msg, ResolvedIcon, StateColors, Tooltip, Widget, WidgetStyle, draw_icon_content, expand,
+    measure_icon_content,
 };
+
+/// Placeholders accepted by the battery `format` and `tooltip-format`.
+pub const BATTERY_PLACEHOLDERS: &[&str] = &["icon", "percent", "state", "time"];
 
 /// Validate the battery format placeholders accepted by [`BatteryWidget`].
 pub fn validate_battery_format(format: &str) -> Result<(), String> {
-    let mut rest = format;
-    while !rest.is_empty() {
-        let next_open = rest.find('{');
-        let next_close = rest.find('}');
-        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
-            return Err("contains an unmatched `}`".to_string());
-        }
-        let Some(open) = next_open else {
-            break;
-        };
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('}') else {
-            return Err("contains an unmatched `{`".to_string());
-        };
-        let placeholder = &rest[..close];
-        if !matches!(placeholder, "icon" | "percent" | "state") {
-            return Err(format!(
-                "contains unsupported placeholder `{{{placeholder}}}`"
-            ));
-        }
-        rest = &rest[close + 1..];
-    }
-    Ok(())
+    super::validate_placeholders(format, BATTERY_PLACEHOLDERS)
 }
 
 /// The charge direction of a battery, normalized from a raw power-daemon state.
@@ -80,11 +62,13 @@ impl BatteryState {
 /// `0..=100` and rounded to a whole percent, and a `NaN` reading degrades to `0`
 /// rather than panicking. Equality is therefore a faithful "does this look
 /// different on screen?" test — sub-percent jitter from the daemon never forces a
-/// repaint.
+/// repaint. The time to empty/full rides along in whole minutes for the
+/// tooltip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Battery {
     state: BatteryState,
     percent: u8,
+    minutes: Option<u32>,
 }
 
 impl Battery {
@@ -99,7 +83,33 @@ impl Battery {
         } else {
             percent.clamp(0.0, 100.0).round() as u8
         };
-        Self { state, percent }
+        Self {
+            state,
+            percent,
+            minutes: None,
+        }
+    }
+
+    /// Attach the daemon's time to empty (discharging) or full (charging) in
+    /// seconds, rounded to whole minutes. Zero or negative means unknown.
+    pub fn with_time(mut self, seconds: i64) -> Self {
+        self.minutes = u32::try_from((seconds + 30) / 60)
+            .ok()
+            .filter(|&minutes| seconds > 0 && minutes > 0);
+        self
+    }
+
+    /// The estimated minutes to empty or full, when the daemon knows.
+    pub fn minutes(self) -> Option<u32> {
+        self.minutes
+    }
+
+    /// The time estimate as `"2h 14m"` or `"45m"`, when known.
+    pub fn time_label(self) -> Option<String> {
+        self.minutes.map(|minutes| match minutes / 60 {
+            0 => format!("{minutes}m"),
+            hours => format!("{hours}h {}m", minutes % 60),
+        })
     }
 
     /// The normalized charge state.
@@ -161,6 +171,8 @@ pub struct BatteryWidget {
     state: Option<Battery>,
     style: WidgetStyle,
     format: Option<String>,
+    tooltip: bool,
+    tooltip_format: Option<String>,
 }
 
 impl BatteryWidget {
@@ -173,6 +185,8 @@ impl BatteryWidget {
             state: None,
             style: WidgetStyle::default(),
             format: None,
+            tooltip: true,
+            tooltip_format: None,
         }
     }
 
@@ -183,10 +197,84 @@ impl BatteryWidget {
         self
     }
 
-    /// Set the optional `{icon}` / `{percent}` / `{state}` display format.
+    /// Set the optional `{icon}` / `{percent}` / `{state}` / `{time}` display
+    /// format.
     pub fn with_format(mut self, format: Option<String>) -> Self {
         self.format = format;
         self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, tooltip: Option<bool>) -> Self {
+        if let Some(tooltip) = tooltip {
+            self.tooltip = tooltip;
+        }
+        self
+    }
+
+    /// Set a custom tooltip format (same placeholders as `format`).
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.tooltip_format = format;
+        }
+        self
+    }
+
+    fn expand(format: &str, battery: Battery) -> String {
+        expand(
+            format,
+            &[
+                ("percent", &battery.percent().to_string()),
+                ("state", battery.state().label()),
+                ("time", &battery.time_label().unwrap_or_default()),
+            ],
+        )
+    }
+
+    /// State and percent plus the time to empty/full when known, or the custom
+    /// `tooltip-format`.
+    pub fn tooltip_text(&self) -> Option<String> {
+        if !self.tooltip {
+            return None;
+        }
+        let battery = self.state?;
+        if let Some(format) = &self.tooltip_format {
+            let icon = match self.icon(battery) {
+                ResolvedIcon::Text(icon) => icon,
+                _ => String::new(),
+            };
+            return Some(Self::expand(format, battery).replace("{icon}", &icon));
+        }
+        let mut text = format!(
+            "Battery: {}% ({})",
+            battery.percent(),
+            battery.state().label()
+        );
+        let direction = match battery.state() {
+            BatteryState::Discharging => Some("Empty"),
+            BatteryState::Charging => Some("Full"),
+            _ => None,
+        };
+        if let (Some(direction), Some(time)) = (direction, battery.time_label()) {
+            text.push_str(&format!("\n{direction} in {time}"));
+        }
+        Some(text)
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        let b = self.bounds;
+        px >= b.x && px < b.x + b.width && py >= b.y && py < b.y + b.height
+    }
+
+    /// Everything the pill paints, so a tooltip-only change (the time
+    /// estimate) is not a visible change.
+    fn visible(&self) -> Option<(String, ResolvedIcon, StateColors)> {
+        let battery = self.state?;
+        Some((
+            self.template(),
+            self.icon(battery),
+            self.state_colors(battery),
+        ))
     }
 
     /// The currently displayed label (empty before the first present reading, or
@@ -201,9 +289,7 @@ impl BatteryWidget {
     fn template(&self) -> String {
         match self.state {
             Some(battery) => match &self.format {
-                Some(format) => format
-                    .replace("{percent}", &battery.percent().to_string())
-                    .replace("{state}", battery.state().label()),
+                Some(format) => Self::expand(format, battery),
                 None => format!("{{icon}} {}", battery.label()),
             },
             None => String::new(),
@@ -254,8 +340,9 @@ impl Widget for BatteryWidget {
                 if &self.state == next {
                     return false;
                 }
+                let before = self.visible();
                 self.state = *next;
-                true
+                self.visible() != before
             }
             _ => false,
         }
@@ -293,6 +380,16 @@ impl Widget for BatteryWidget {
 
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
+    }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_text()?,
+            bounds: self.bounds,
+        })
     }
 }
 
@@ -454,6 +551,7 @@ mod tests {
 
     #[test]
     fn battery_format_rejects_unknown_or_unbalanced_placeholders() {
+        assert_eq!(validate_battery_format("{icon}{percent}% {time}"), Ok(()));
         assert!(validate_battery_format("{icon} {percent}% {state}").is_ok());
         assert!(validate_battery_format("{watts}").is_err());
         assert!(validate_battery_format("{percent").is_err());
@@ -520,6 +618,81 @@ mod tests {
             widget.state_colors(Battery::new(BatteryState::Charging, 5.0)),
             WidgetStyle::default().charging
         );
+    }
+
+    fn timed(state: BatteryState, percent: f64, seconds: i64) -> Msg {
+        Msg::Battery(Some(Battery::new(state, percent).with_time(seconds)))
+    }
+
+    #[test]
+    fn time_is_whole_minutes_and_zero_means_unknown() {
+        let b = Battery::new(BatteryState::Discharging, 50.0).with_time(2 * 3600 + 14 * 60 + 20);
+        assert_eq!(b.minutes(), Some(134));
+        assert_eq!(b.time_label().as_deref(), Some("2h 14m"));
+        let b = Battery::new(BatteryState::Discharging, 50.0).with_time(45 * 60);
+        assert_eq!(b.time_label().as_deref(), Some("45m"));
+        assert_eq!(
+            Battery::new(BatteryState::Discharging, 50.0)
+                .with_time(0)
+                .minutes(),
+            None
+        );
+        assert_eq!(
+            Battery::new(BatteryState::Discharging, 50.0)
+                .with_time(-5)
+                .minutes(),
+            None
+        );
+    }
+
+    #[test]
+    fn default_tooltip_shows_state_percent_and_time_remaining() {
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(widget.tooltip_text(), None);
+        widget.update(&timed(BatteryState::Discharging, 85.0, 2 * 3600 + 14 * 60));
+        assert_eq!(
+            widget.tooltip_at(10, 10).map(|tip| tip.text).as_deref(),
+            Some("Battery: 85% (discharging)\nEmpty in 2h 14m")
+        );
+        widget.update(&timed(BatteryState::Charging, 40.0, 30 * 60));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Battery: 40% (charging)\nFull in 30m")
+        );
+        widget.update(&battery(BatteryState::Full, 100.0));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Battery: 100% (full)")
+        );
+        assert_eq!(widget.tooltip_at(400, 10), None);
+    }
+
+    #[test]
+    fn a_time_change_updates_the_tooltip_without_a_redraw() {
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(widget.update(&timed(BatteryState::Discharging, 85.0, 3600)));
+        assert!(!widget.update(&timed(BatteryState::Discharging, 85.0, 3000)));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Battery: 85% (discharging)\nEmpty in 50m")
+        );
+        // A format showing the time does redraw.
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format(Some("{icon}{percent}% {time}".into()));
+        widget.update(&timed(BatteryState::Discharging, 85.0, 3600));
+        assert_eq!(widget.template(), "{icon}85% 1h 0m");
+        assert!(widget.update(&timed(BatteryState::Discharging, 85.0, 3000)));
+    }
+
+    #[test]
+    fn tooltip_format_and_opt_out() {
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_tooltip_format(Some("{percent} {state} {time}".into()));
+        widget.update(&timed(BatteryState::Discharging, 85.0, 600));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("85 discharging 10m"));
+        let mut widget = BatteryWidget::new(Bounds::new(0, 0, 320, 32)).with_tooltip(Some(false));
+        widget.update(&battery(BatteryState::Full, 100.0));
+        assert_eq!(widget.tooltip_at(10, 10), None);
     }
 
     #[test]

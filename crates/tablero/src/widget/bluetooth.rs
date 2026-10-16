@@ -6,19 +6,38 @@
 //! changes.
 //!
 //! The widget is always visible — even when no adapter is present it shows
-//! `unavailable`, matching what a user expects to see on a desktop without
+//! the off icon, matching what a user expects to see on a desktop without
 //! Bluetooth hardware. This is a deliberate departure from the
 //! battery/network pattern, where an absent source reserves no slot: here the
 //! slot is always reserved so the user can see *why* nothing is connected
 //! (powered off, or no adapter) and so a configured on-click still has a
-//! target.
+//! target. The pill stays compact — off, on, or connected icon plus a device
+//! count — and the hover tooltip names the adapter state and each device.
+
+use std::collections::BTreeMap;
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    LaunchSpec, Msg, ResolvedIcon, Widget, WidgetStyle, draw_icon_content, measure_icon_content,
+    IconSetting, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_icon_content,
+    expand, measure_icon_content,
 };
+
+/// The default label: the state icon, followed by the device count when one
+/// or more devices are connected.
+const DEFAULT_FORMAT: &str = "{icon}{count}";
+
+/// Placeholders accepted by the bluetooth `format` and `tooltip-format`.
+pub const BLUETOOTH_PLACEHOLDERS: &[&str] = &["icon", "count", "state"];
+
+/// Named `format-icons` entries the bluetooth widget understands.
+pub const BLUETOOTH_ICON_NAMES: &[&str] = &["on", "off", "connected"];
+
+/// Validate a bluetooth `format` or `tooltip-format`.
+pub fn validate_bluetooth_format(format: &str) -> Result<(), String> {
+    super::validate_placeholders(format, BLUETOOTH_PLACEHOLDERS)
+}
 
 /// The power state of the local Bluetooth adapter, normalized from BlueZ.
 ///
@@ -54,11 +73,13 @@ impl BluetoothState {
 /// to `0..=u16::MAX` and is forced to zero on any state other than
 /// [`On`](BluetoothState::On), so a stale count from before an `Off`
 /// transition can never leak back into the label. Equality is therefore a
-/// faithful "does this look different on screen?" test.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// faithful "does this look different on screen?" test. The connected
+/// device names ride along for the tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bluetooth {
     state: BluetoothState,
     connected: u16,
+    devices: Vec<String>,
 }
 
 impl Bluetooth {
@@ -76,17 +97,35 @@ impl Bluetooth {
         } else {
             0
         };
-        Self { state, connected }
+        Self {
+            state,
+            connected,
+            devices: Vec::new(),
+        }
+    }
+
+    /// Attach the connected devices' display names, kept only while the
+    /// adapter is on.
+    pub fn with_devices(mut self, devices: Vec<String>) -> Self {
+        if self.state == BluetoothState::On {
+            self.devices = devices;
+        }
+        self
     }
 
     /// The normalized power state.
-    pub fn state(self) -> BluetoothState {
+    pub fn state(&self) -> BluetoothState {
         self.state
     }
 
     /// The number of connected devices, present only when the adapter is on.
-    pub fn connected(self) -> u16 {
+    pub fn connected(&self) -> u16 {
         self.connected
+    }
+
+    /// The connected devices' display names, for the tooltip.
+    pub fn devices(&self) -> &[String] {
+        &self.devices
     }
 
     /// The display label, e.g. `"on"`, `"off"`, `"2 connected"`, or
@@ -99,7 +138,7 @@ impl Bluetooth {
     /// bare label, since the device count is not meaningful in either. Keeping
     /// this a pure function makes the rendered text deterministic and
     /// unit-testable without painting pixels.
-    pub fn label(self) -> String {
+    pub fn label(&self) -> String {
         match (self.state, self.connected) {
             (BluetoothState::On, 0) => "on".to_string(),
             (BluetoothState::On, 1) => "1 connected".to_string(),
@@ -118,7 +157,7 @@ impl Bluetooth {
 /// widget is always visible — its initial state is
 /// [`Unavailable`](BluetoothState::Unavailable) and it stays so until the
 /// producer hands it a reading — so a desktop without Bluetooth hardware
-/// still shows `unavailable` rather than reserving nothing. Its resolved
+/// still shows the off icon rather than reserving nothing. Its resolved
 /// [`WidgetStyle`] decides the glyph, the optional pill, and the colors it
 /// draws with. An optional `on_click` path turns clicks into a
 /// [`Command::RunProgram`](super::Command::RunProgram) so the user can wire a
@@ -128,6 +167,11 @@ pub struct BluetoothWidget {
     state: Bluetooth,
     style: WidgetStyle,
     on_click: Option<LaunchSpec>,
+    format: String,
+    /// Named text icons (`on`, `off`, `connected`) replacing the built-in art.
+    format_icons: BTreeMap<String, String>,
+    tooltip: bool,
+    tooltip_format: Option<String>,
 }
 
 impl BluetoothWidget {
@@ -141,7 +185,43 @@ impl BluetoothWidget {
             state: Bluetooth::new(BluetoothState::Unavailable, 0),
             style: WidgetStyle::default(),
             on_click: None,
+            format: DEFAULT_FORMAT.to_string(),
+            format_icons: BTreeMap::new(),
+            tooltip: true,
+            tooltip_format: None,
         }
+    }
+
+    /// Set the label format (`{icon}`, `{count}`, `{state}`).
+    pub fn with_format(mut self, format: Option<String>) -> Self {
+        if let Some(format) = format {
+            self.format = format;
+        }
+        self
+    }
+
+    /// Set named text icons (`on`, `off`, `connected`).
+    pub fn with_format_icons(mut self, icons: Option<BTreeMap<String, String>>) -> Self {
+        if let Some(icons) = icons {
+            self.format_icons = icons;
+        }
+        self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, tooltip: Option<bool>) -> Self {
+        if let Some(tooltip) = tooltip {
+            self.tooltip = tooltip;
+        }
+        self
+    }
+
+    /// Set a custom tooltip format (same placeholders as `format`).
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.tooltip_format = format;
+        }
+        self
     }
 
     /// Set the resolved visual style, consuming and returning `self` so it
@@ -163,21 +243,75 @@ impl BluetoothWidget {
         self
     }
 
-    /// The currently displayed label.
+    /// A plain-text summary of the current state, e.g. `"2 connected"`.
     pub fn label(&self) -> String {
         self.state.label()
     }
 
-    /// The format template — the icon slot marked by `{icon}` ahead of the label.
-    /// Always non-empty, so the widget always reserves a slot.
+    /// The configured format with `{count}`/`{state}` filled in. The default
+    /// format drops a zero count, so off and idle states show the icon alone.
     fn template(&self) -> String {
-        format!("{{icon}} {}", self.state.label())
+        self.expand(&self.format)
     }
 
-    /// The bluetooth icon resolved against its
-    /// [`Bluetooth`](BuiltinIcon::Bluetooth) default.
+    fn expand(&self, format: &str) -> String {
+        let count = self.state.connected();
+        let count = if format == DEFAULT_FORMAT && count == 0 {
+            String::new()
+        } else {
+            count.to_string()
+        };
+        expand(
+            format,
+            &[("count", &count), ("state", self.state.state().label())],
+        )
+    }
+
+    /// The state's `format-icons` key and built-in art.
+    fn state_icon(&self) -> (&'static str, BuiltinIcon) {
+        match (self.state.state(), self.state.connected()) {
+            (BluetoothState::On, 0) => ("on", BuiltinIcon::Bluetooth),
+            (BluetoothState::On, _) => ("connected", BuiltinIcon::BluetoothConnected),
+            _ => ("off", BuiltinIcon::BluetoothOff),
+        }
+    }
+
+    /// The off/on/connected icon: a custom/opted-out style icon, a named
+    /// `format-icons` entry, or the built-in art.
     fn icon(&self) -> ResolvedIcon {
-        self.style.resolve_icon(BuiltinIcon::Bluetooth)
+        let (name, builtin) = self.state_icon();
+        if self.style.icon == IconSetting::Default
+            && let Some(icon) = self.format_icons.get(name)
+        {
+            return ResolvedIcon::Text(icon.clone());
+        }
+        self.style.resolve_icon(builtin)
+    }
+
+    /// The adapter state followed by one line per connected device, or the
+    /// custom `tooltip-format`.
+    pub fn tooltip_text(&self) -> Option<String> {
+        if !self.tooltip {
+            return None;
+        }
+        if let Some(format) = &self.tooltip_format {
+            let icon = match self.icon() {
+                ResolvedIcon::Text(icon) => icon,
+                _ => String::new(),
+            };
+            return Some(self.expand(format).replace("{icon}", &icon));
+        }
+        let mut text = format!("Bluetooth: {}", self.state.state().label());
+        for device in self.state.devices() {
+            text.push('\n');
+            text.push_str(device);
+        }
+        Some(text)
+    }
+
+    fn contains(&self, px: u32, py: u32) -> bool {
+        let b = self.bounds;
+        px >= b.x && px < b.x + b.width && py >= b.y && py < b.y + b.height
     }
 }
 
@@ -188,8 +322,11 @@ impl Widget for BluetoothWidget {
                 if self.state == *next {
                     return false;
                 }
-                self.state = *next;
-                true
+                // Device names only reach the tooltip; repaint only when the
+                // pill itself changes.
+                let before = (self.template(), self.icon());
+                self.state = next.clone();
+                (self.template(), self.icon()) != before
             }
             _ => false,
         }
@@ -230,11 +367,20 @@ impl Widget for BluetoothWidget {
         // Only interactive when an on-click path was configured at build time;
         // otherwise the default (None) is correct.
         let path = self.on_click.as_ref()?;
-        let b = self.bounds;
-        if px < b.x || px >= b.x + b.width || py < b.y || py >= b.y + b.height {
+        if !self.contains(px, py) {
             return None;
         }
         Some(super::Command::RunProgram(path.clone()))
+    }
+
+    fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        Some(Tooltip {
+            text: self.tooltip_text()?,
+            bounds: self.bounds,
+        })
     }
 }
 
@@ -358,17 +504,108 @@ mod tests {
         assert_eq!(widget.bounds(), Bounds::new(10, 0, 200, 32));
     }
 
+    fn bt_with(devices: &[&str]) -> Msg {
+        Msg::Bluetooth(
+            Bluetooth::new(BluetoothState::On, devices.len() as u32)
+                .with_devices(devices.iter().map(|d| d.to_string()).collect()),
+        )
+    }
+
     #[test]
-    fn template_marks_the_icon_slot_before_the_label() {
+    fn device_names_are_kept_only_while_on() {
+        let off = Bluetooth::new(BluetoothState::Off, 0).with_devices(vec!["Buds".into()]);
+        assert!(off.devices().is_empty());
+        let on = Bluetooth::new(BluetoothState::On, 1).with_devices(vec!["Buds".into()]);
+        assert_eq!(on.devices(), ["Buds".to_string()]);
+    }
+
+    #[test]
+    fn display_is_off_icon_on_icon_or_connected_icon_with_count() {
         let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32));
-        // The bluetooth icon is constant; only the label tracks state.
-        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::Bluetooth));
-        // Initial Unavailable state already reserves the icon slot + label.
-        assert_eq!(widget.template(), "{icon} unavailable");
-        widget.update(&bt(BluetoothState::On, 2));
-        assert_eq!(widget.template(), "{icon} 2 connected");
+        // No adapter: the off icon alone.
+        assert_eq!(widget.template(), "{icon}");
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::BluetoothOff)
+        );
         widget.update(&bt(BluetoothState::Off, 0));
-        assert_eq!(widget.template(), "{icon} off");
+        assert_eq!(widget.template(), "{icon}");
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::BluetoothOff)
+        );
+        widget.update(&bt(BluetoothState::On, 0));
+        assert_eq!(widget.template(), "{icon}");
+        assert_eq!(widget.icon(), ResolvedIcon::Builtin(BuiltinIcon::Bluetooth));
+        widget.update(&bt_with(&["Buds", "Mouse"]));
+        assert_eq!(widget.template(), "{icon}2");
+        assert_eq!(
+            widget.icon(),
+            ResolvedIcon::Builtin(BuiltinIcon::BluetoothConnected)
+        );
+    }
+
+    #[test]
+    fn named_format_icons_override_each_state() {
+        let icons = [("on", "B"), ("off", "X"), ("connected", "C")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut widget =
+            BluetoothWidget::new(Bounds::new(0, 0, 320, 32)).with_format_icons(Some(icons));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("X".into()));
+        widget.update(&bt(BluetoothState::On, 0));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("B".into()));
+        widget.update(&bt_with(&["Buds"]));
+        assert_eq!(widget.icon(), ResolvedIcon::Text("C".into()));
+    }
+
+    #[test]
+    fn custom_format_expands_count_and_state() {
+        let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format(Some("{icon} {count} {state}".into()));
+        widget.update(&bt_with(&["Buds"]));
+        assert_eq!(widget.template(), "{icon} 1 on");
+        widget.update(&bt(BluetoothState::On, 0));
+        assert_eq!(widget.template(), "{icon} 0 on");
+    }
+
+    #[test]
+    fn tooltip_lists_the_adapter_state_and_each_device() {
+        let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Bluetooth: unavailable")
+        );
+        widget.update(&bt(BluetoothState::On, 0));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("Bluetooth: on"));
+        widget.update(&bt_with(&["Buds", "Mouse"]));
+        assert_eq!(
+            widget.tooltip_at(10, 10).map(|tip| tip.text).as_deref(),
+            Some("Bluetooth: on\nBuds\nMouse")
+        );
+        assert_eq!(widget.tooltip_at(400, 10), None);
+    }
+
+    #[test]
+    fn a_device_name_change_updates_the_tooltip_without_a_redraw() {
+        let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(widget.update(&bt_with(&["Buds"])));
+        assert!(!widget.update(&bt_with(&["Headset"])));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Bluetooth: on\nHeadset")
+        );
+    }
+
+    #[test]
+    fn tooltip_format_and_opt_out() {
+        let mut widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_tooltip_format(Some("{state}: {count}".into()));
+        widget.update(&bt_with(&["Buds"]));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("on: 1"));
+        let widget = BluetoothWidget::new(Bounds::new(0, 0, 320, 32)).with_tooltip(Some(false));
+        assert_eq!(widget.tooltip_at(10, 10), None);
     }
 
     #[test]

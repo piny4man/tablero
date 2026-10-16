@@ -8,7 +8,7 @@
 //! UPower aggregates every power supply into a synthetic *display device* at
 //! `/org/freedesktop/UPower/devices/DisplayDevice`, implementing
 //! `org.freedesktop.UPower.Device`. The producer reads its `Percentage`, `State`,
-//! and `IsPresent` properties, normalizes them into a [`Battery`] (or `None` when
+//! `IsPresent`, `TimeToEmpty`, and `TimeToFull` properties, normalizes them into a [`Battery`] (or `None` when
 //! no battery is present), then re-reads and re-emits whenever any of those
 //! properties changes. Normalization lives in [`battery_from_upower`], a pure
 //! function the tests drive directly — the full DBus value → message → widget
@@ -56,6 +56,16 @@ pub fn battery_from_upower(raw_state: u32, percentage: f64, is_present: bool) ->
     Some(Battery::new(upower_state(raw_state), percentage))
 }
 
+/// The time estimate matching the charge direction: seconds to empty while
+/// discharging, to full while charging, otherwise `0` (unknown). Pure.
+pub fn time_remaining(state: BatteryState, to_empty: i64, to_full: i64) -> i64 {
+    match state {
+        BatteryState::Discharging => to_empty,
+        BatteryState::Charging => to_full,
+        BatteryState::Full | BatteryState::Unknown => 0,
+    }
+}
+
 /// The subset of `org.freedesktop.UPower.Device` the bar reads, on the display
 /// device by default. zbus generates `UPowerDeviceProxy` from this.
 #[proxy(
@@ -75,6 +85,14 @@ trait UPowerDevice {
     /// Whether a battery is physically present.
     #[zbus(property)]
     fn is_present(&self) -> zbus::Result<bool>;
+
+    /// Estimated seconds until empty, `0` when unknown.
+    #[zbus(property)]
+    fn time_to_empty(&self) -> zbus::Result<i64>;
+
+    /// Estimated seconds until full, `0` when unknown.
+    #[zbus(property)]
+    fn time_to_full(&self) -> zbus::Result<i64>;
 }
 
 /// Read the device's current properties and normalize them into a snapshot.
@@ -93,13 +111,23 @@ async fn read_snapshot(device: &UPowerDeviceProxy<'_>) -> Option<Battery> {
     }
 }
 
-/// Read the three properties and fold them into a normalized snapshot.
+/// Read the properties and fold them into a normalized snapshot. The time
+/// estimates are best-effort: a failed read just leaves the time unknown.
 #[hotpath::measure]
 async fn try_read(device: &UPowerDeviceProxy<'_>) -> zbus::Result<Option<Battery>> {
     let is_present = device.is_present().await?;
     let percentage = device.percentage().await?;
     let state = device.state().await?;
-    Ok(battery_from_upower(state, percentage, is_present))
+    let Some(battery) = battery_from_upower(state, percentage, is_present) else {
+        return Ok(None);
+    };
+    let to_empty = device.time_to_empty().await.unwrap_or(0);
+    let to_full = device.time_to_full().await.unwrap_or(0);
+    Ok(Some(battery.with_time(time_remaining(
+        battery.state(),
+        to_empty,
+        to_full,
+    ))))
 }
 
 /// A [`Producer`] that streams UPower battery changes into the render loop.
@@ -150,8 +178,8 @@ async fn run(tx: MsgSender) -> ProducerResult {
         return Ok(());
     }
 
-    // Any of percentage, state, or presence changing warrants a re-read; merge
-    // the three property streams and re-emit a fresh snapshot on each tick. An
+    // Any of percentage, state, presence, or the time estimates changing
+    // warrants a re-read; merge the property streams and re-emit a fresh snapshot on each tick. An
     // unchanged snapshot is harmless — the widget reports no visible change.
     let mut changes = select_all([
         device
@@ -162,6 +190,16 @@ async fn run(tx: MsgSender) -> ProducerResult {
         device.receive_state_changed().await.map(|_| ()).boxed(),
         device
             .receive_is_present_changed()
+            .await
+            .map(|_| ())
+            .boxed(),
+        device
+            .receive_time_to_empty_changed()
+            .await
+            .map(|_| ())
+            .boxed(),
+        device
+            .receive_time_to_full_changed()
             .await
             .map(|_| ())
             .boxed(),
@@ -211,6 +249,14 @@ mod tests {
         assert_eq!(battery.state(), BatteryState::Discharging);
         assert_eq!(battery.percent(), 85);
         assert_eq!(battery.label(), "85% discharging");
+    }
+
+    #[test]
+    fn time_remaining_follows_the_charge_direction() {
+        assert_eq!(time_remaining(BatteryState::Discharging, 600, 1200), 600);
+        assert_eq!(time_remaining(BatteryState::Charging, 600, 1200), 1200);
+        assert_eq!(time_remaining(BatteryState::Full, 600, 1200), 0);
+        assert_eq!(time_remaining(BatteryState::Unknown, 600, 1200), 0);
     }
 
     #[test]

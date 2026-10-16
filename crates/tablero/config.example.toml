@@ -122,6 +122,9 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+# Off/on/connected icon, plus the device count while connected. Hover lists
+# each connected device.
+format = "{icon}{count}"
 # on-click = "/usr/bin/blueman-manager"
 
 [widget.backlight]
@@ -163,6 +166,7 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+format = "{icon}{percent}%"
 # Direct spawn, no shell — prefer absolute paths for reliability.
 # on-click = "/usr/bin/pavucontrol"
 
@@ -173,6 +177,8 @@ border = "#3d1f3a"
 border-width = 1
 radius = 2
 padding = 8
+# The Wi-Fi icon follows signal strength; SSID and signal live in the tooltip.
+format = "{icon}"
 # Script must be executable (chmod +x). Tilde is expanded; no shell args.
 # on-click = "~/.config/hypr/scripts/networkmanager.sh"
 
@@ -185,6 +191,12 @@ radius = 2
 padding = 8
 # Seconds between CPU/memory samples (default 3). Read at startup.
 # interval = 3
+
+# Hovering an interactive widget lifts its pill; override per widget with a
+# hover table (unset channels keep the widget's own colors).
+# [widget.volume.hover]
+# background = "#2a1428"
+# border = "#7decff"
 
 [widget.clock]
 background = "#1c0e1ee8"

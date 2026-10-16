@@ -145,13 +145,15 @@ and launch the updated binary once; commands cannot control pre-support bars.
   launch the configured program on a left- or right-click, useful for opening
   a calendar app or quick date picker.
   - **Battery** — percentage and charge state via UPower (blank when no battery
-    is present).
+    is present). Hovering shows the state, percent, and UPower's time to empty
+    or full when it knows one.
   - **Backlight** — screen brightness read directly from Linux sysfs. **Opt-in**:
     add `"backlight"` to a zone. Scroll up/down over the widget to adjust the
     selected device through systemd-logind, without `brightnessctl` or another
     status bar. Device state follows native udev events with periodic recovery
     polling, and the widget reserves no slot when no screen backlight is present.
-  - **System** — CPU and memory load sampled from procfs.
+  - **System** — CPU and memory load sampled from procfs. Hovering shows CPU
+    load and memory used over total in GiB.
   - **Updates** — available Arch Linux package updates, checked immediately and
     every five minutes. **Opt-in** in the built-in config and enabled first in the
     ARC preset's right zone. Official repository updates come from the safe,
@@ -160,7 +162,9 @@ and launch the updated binary once; commands cannot control pre-support bars.
     zero or the required official check is unavailable.
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
-    NetworkManager is unavailable. `on-click` and `on-click-right` launch the
+    NetworkManager is unavailable. The built-in Wi-Fi icon follows the access
+    point's signal in four levels (dot, then one more arc per level), and
+    hovering shows the connection, SSID, and signal percent. `on-click` and `on-click-right` launch the
     configured program on a left- or right-click, useful for opening a network
     manager such as `nm-connection-editor` or `networkmanager_dmenu`.
   - **Tray** — StatusNotifierItem (SNI) system-tray icons from background apps,
@@ -173,15 +177,18 @@ and launch the updated binary once; commands cannot control pre-support bars.
     from an embedded pixmap or a themed PNG; an item with neither falls back to
     its initial letter.
   - **Bluetooth** — the local adapter state (powered on/off) and connected-
-    device count, read from BlueZ over DBus. Shows `on`, `off`, `N connected`,
-    or `unavailable` when no adapter is present (desktops without Bluetooth
-    hardware always reserve the slot). **Opt-in**: not in the default set;
+    device count, read from BlueZ over DBus. Shows an off icon when the adapter
+    is off or missing (desktops without Bluetooth hardware always reserve the
+    slot), an on icon when nothing is connected, and a connected icon plus the
+    device count otherwise. Hovering lists the adapter state and each connected
+    device's name. **Opt-in**: not in the default set;
     add `"bluetooth"` to a zone to enable it. Any widget can carry an
     `on-click` config field — when set, a left-click inside the widget spawns
     that executable directly (no shell), so a typical use is `on-click =
     "/path/to/blueman-manager"` to launch a Bluetooth manager on click.
-  - **Volume** — the active output sink's level (`Vol N%`) and mute state
-    (`Mute`), read over the native PipeWire wire protocol. The icon is a
+  - **Volume** — the active output sink's level (`N%`) and mute state, read
+    over the native PipeWire wire protocol. Hovering shows the level, device
+    kind, and mute state. The icon is a
     built-in speaker that follows the level — one more wave per step from
     low to high, and the muted speaker when muted or at 0% — so the icon
     hints at the level at a glance.
@@ -434,9 +441,54 @@ an `icon` field on its `[widget.<name>]` table:
   or an emoji, rendered as text in place of the vector icon.
 
 For widgets with a `format`/`format-icons` string (battery, backlight,
-power-profiles-daemon, updates), the `{icon}` placeholder marks where the icon
-sits; a `format-icons` entry supplies a per-state text glyph that overrides the
-built-in art for that state.
+bluetooth, network, power-profiles-daemon, system, updates, volume), the `{icon}`
+placeholder marks where the icon sits; a `format-icons` entry supplies a
+per-state text glyph that overrides the built-in art for that state.
+
+### Formats, tooltips, and hover
+
+Most status widgets take a `format` for the pill and a `tooltip-format` for the
+hover tooltip, with the same placeholders; `tooltip = false` turns the tooltip
+off. Unknown placeholders and unbalanced braces are rejected at load.
+
+| Widget | Placeholders | `format-icons` |
+|---|---|---|
+| battery | `{icon}` `{percent}` `{state}` `{time}` | — |
+| bluetooth | `{icon}` `{count}` `{state}` | table: `on`, `off`, `connected` |
+| network | `{icon}` `{ssid}` `{signal}` `{state}` | ramp, or `{ levels = [..], disconnected, wired, unknown }` |
+| system | `{icon}` `{cpu}` `{mem}` | — |
+| volume | `{icon}` `{percent}` `{device}` | ramp, or `{ levels = [..], muted }` |
+
+A ramp lists icons from low to high; Wi-Fi picks from it by signal strength.
+
+```toml
+[widget.volume]
+format = "{icon}{percent}%"
+format-icons = { levels = ["󰕿", "󰖀", "󰕾"], muted = "󰝟" }
+
+[widget.network]
+format = "{icon}"
+format-icons = { levels = ["󰤟", "󰤢", "󰤥", "󰤨"], disconnected = "󰤭" }
+tooltip-format = "{ssid} ({signal}%)"
+
+[widget.bluetooth]
+format-icons = { on = "󰂯", off = "󰂲", connected = "󰂱" }
+
+[widget.battery]
+tooltip-format = "{percent}% {state}, {time} left"
+```
+
+Hovering a clickable widget or one with a tooltip highlights its pill. By
+default a tenth of the widget's foreground is mixed into its background; a
+`[widget.<name>.hover]` table sets the hover `background`, `foreground`, or
+`border` explicitly. Unset channels keep the widget's own colors, so a widget
+that recolors by state keeps that color while hovered.
+
+```toml
+[widget.volume.hover]
+background = "#2a1428"
+border = "#7decff"
+```
 
 Per-widget click handlers live on every `[widget.<name>]` table as
 `on-click = "/path/to/executable"`. When set, a left-click inside that widget
@@ -759,18 +811,20 @@ surface placement and input need a live compositor. To verify on Hyprland:
     focused window should leave the center blank.
 14. Verify the **bluetooth widget** (opt-in: add `"bluetooth"` to a zone).
     With BlueZ running:
-    - The widget appears with the bluetooth glyph and a label of `on`, `off`,
-      `N connected`, or `unavailable`. On a desktop with no Bluetooth
-      hardware it should always reserve a slot and read `unavailable`; on a
-      laptop with the adapter powered off it reads `off`.
+    - The widget appears with the off icon (adapter off or missing), the on
+      icon (nothing connected), or the connected icon followed by the device
+      count. On a desktop with no Bluetooth hardware it should always reserve
+      a slot with the off icon; hovering reads `Bluetooth: unavailable`.
     - Toggle the adapter with `bluetoothctl power on` / `bluetoothctl power
       off` and confirm the label changes within a moment (the producer
       follows BlueZ signals and re-reads the state once they settle).
+      Hovering reads `Bluetooth: on` or `Bluetooth: off`.
     - Pair and connect a device (e.g. `bluetoothctl connect <mac>`); confirm
-      the label flips to `1 connected` (or higher) and back to `on` on
+      the pill flips to the connected icon and `1` (or higher), the tooltip
+      lists the device's name, and the pill returns to the on icon on
       disconnect.
     - Pair/unpair with the adapter powered off; the count stays at zero and
-      the label stays `off`.
+      the off icon stays.
     - If a `[widget.bluetooth] on-click = "/path/to/executable"` is set,
       left-click the widget and confirm the configured process is spawned
       (no shell, direct exec). The script must be marked executable; a
@@ -781,7 +835,7 @@ surface placement and input need a live compositor. To verify on Hyprland:
      and at least one output sink configured:
      - The widget appears with a built-in speaker icon whose waves follow the
        level (bare speaker at 1-33%, one wave at 34-66%, two waves above; the
-       muted speaker at 0%) and a label of `Vol N%` (where `N` is the
+       muted speaker at 0%) and a label of `N%` (where `N` is the
        active sink's level). On a system with PipeWire but no output sink configured,
        the widget reserves no slot (matching the `network` / `system`
        pattern); on a system with no PipeWire running, the widget also
@@ -792,9 +846,10 @@ surface placement and input need a live compositor. To verify on Hyprland:
        level; a ten-second tick is only the safety net). The widget should track
        per-cent: `12%`, `13%`, …
      - Toggle mute with `pactl set-sink-mute @DEFAULT_SINK@ 1` and confirm
-       the label flips to `Mute` with the muted speaker icon; toggling
-       mute back restores `Vol N%` with the level-based icon. Setting the
-       level to `0%` unmuted shows `Vol 0%` with the same muted icon.
+       the pill shows only the muted speaker icon; toggling mute back
+       restores `N%` with the level-based icon. Setting the level to `0%`
+       unmuted shows `0%` with the same muted icon. Hovering shows the level,
+       device kind, and `Muted` while muted.
      - With multiple sinks configured (e.g. headphones + monitor speakers),
        play audio through one and confirm the widget tracks *that* sink
        (active sink has its `NodeState` set to `Running`); switching

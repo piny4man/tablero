@@ -410,6 +410,9 @@ pub struct RenderContext {
     /// composites them instead of building and anti-aliasing paths again.
     pill_cache: HashMap<PillKey, Pixmap>,
     stats: RenderStats,
+    /// Whether the widget being painted is under the pointer, so the shared
+    /// pill painters swap to its hover colors.
+    hovered: bool,
 }
 
 impl RenderContext {
@@ -445,12 +448,23 @@ impl RenderContext {
             icon_cache: HashMap::new(),
             pill_cache: HashMap::new(),
             stats: RenderStats::default(),
+            hovered: false,
         }
     }
 
     /// The active foreground (default text) color.
     pub fn foreground(&self) -> (u8, u8, u8, u8) {
         self.settings.foreground
+    }
+
+    /// Whether the widget now being painted is hovered.
+    pub fn hovered(&self) -> bool {
+        self.hovered
+    }
+
+    /// Mark the widget about to be painted as hovered (or not).
+    pub fn set_hovered(&mut self, hovered: bool) {
+        self.hovered = hovered;
     }
 
     /// The active accent (emphasis) color.

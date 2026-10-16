@@ -12,10 +12,23 @@
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
+use std::collections::BTreeMap;
+
 use super::{
-    ClickButton, Command, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
-    draw_icon_content, measure_icon_content,
+    ClickButton, Command, IconSetting, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
+    draw_icon_content, expand, measure_icon_content,
 };
+
+/// Placeholders accepted by the network `format` and `tooltip-format`.
+pub const NETWORK_PLACEHOLDERS: &[&str] = &["icon", "ssid", "signal", "state"];
+
+/// Named `format-icons` entries the network widget understands.
+pub const NETWORK_ICON_NAMES: &[&str] = &["disconnected", "wired", "unknown"];
+
+/// Validate a network `format` or `tooltip-format`.
+pub fn validate_network_format(format: &str) -> Result<(), String> {
+    super::validate_placeholders(format, NETWORK_PLACEHOLDERS)
+}
 
 /// The kind of network connection in use, normalized from a raw daemon reading.
 ///
@@ -61,6 +74,7 @@ impl NetworkState {
 pub struct Network {
     state: NetworkState,
     ssid: Option<String>,
+    signal: Option<u8>,
 }
 
 impl Network {
@@ -79,7 +93,30 @@ impl Network {
         } else {
             None
         };
-        Self { state, ssid }
+        Self {
+            state,
+            ssid,
+            signal: None,
+        }
+    }
+
+    /// Attach the access point's signal strength in percent, clamped to
+    /// `0..=100`. Kept only on a wireless link.
+    pub fn with_signal(mut self, signal: Option<u8>) -> Self {
+        self.signal = signal
+            .filter(|_| self.state == NetworkState::Wireless)
+            .map(|signal| signal.min(100));
+        self
+    }
+
+    /// The Wi-Fi signal strength in percent, when known.
+    pub fn signal(&self) -> Option<u8> {
+        self.signal
+    }
+
+    /// The signal bucketed into the four-step icon ramp (`0..=3`), when known.
+    pub fn level(&self) -> Option<u8> {
+        self.signal.map(|signal| signal.min(99) / 25)
     }
 
     /// The normalized connection state.
@@ -113,10 +150,10 @@ impl Network {
 /// Ethernet link, otherwise the wireless symbol — there is no distinct
 /// disconnected/unknown artwork, so those states reuse the generic network mark
 /// and lean on the accompanying label to disambiguate.
-fn default_icon(state: NetworkState) -> BuiltinIcon {
-    match state {
+fn default_icon(network: &Network) -> BuiltinIcon {
+    match network.state() {
         NetworkState::Wired => BuiltinIcon::NetworkWired,
-        _ => BuiltinIcon::NetworkWireless,
+        _ => BuiltinIcon::NetworkWireless(network.level().unwrap_or(3)),
     }
 }
 
@@ -135,6 +172,14 @@ pub struct NetworkWidget {
     style: WidgetStyle,
     on_click: Option<LaunchSpec>,
     on_click_right: Option<LaunchSpec>,
+    /// A custom label format; `None` keeps the built-in `icon + label`.
+    format: Option<String>,
+    /// A low-to-high Wi-Fi text icon ramp.
+    format_icons: Option<Vec<String>>,
+    /// Text icons for the non-Wi-Fi states (`disconnected`, `wired`, `unknown`).
+    state_icons: BTreeMap<String, String>,
+    tooltip: bool,
+    tooltip_format: Option<String>,
 }
 
 impl NetworkWidget {
@@ -148,7 +193,50 @@ impl NetworkWidget {
             style: WidgetStyle::default(),
             on_click: None,
             on_click_right: None,
+            format: None,
+            format_icons: None,
+            state_icons: BTreeMap::new(),
+            tooltip: true,
+            tooltip_format: None,
         }
+    }
+
+    /// Set the label format (`{icon}`, `{ssid}`, `{signal}`, `{state}`).
+    pub fn with_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.format = format;
+        }
+        self
+    }
+
+    /// Set a low-to-high Wi-Fi text icon ramp, indexed by signal strength.
+    pub fn with_format_icons(mut self, icons: Option<Vec<String>>) -> Self {
+        self.format_icons = icons.filter(|icons| !icons.is_empty());
+        self
+    }
+
+    /// Set the text icon for a named non-Wi-Fi state.
+    pub fn with_state_icon(mut self, name: &str, icon: Option<String>) -> Self {
+        if let Some(icon) = icon {
+            self.state_icons.insert(name.to_string(), icon);
+        }
+        self
+    }
+
+    /// Enable or disable the hover tooltip.
+    pub fn with_tooltip(mut self, tooltip: Option<bool>) -> Self {
+        if let Some(tooltip) = tooltip {
+            self.tooltip = tooltip;
+        }
+        self
+    }
+
+    /// Set a custom tooltip format (same placeholders as `format`).
+    pub fn with_tooltip_format(mut self, format: Option<String>) -> Self {
+        if format.is_some() {
+            self.tooltip_format = format;
+        }
+        self
     }
 
     /// Set the resolved visual style, consuming and returning `self` so it
@@ -180,28 +268,81 @@ impl NetworkWidget {
     /// — or empty while the network is unavailable (so the widget reserves no
     /// slot). A wireless link with no SSID collapses to a bare icon.
     fn template(&self) -> String {
-        match &self.state {
-            Some(network) => format!("{{icon}} {}", network.label()),
-            None => String::new(),
+        match (&self.state, &self.format) {
+            (Some(network), Some(format)) => Self::expand(format, network),
+            (Some(network), None) => format!("{{icon}} {}", network.label()),
+            (None, _) => String::new(),
         }
     }
 
-    /// The network's icon resolved against the state-derived semantic default.
+    fn expand(format: &str, network: &Network) -> String {
+        let signal = network.signal().map(|s| s.to_string()).unwrap_or_default();
+        expand(
+            format,
+            &[
+                ("ssid", network.ssid().unwrap_or("")),
+                ("signal", &signal),
+                ("state", network.state().label()),
+            ],
+        )
+    }
+
+    /// The network's icon: a custom/opted-out style icon, a configured text
+    /// icon for the state or Wi-Fi level, or the built-in art.
     fn icon(&self, network: &Network) -> ResolvedIcon {
-        self.style.resolve_icon(default_icon(network.state()))
+        if self.style.icon == IconSetting::Default {
+            let text = match network.state() {
+                NetworkState::Wireless => self.format_icons.as_ref().map(|icons| {
+                    let signal = usize::from(network.signal().unwrap_or(100));
+                    icons[(signal * icons.len()) / 101].clone()
+                }),
+                NetworkState::Disconnected => self.state_icons.get("disconnected").cloned(),
+                NetworkState::Wired => self.state_icons.get("wired").cloned(),
+                NetworkState::Unknown => self.state_icons.get("unknown").cloned(),
+            };
+            if let Some(text) = text {
+                return ResolvedIcon::Text(text);
+            }
+        }
+        self.style.resolve_icon(default_icon(network))
     }
 
     /// Connection details kept off the bar's compact label.
     pub fn tooltip_text(&self) -> Option<String> {
-        self.state.as_ref().map(|network| match network.state() {
-            NetworkState::Wireless => match network.ssid() {
-                Some(ssid) => format!("Connection: Wi-Fi\nSSID: {ssid}"),
-                None => "Connection: Wi-Fi".to_string(),
-            },
+        if !self.tooltip {
+            return None;
+        }
+        let network = self.state.as_ref()?;
+        if let Some(format) = &self.tooltip_format {
+            let icon = match self.icon(network) {
+                ResolvedIcon::Text(icon) => icon,
+                _ => String::new(),
+            };
+            return Some(Self::expand(format, network).replace("{icon}", &icon));
+        }
+        Some(match network.state() {
+            NetworkState::Wireless => {
+                let mut text = "Connection: Wi-Fi".to_string();
+                if let Some(ssid) = network.ssid() {
+                    text.push_str(&format!("\nSSID: {ssid}"));
+                }
+                if let Some(signal) = network.signal() {
+                    text.push_str(&format!("\nSignal: {signal}%"));
+                }
+                text
+            }
             NetworkState::Wired => "Connection: Wired".to_string(),
             NetworkState::Disconnected => "Status: Disconnected".to_string(),
             NetworkState::Unknown => "Status: Unknown".to_string(),
         })
+    }
+
+    /// What the bar actually paints for the current snapshot, so a reading
+    /// that only moves tooltip-only fields (e.g. signal inside one level) is
+    /// not a visible change.
+    fn visible(&self) -> Option<(String, ResolvedIcon)> {
+        let network = self.state.as_ref()?;
+        Some((self.template(), self.icon(network)))
     }
 
     fn contains(&self, px: u32, py: u32) -> bool {
@@ -219,8 +360,9 @@ impl Widget for NetworkWidget {
                 if &self.state == next {
                     return false;
                 }
+                let before = self.visible();
                 self.state = next.clone();
-                true
+                self.visible() != before
             }
             _ => false,
         }
@@ -430,7 +572,7 @@ mod tests {
         assert_eq!(widget.template(), "{icon} home-net");
         assert_eq!(
             widget.icon(widget.state.as_ref().unwrap()),
-            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless)
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless(3))
         );
         widget.update(&network(NetworkState::Wireless, None));
         // A wireless link with no usable SSID collapses to a bare icon slot.
@@ -446,7 +588,7 @@ mod tests {
         assert_eq!(widget.template(), "{icon} disconnected");
         assert_eq!(
             widget.icon(widget.state.as_ref().unwrap()),
-            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless)
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless(3))
         );
     }
 
@@ -470,6 +612,128 @@ mod tests {
             Some("Connection: Wi-Fi\nSSID: home-net".to_string())
         );
         assert_eq!(widget.tooltip_at(200, 16), None);
+    }
+
+    fn wifi(ssid: &str, signal: u8) -> Msg {
+        Msg::Network(Some(
+            Network::new(NetworkState::Wireless, Some(ssid)).with_signal(Some(signal)),
+        ))
+    }
+
+    #[test]
+    fn signal_is_kept_only_on_wifi_and_bucketed_into_four_levels() {
+        assert_eq!(
+            Network::new(NetworkState::Wired, None)
+                .with_signal(Some(80))
+                .signal(),
+            None
+        );
+        let level = |signal| {
+            Network::new(NetworkState::Wireless, None)
+                .with_signal(Some(signal))
+                .level()
+        };
+        assert_eq!(level(0), Some(0));
+        assert_eq!(level(24), Some(0));
+        assert_eq!(level(25), Some(1));
+        assert_eq!(level(50), Some(2));
+        assert_eq!(level(75), Some(3));
+        assert_eq!(level(100), Some(3));
+        // Out-of-range readings clamp to 100%.
+        assert_eq!(
+            Network::new(NetworkState::Wireless, None)
+                .with_signal(Some(200))
+                .signal(),
+            Some(100)
+        );
+        assert_eq!(Network::new(NetworkState::Wireless, None).level(), None);
+    }
+
+    #[test]
+    fn built_in_wifi_icon_follows_the_signal_level() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
+        widget.update(&wifi("home", 10));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless(0))
+        );
+        widget.update(&wifi("home", 60));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless(2))
+        );
+        // Unknown strength keeps the full icon.
+        widget.update(&network(NetworkState::Wireless, Some("home")));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWireless(3))
+        );
+    }
+
+    #[test]
+    fn a_signal_change_inside_one_level_updates_the_tooltip_without_a_redraw() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32));
+        assert!(widget.update(&wifi("home", 60)));
+        assert!(!widget.update(&wifi("home", 62)));
+        assert_eq!(
+            widget.tooltip_text().as_deref(),
+            Some("Connection: Wi-Fi\nSSID: home\nSignal: 62%")
+        );
+        // Crossing into the next level changes the icon.
+        assert!(widget.update(&wifi("home", 80)));
+    }
+
+    #[test]
+    fn format_expands_placeholders_and_a_visible_signal_redraws() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format(Some("{icon}{signal}% {ssid} {state}".into()));
+        widget.update(&wifi("home", 60));
+        assert_eq!(widget.template(), "{icon}60% home wifi");
+        assert!(widget.update(&wifi("home", 61)));
+
+        let mut widget =
+            NetworkWidget::new(Bounds::new(0, 0, 320, 32)).with_format(Some("{icon}".into()));
+        widget.update(&wifi("home", 60));
+        assert_eq!(widget.template(), "{icon}");
+    }
+
+    #[test]
+    fn format_icons_ramp_and_named_state_icons() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_format_icons(Some(vec!["0".into(), "1".into(), "2".into(), "3".into()]))
+            .with_state_icon("disconnected", Some("off".into()));
+        widget.update(&wifi("home", 30));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Text("1".into())
+        );
+        widget.update(&network(NetworkState::Wireless, Some("home")));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Text("3".into())
+        );
+        widget.update(&network(NetworkState::Disconnected, None));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Text("off".into())
+        );
+        // No named wired icon: the built-in wired art stays.
+        widget.update(&network(NetworkState::Wired, None));
+        assert_eq!(
+            widget.icon(widget.state.as_ref().unwrap()),
+            ResolvedIcon::Builtin(BuiltinIcon::NetworkWired)
+        );
+    }
+
+    #[test]
+    fn tooltip_format_and_opt_out() {
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32))
+            .with_tooltip_format(Some("{ssid} {signal}%".into()));
+        widget.update(&wifi("home", 60));
+        assert_eq!(widget.tooltip_text().as_deref(), Some("home 60%"));
+        let mut widget = NetworkWidget::new(Bounds::new(0, 0, 320, 32)).with_tooltip(Some(false));
+        widget.update(&wifi("home", 60));
+        assert_eq!(widget.tooltip_at(10, 10), None);
     }
 
     #[test]
