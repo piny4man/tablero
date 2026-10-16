@@ -53,6 +53,10 @@ Only the bar run is profiled: `#[hotpath::main]` sits on `run` in `main.rs`, so
   The producer → render-loop channel is a calloop channel, which hotpath cannot
   wrap.
 - Mutexes: the volume state and the two SNI host mutexes.
+- Futures: every producer's `run` future (`producers`) and the producers'
+  spawned tasks (`producer-tasks`), so allocation inside zbus decoding and
+  other unmeasured producer code is attributed. hotpath keys futures by call
+  site, so the labels are per call site rather than per producer.
 
 Two hotpath behaviors to keep in mind when reading a report:
 
@@ -64,7 +68,9 @@ Two hotpath behaviors to keep in mind when reading a report:
   pass `label = "…".to_owned()` instead.
 
 `tests/hotpath_profile.rs` (run with `--features hotpath`, and in CI) fails if
-the render-phase instrumentation is lost.
+the render-phase instrumentation is lost. `tests/alloc_budget.rs` (compiled
+only with `--features hotpath-alloc`) holds allocation budgets for paths this
+profile found expensive, read back from a hotpath JSON report.
 
 ## Findings — 2026-10-16
 
@@ -92,7 +98,18 @@ Live baseline from `TABLERO_PERF` in the same runs (median / p95 / max):
 | `frame-blit` | 0.25–0.26 / 0.67–0.99 ms |
 | frames per 120 s | 43–64; 31 of 64 caused by the system widget |
 
-Ranked by expected impact:
+Ranked by expected impact. A follow-up balanced-profile run found a larger
+issue than all of these (finding 0); [Fixes](#fixes--2026-10-16) records what
+was changed and the measured result.
+
+### 0. One missing icon glyph made cosmic-text load every installed font
+
+In the balanced profile the power-profiles widget shows U+F863, which only
+Font Awesome 7 has. cosmic-text's fallback does not find it in the default or
+script fallback lists, so it loads and shapes against faces until one maps it:
+`shape_text` allocated 141.7 MB, one frame took 321 ms, and RSS reached
+~870 MB with 2875 fonts installed (the performance profile's icon is in the
+Nerd Font and never hits this).
 
 ### 1. A 58 ms blocking sysfs read stalls the producer runtime every 5 s
 
@@ -180,6 +197,23 @@ pending. Expected impact: up to ~50 ms off startup-to-first-commit.
 - At startup SNI introspects every bus name (174 here) with a 500 ms timeout
   each; they run concurrently, so tray adoption waits ~0.5 s for unresponsive
   names.
+
+## Fixes — 2026-10-16
+
+| Finding | Change | Result |
+| --- | --- | --- |
+| 0. icon font fallback | `fallback.rs`: a Private Use Area glyph the primary family lacks is looked up once by cmap (`ttf-parser`) and shaped as a span in the face that has it; other text keeps cosmic-text's fallback. | U+F863: 286 ms / 794 MB RSS → 66 ms once / 5 MB. Live RSS 870 MB → 82 MB. |
+| 1. qc71 stall | `compose` runs on `spawn_blocking` when a platform profile is present. | The 65 ms read no longer runs on the producer worker: producer future poll time over 120 s fell from 1625 ms to 30 ms. |
+| 2. full repaint | `Dashboard::draw_damage` clears and repaints only the widgets in the damage, grown until it covers every slot it touches; `StaleBuffers` tracks what each SHM slot missed so only that region is converted. | Live `frame-draw` median 1.84 → 0.34 ms, `frame-blit` 364 → 49 µs, `frame-total` 2.37 → 0.47 ms. |
+| 3. pills | Pill fills and borders are rasterised once per size, color, radius, and stroke, and composited with a hand-written source-over (tiny-skia's `draw_pixmap` was slower than filling the path). | Offscreen draw with the user config 0.565 → 0.41 ms median; pill allocation 7 MB → 0.98 MB per run. |
+| 4. SNI pixmaps | Fetching `IconPixmap` is kept (most items need it), but it is decoded straight into `Vec<(i32, i32, Vec<u8>)>`. zbus's dynamic `OwnedValue` path, used by `#[zbus(property)]` getters and the proxy property cache, turned a 256 KB pixmap into ~66 MB of allocation. SNI proxies no longer cache properties. | 256 KB pixmap: 66 MB → 0.77 MB. Live pixmap allocation 36.7 MB → 0.58 MB. |
+| 6. first-frame fonts | Not changed. Loading fonts on a thread during Wayland setup was tried: setup takes only 7–10 ms, so the first frame still waited ~83 ms for the thread (93 ms startup vs 92 ms before), and warming the configured icons there added 60 ms. | Font loading is inherent to the first frame. |
+| smaller | `/proc/stat` and `/proc/meminfo` are read into one reused buffer. `ConfigWatcher::poll` was left: it runs 2–3 times a session, and its cost is validating the config. | `read_cpu_times` 8 KB per sample → 0. |
+
+The live numbers come from 120 s balanced-profile runs before and after, with
+the same script (idle, pointer sweeps over the bar, workspace, volume, and
+backlight changes). `startup-to-first-commit` is unchanged at ~93 ms (plain
+release builds, five launches each).
 
 ### Non-issues
 

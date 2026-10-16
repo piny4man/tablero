@@ -179,8 +179,12 @@ impl ProducerBridge {
     pub fn spawn(&self, producer: Box<dyn Producer>) {
         let tx = self.sender();
         let name = producer.name();
+        // Profiled builds sum every producer's poll time and allocations under
+        // one entry (hotpath groups futures by call site); otherwise this is
+        // the plain future.
+        let run = hotpath::future!(producer.run(tx), label = "producers".to_owned());
         self.runtime.spawn(async move {
-            match producer.run(tx).await {
+            match run.await {
                 Ok(()) => debug!("producer {name} finished"),
                 Err(e) => error!("producer {name} failed: {e}"),
             }
@@ -198,6 +202,7 @@ impl ProducerBridge {
         F: Future<Output = ProducerResult> + Send + 'static,
     {
         let name = name.into();
+        let future = hotpath::future!(future, label = "producer-tasks".to_owned());
         self.runtime.spawn(async move {
             match future.await {
                 Ok(()) => debug!("task {name} finished"),

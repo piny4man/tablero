@@ -153,6 +153,28 @@ fn compose(
     overlay_snapshot(ppd, platform.map(PlatformKind::name), hardware_profile)
 }
 
+/// [`compose`] for the producer loop. The qc71 driver answers its sysfs read
+/// from the embedded controller in about 60 ms, so a platform read runs on the
+/// blocking pool rather than stalling the runtime's single worker, which every
+/// other producer and the command executor share.
+async fn read_composed(
+    ppd: Option<PowerProfilesState>,
+    platform: Option<PlatformKind>,
+    sys_root: &std::path::Path,
+) -> Option<PowerProfilesState> {
+    if platform.is_none() {
+        return compose(ppd, None, sys_root);
+    }
+    let root = sys_root.to_path_buf();
+    let fallback = ppd.clone();
+    tokio::task::spawn_blocking(move || compose(ppd, platform, &root))
+        .await
+        .unwrap_or_else(|error| {
+            warn!("power-profiles: platform read failed: {error}");
+            overlay_snapshot(fallback, platform.map(PlatformKind::name), None)
+        })
+}
+
 /// Event-driven power-profiles-daemon producer, with optional platform overlay.
 pub struct PowerProfilesProducer {
     settings: PowerProfilesSettings,
@@ -207,7 +229,7 @@ async fn run(tx: MsgSender, settings: PowerProfilesSettings) -> ProducerResult {
     let mut previous = None;
     loop {
         let Some((endpoint, _)) = find_endpoint(&conn).await else {
-            let composed = compose(None, platform, settings.sys_root());
+            let composed = read_composed(None, platform, settings.sys_root()).await;
             if send_if_changed(&tx, &mut previous, composed).is_err() {
                 return Ok(());
             }
@@ -261,7 +283,8 @@ async fn run(tx: MsgSender, settings: PowerProfilesSettings) -> ProducerResult {
         // The daemon pushes its changes, so between those only the platform
         // file is re-read, against the daemon state already in hand.
         loop {
-            let composed = compose(Some(snapshot.clone()), platform, settings.sys_root());
+            let composed =
+                read_composed(Some(snapshot.clone()), platform, settings.sys_root()).await;
             if send_if_changed(&tx, &mut previous, composed).is_err() {
                 return Ok(());
             }
@@ -384,6 +407,67 @@ mod tests {
     #[test]
     fn empty_profile_name_is_dropped() {
         assert!(profile_from_properties(HashMap::from([("Profile".into(), value(""))])).is_none());
+    }
+
+    /// The qc71 driver answers `performance_mode` from the embedded controller
+    /// (~60 ms). That read must leave the producer runtime's single worker free
+    /// for every other producer and the command executor.
+    #[test]
+    fn a_slow_platform_read_does_not_block_the_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sys = tempfile::tempdir().unwrap();
+        let qc71 = sys.path().join("devices/platform/qc71_laptop");
+        std::fs::create_dir_all(&qc71).unwrap();
+        let mode = qc71.join("performance_mode");
+        // A FIFO read blocks until something writes it: a stand-in for the EC.
+        let status = std::process::Command::new("mkfifo")
+            .arg(&mode)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let worker_ran = Arc::new(AtomicBool::new(false));
+        let ran_before_write = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (mode, worker_ran, ran_before_write) =
+                (mode.clone(), worker_ran.clone(), ran_before_write.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !worker_ran.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ran_before_write.store(worker_ran.load(Ordering::SeqCst), Ordering::SeqCst);
+                std::fs::write(&mode, "3\n").unwrap();
+            })
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let composed = runtime.block_on(async {
+            let read = tokio::spawn({
+                let root = sys.path().to_path_buf();
+                async move { read_composed(None, Some(PlatformKind::Qc71), &root).await }
+            });
+            tokio::task::yield_now().await;
+            // Another producer on the same worker gets to run during the read.
+            tokio::spawn({
+                let worker_ran = worker_ran.clone();
+                async move { worker_ran.store(true, Ordering::SeqCst) }
+            });
+            read.await.unwrap()
+        });
+        writer.join().unwrap();
+
+        assert!(
+            ran_before_write.load(Ordering::SeqCst),
+            "the platform read held the only worker"
+        );
+        assert_eq!(composed.unwrap().active_name(), "performance");
     }
 
     /// The platform poll works from the daemon state already in hand: it takes

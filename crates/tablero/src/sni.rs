@@ -401,6 +401,41 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
     dirs
 }
 
+/// The `IconPixmap` variant in a `Properties.Get` reply, decoded straight into
+/// its concrete type.
+#[derive(serde::Deserialize, zbus::zvariant::Type)]
+#[zvariant(signature = "v")]
+struct IconPixmapReply(#[serde(with = "zbus::zvariant::as_value")] Vec<RawPixmap>);
+
+/// Decode an `IconPixmap` `Properties.Get` reply.
+///
+/// Read through zbus's dynamic `OwnedValue` (as a `#[zbus(property)]` getter or
+/// the proxy property cache would), every pixel byte becomes its own value: a
+/// 256 KB pixmap allocated ~66 MB. Decoded typed it costs about its own size.
+#[hotpath::measure]
+pub fn decode_icon_pixmap(reply: &zbus::Message) -> Option<Vec<(i32, i32, Vec<u8>)>> {
+    reply
+        .body()
+        .deserialize::<IconPixmapReply>()
+        .ok()
+        .map(|reply| reply.0)
+}
+
+/// An item's `IconPixmap`, or none when it has none or the read fails.
+async fn read_icon_pixmap(conn: &Connection, name: &str, path: &str) -> Vec<RawPixmap> {
+    conn.call_method(
+        Some(name),
+        path,
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &("org.kde.StatusNotifierItem", "IconPixmap"),
+    )
+    .await
+    .ok()
+    .and_then(|reply| decode_icon_pixmap(&reply))
+    .unwrap_or_default()
+}
+
 /// The host's view of a single registered item, read fresh from its proxy.
 ///
 /// `Id` is mandatory and doubles as a liveness check: once the item's bus owner
@@ -428,23 +463,37 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
 #[hotpath::measure]
 async fn read_item_props(conn: &Connection, key: &str) -> Option<TrayItem> {
     let (name, path) = parse_item_address(key)?;
+    // Uncached: the cache is filled by `GetAll`, which would decode the pixmap
+    // through dynamic values (see `decode_icon_pixmap`).
     let item = StatusNotifierItemProxy::builder(conn)
-        .destination(name)
+        .destination(name.as_str())
         .ok()?
-        .path(path)
+        .path(path.as_str())
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
 
-    let id = item.id().await.ok()?;
-    let title = item.title().await.unwrap_or_default();
-    let status = item.status().await.unwrap_or_default();
-    let icon_name = item.icon_name().await.unwrap_or_default();
-    let theme_path = item.icon_theme_path().await.unwrap_or_default();
-    let pixmaps = item.icon_pixmap().await.unwrap_or_default();
-    let menu = item.menu().await.ok();
-    let item_is_menu = item.item_is_menu().await.ok();
+    // Each property is now its own call; issue them together.
+    let ((id, title, status, icon_name), (theme_path, pixmaps, menu, item_is_menu)) =
+        futures_util::future::join(
+            futures_util::future::join4(item.id(), item.title(), item.status(), item.icon_name()),
+            futures_util::future::join4(
+                item.icon_theme_path(),
+                read_icon_pixmap(conn, &name, &path),
+                item.menu(),
+                item.item_is_menu(),
+            ),
+        )
+        .await;
+    let id = id.ok()?;
+    let title = title.unwrap_or_default();
+    let status = status.unwrap_or_default();
+    let icon_name = icon_name.unwrap_or_default();
+    let theme_path = theme_path.unwrap_or_default();
+    let menu = menu.ok();
+    let item_is_menu = item_is_menu.ok();
 
     let icon = resolve_icon(&icon_name, &pixmaps, &theme_path).await;
     let mode = menu_mode(menu.as_deref().map(|path| path.as_str()), item_is_menu);
@@ -937,10 +986,6 @@ trait StatusNotifierItem {
     #[zbus(property)]
     fn icon_theme_path(&self) -> zbus::Result<String>;
 
-    /// Embedded ARGB32 icon data at one or more sizes.
-    #[zbus(property)]
-    fn icon_pixmap(&self) -> zbus::Result<Vec<RawPixmap>>;
-
     /// Object path implementing `com.canonical.dbusmenu`.
     #[zbus(property)]
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
@@ -1321,11 +1366,13 @@ async fn item_change_stream(
     address: &str,
 ) -> Option<futures_util::stream::BoxStream<'static, ()>> {
     let (name, path) = parse_item_address(address)?;
+    // Only its signals are used; never cache (and so decode) its properties.
     let item = StatusNotifierItemProxy::builder(conn)
         .destination(name.clone())
         .ok()?
         .path(path)
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
@@ -1451,9 +1498,11 @@ async fn item_proxy<'a>(
 ) -> zbus::Result<StatusNotifierItemProxy<'a>> {
     let (name, path) = parse_item_address(key)
         .ok_or_else(|| zbus::Error::Failure(format!("bad address {key}")))?;
+    // Uncached so a click never pulls (and decodes) the pixmap via GetAll.
     StatusNotifierItemProxy::builder(conn)
         .destination(name)?
         .path(path)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
 }
@@ -2059,6 +2108,57 @@ mod tests {
             .build()
             .await
             .expect("connection to private bus")
+    }
+
+    /// An item that ships only an embedded pixmap.
+    struct PixmapItem;
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl PixmapItem {
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "pixmap"
+        }
+
+        #[zbus(property)]
+        fn icon_pixmap(&self) -> Vec<RawPixmap> {
+            vec![
+                (1, 1, vec![255, 255, 0, 0]),
+                (2, 1, vec![255, 0, 255, 0, 255, 0, 0, 255]),
+            ]
+        }
+    }
+
+    /// The typed `IconPixmap` read (see `decode_icon_pixmap`) still turns a
+    /// live item's largest pixmap into its icon.
+    #[test]
+    fn a_live_item_pixmap_becomes_its_icon() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let app = connect(&bus.address).await;
+                app.object_server()
+                    .at(DEFAULT_ITEM_PATH, PixmapItem)
+                    .await
+                    .unwrap();
+                let key = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+                let host = connect(&bus.address).await;
+
+                let item = read_item_props(&host, &key)
+                    .await
+                    .expect("item is readable");
+                let icon = item.icon().expect("the pixmap becomes the icon");
+                assert_eq!((icon.width(), icon.height()), (2, 1));
+            });
     }
 
     /// Regression test for the frozen tray: membership read through the

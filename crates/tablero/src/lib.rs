@@ -18,6 +18,7 @@ pub mod blit;
 pub mod clock;
 pub mod config;
 mod config_reload;
+mod fallback;
 pub mod icon;
 pub mod lifecycle;
 mod performance;
@@ -48,7 +49,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::blit::write_argb8888;
+use crate::blit::{write_argb8888, write_argb8888_region};
 use crate::clock::millis_until_next_minute;
 use crate::config::{Config, WidgetKind};
 use crate::redraw::RedrawScheduler;
@@ -179,6 +180,9 @@ struct Surface {
     buffer_px: (u32, u32),
     /// Next double-buffer index to try (0 or 1).
     next_buffer: usize,
+    /// What each SHM slot still lacks of the render target, so a frame copies
+    /// only that instead of the whole bar.
+    stale: StaleBuffers,
     /// When diagnostics are enabled, the start of the previous painted frame.
     last_frame: Option<Instant>,
     /// Set once the first configure has been received; drawing before that is
@@ -261,6 +265,7 @@ impl Surface {
             buffers: [None, None],
             buffer_px: (0, 0),
             next_buffer: 0,
+            stale: StaleBuffers::default(),
             last_frame: None,
             configured: false,
             presented: false,
@@ -450,7 +455,7 @@ impl Surface {
 
         let timings = if can_reuse {
             match pool.canvas(self.buffers[idx].as_ref().unwrap()) {
-                Some(canvas) => Some(self.paint_frame(canvas, width, height)),
+                Some(canvas) => Some(self.paint_frame(canvas, idx, width, height)),
                 None => {
                     // Race: became active between the check and canvas(). Allocate.
                     self.paint_new_buffer(pool, idx, width, height, stride)
@@ -493,7 +498,13 @@ impl Surface {
     }
 
     #[hotpath::measure(impl_type = "Surface")]
-    fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
+    fn paint_frame(
+        &mut self,
+        canvas: &mut [u8],
+        idx: usize,
+        width: u32,
+        height: u32,
+    ) -> FrameTimings {
         let started = self.performance.start();
         // Zero for a surface's first frame, so its counters are still logged.
         let idle_gap = started.map(|now| {
@@ -508,12 +519,21 @@ impl Surface {
         let damage = self.dashboard.take_damage();
         let layout = phase_started.map(|started| started.elapsed());
 
+        // The render target still holds the previous frame, so only the damage
+        // is repainted, and each slot receives only what it has not yet shown.
         let phase_started = self.performance.start();
-        self.dashboard.draw(&mut self.ctx);
+        let repainted = self.dashboard.draw_damage(&mut self.ctx, damage);
+        self.stale.record(repainted);
         let draw = phase_started.map(|started| started.elapsed());
 
         let phase_started = self.performance.start();
-        write_argb8888(self.ctx.pixels(), canvas);
+        match self.stale.take(idx) {
+            Some(Damage::Full) => write_argb8888(self.ctx.pixels(), canvas),
+            Some(Damage::Region(region)) => {
+                write_argb8888_region(self.ctx.pixels(), canvas, width, region);
+            }
+            None => {}
+        }
         let blit = phase_started.map(|started| started.elapsed());
         let render = started.map(|started| started.elapsed());
         FrameTimings {
@@ -583,15 +603,16 @@ impl Surface {
                 return None;
             }
         };
-        let timings = self.paint_frame(canvas, width, height);
+        self.stale.reset(idx);
+        let timings = self.paint_frame(canvas, idx, width, height);
         self.buffers[idx] = Some(buffer);
         Some(timings)
     }
 
     /// Attach slot `idx` and commit it, damaging only what `damage` covers so the
-    /// compositor re-composites (and re-blurs) just that part of the strip. The
-    /// buffer itself is always painted in full, so either slot is a complete
-    /// frame whichever the compositor shows.
+    /// compositor re-composites (and re-blurs) just that part of the strip.
+    /// [`StaleBuffers`] keeps either slot a complete frame whichever the
+    /// compositor shows.
     #[hotpath::measure(impl_type = "Surface")]
     fn commit_buffer(&mut self, idx: usize, width: u32, height: u32, damage: Damage) -> bool {
         let Some(buffer) = self.buffers[idx].as_ref() else {
@@ -612,6 +633,39 @@ impl Surface {
         self.layer.commit();
         self.redraw.committed(Instant::now());
         true
+    }
+}
+
+/// What each of a surface's two SHM slots is missing relative to the render
+/// target: a slot shown to the compositor last frame missed this frame's
+/// damage, and the other slot also missed the frame before. `None` means the
+/// slot is current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaleBuffers([Option<Damage>; 2]);
+
+impl Default for StaleBuffers {
+    fn default() -> Self {
+        Self([Some(Damage::Full); 2])
+    }
+}
+
+impl StaleBuffers {
+    /// The render target changed by `damage`; neither slot shows it yet.
+    fn record(&mut self, damage: Damage) {
+        for slot in &mut self.0 {
+            *slot = Some(slot.map_or(damage, |missed| missed.union(damage)));
+        }
+    }
+
+    /// Slot `idx` is a fresh (or unknown) buffer: it is missing everything.
+    fn reset(&mut self, idx: usize) {
+        self.0[idx] = Some(Damage::Full);
+    }
+
+    /// What must be copied into slot `idx` to make it current; it is current
+    /// afterwards.
+    fn take(&mut self, idx: usize) -> Option<Damage> {
+        self.0[idx].take()
     }
 }
 
@@ -2771,6 +2825,30 @@ mod scroll_tests {
             popup_background((0x30, 0x32, 0x38, 0xD0)),
             (0x30, 0x32, 0x38, 0xF0)
         );
+    }
+
+    #[test]
+    fn each_buffer_slot_receives_the_damage_it_missed() {
+        let a = Damage::Region(Bounds::new(0, 0, 10, 10));
+        let b = Damage::Region(Bounds::new(30, 0, 10, 10));
+        let mut stale = StaleBuffers::default();
+
+        // Both slots start empty, so each gets one full copy.
+        stale.record(Damage::Full);
+        assert_eq!(stale.take(0), Some(Damage::Full));
+        stale.record(a);
+        assert_eq!(stale.take(1), Some(Damage::Full));
+        // Slot 0 missed `a` and now `b`; slot 1 only `b`.
+        stale.record(b);
+        assert_eq!(stale.take(0), Some(a.union(b)));
+        stale.record(a);
+        assert_eq!(stale.take(1), Some(b.union(a)));
+        // A frame that changes nothing leaves a current slot with nothing to copy.
+        assert_eq!(stale.take(1), None);
+
+        // A replaced buffer starts over.
+        stale.reset(0);
+        assert_eq!(stale.take(0), Some(Damage::Full));
     }
 
     #[test]

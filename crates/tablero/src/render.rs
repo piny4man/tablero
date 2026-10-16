@@ -8,6 +8,7 @@ use tiny_skia::{
     Stroke, Transform,
 };
 
+use crate::fallback::IconFallback;
 use crate::icon::BuiltinIcon;
 
 /// Shared font machinery for every bar surface and popup on the render thread.
@@ -19,6 +20,7 @@ use crate::icon::BuiltinIcon;
 pub struct FontResources {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    icon_fallback: IconFallback,
 }
 
 impl FontResources {
@@ -27,6 +29,7 @@ impl FontResources {
         Self {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
+            icon_fallback: IconFallback::default(),
         }
     }
 }
@@ -122,6 +125,15 @@ impl Bounds {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
 
+    /// True if the two rectangles share at least one pixel (an empty rectangle
+    /// shares none).
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
     /// The smallest rectangle covering both `self` and `other`.
     pub fn union(&self, other: &Self) -> Self {
         let x = self.x.min(other.x);
@@ -189,6 +201,14 @@ const ICON_CACHE_LIMIT: usize = 64;
 /// straight-alpha color.
 type IconKey = (BuiltinIcon, (u32, u32), (u8, u8, u8, u8));
 
+/// Upper bound on cached pill rasters per context. Steady pills hit; a pill
+/// whose width follows changing text adds one entry per width it takes.
+const PILL_CACHE_LIMIT: usize = 64;
+
+/// Identity of one rasterised pill: size, straight-alpha color, and
+/// `f32::to_bits` of its radius and stroke width (`None` for a fill).
+type PillKey = ((u32, u32), (u8, u8, u8, u8), u32, Option<u32>);
+
 /// The shaping box a string was laid out in. Font size and family live in
 /// [`RenderSettings`], and the cache is cleared whenever those change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,6 +250,7 @@ impl TextCache {
     fn get_or_shape(
         &mut self,
         font_system: &mut FontSystem,
+        icon_fallback: &mut IconFallback,
         settings: &RenderSettings,
         stats: &mut RenderStats,
         text: &str,
@@ -246,7 +267,7 @@ impl TextCache {
                 self.clear();
             }
             stats.text_shapes += 1;
-            let shaped = shape_text(font_system, settings, text, key);
+            let shaped = shape_text(font_system, icon_fallback, settings, text, key);
             self.by_shape
                 .entry(key)
                 .or_default()
@@ -263,6 +284,7 @@ impl TextCache {
 #[hotpath::measure]
 fn shape_text(
     font_system: &mut FontSystem,
+    icon_fallback: &mut IconFallback,
     settings: &RenderSettings,
     text: &str,
     key: ShapeKey,
@@ -281,7 +303,28 @@ fn shape_text(
     if let Some(family) = &settings.font_family {
         attrs = attrs.family(Family::Name(family));
     }
-    buffer.set_text(text, &attrs, Shaping::Advanced, None);
+    let primary = settings.font_family.as_deref();
+    let spans = crate::fallback::fallback_spans(text, |c| {
+        icon_fallback.face_for(font_system.db(), primary, c)
+    });
+    if spans.iter().all(|(_, face)| face.is_none()) {
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+    } else {
+        // Name the icon font outright: left to its own fallback, cosmic-text
+        // would load every installed face looking for the glyph.
+        let rich = spans.iter().map(|(span, face)| match face {
+            Some(face) => (
+                *span,
+                attrs
+                    .clone()
+                    .family(Family::Name(&face.family))
+                    .weight(face.weight)
+                    .style(face.style),
+            ),
+            None => (*span, attrs.clone()),
+        });
+        buffer.set_rich_text(rich, &attrs, Shaping::Advanced, None);
+    }
     buffer.shape_until_scroll(font_system, false);
 
     let width = buffer
@@ -363,6 +406,9 @@ pub struct RenderContext {
     /// Built-in icons rasterised at their slot size, so a steady frame
     /// composites them instead of rebuilding and anti-aliasing vector paths.
     icon_cache: HashMap<IconKey, Pixmap>,
+    /// Pill fills and borders rasterised at their size, so a steady frame
+    /// composites them instead of building and anti-aliasing paths again.
+    pill_cache: HashMap<PillKey, Pixmap>,
     stats: RenderStats,
 }
 
@@ -397,6 +443,7 @@ impl RenderContext {
             settings,
             text_cache: TextCache::default(),
             icon_cache: HashMap::new(),
+            pill_cache: HashMap::new(),
             stats: RenderStats::default(),
         }
     }
@@ -480,6 +527,30 @@ impl RenderContext {
         self.pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
     }
 
+    /// Reset `region` (clipped to the target) to the background color, exactly
+    /// as [`fill_background`](Self::fill_background) leaves it.
+    #[hotpath::measure(impl_type = "RenderContext")]
+    pub fn fill_background_in(&mut self, region: Bounds) {
+        let (r, g, b, a) = self.settings.background;
+        let color = tiny_skia::Color::from_rgba8(r, g, b, a)
+            .premultiply()
+            .to_color_u8();
+        let pixel = [color.red(), color.green(), color.blue(), color.alpha()];
+        let width = self.pixmap.width();
+        let x = region.x.min(width);
+        let right = (region.x + region.width).min(width);
+        let bottom = (region.y + region.height).min(self.pixmap.height());
+        let stride = width as usize * 4;
+        let data = self.pixmap.data_mut();
+        for row in region.y..bottom {
+            let start = row as usize * stride;
+            let line = &mut data[start + x as usize * 4..start + right as usize * 4];
+            for out in line.as_chunks_mut::<4>().0 {
+                *out = pixel;
+            }
+        }
+    }
+
     /// Fill a rounded rectangle covering `bounds` with `color`, corner radius
     /// `radius` pixels.
     ///
@@ -493,23 +564,10 @@ impl RenderContext {
     /// color, so a widget with no background color draws no pill at all.
     #[hotpath::measure(impl_type = "RenderContext")]
     pub fn fill_rounded_rect(&mut self, bounds: Bounds, color: (u8, u8, u8, u8), radius: f32) {
-        let (r, g, b, a) = color;
-        if bounds.width == 0 || bounds.height == 0 || a == 0 {
+        if bounds.width == 0 || bounds.height == 0 || color.3 == 0 {
             return;
         }
-
-        let path =
-            rounded_rect_path(bounds, radius, 0.0).expect("validated non-zero rounded rectangle");
-
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(r, g, b, a);
-        self.pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        self.draw_pill(bounds, color, radius, None);
     }
 
     /// Stroke a rounded rectangle inside `bounds` with `color` and `width`.
@@ -525,26 +583,43 @@ impl RenderContext {
         radius: f32,
         width: f32,
     ) {
-        let (r, g, b, a) = color;
-        if bounds.width == 0 || bounds.height == 0 || a == 0 || width <= 0.0 {
+        if bounds.width == 0 || bounds.height == 0 || color.3 == 0 || width <= 0.0 {
             return;
         }
-
         let max_width = bounds.width.min(bounds.height) as f32;
-        let width = width.min(max_width);
-        let inset = width / 2.0;
-        let Some(path) = rounded_rect_path(bounds, (radius - inset).max(0.0), inset) else {
+        self.draw_pill(bounds, color, radius, Some(width.min(max_width)));
+    }
+
+    /// Composite the cached raster of one pill fill (`stroke` `None`) or
+    /// border, rasterising it at the origin on a miss. Integer placement keeps
+    /// the anti-aliasing identical to painting the path in place.
+    fn draw_pill(
+        &mut self,
+        bounds: Bounds,
+        color: (u8, u8, u8, u8),
+        radius: f32,
+        stroke: Option<f32>,
+    ) {
+        let key = (
+            (bounds.width, bounds.height),
+            color,
+            radius.to_bits(),
+            stroke.map(f32::to_bits),
+        );
+        if !self.pill_cache.contains_key(&key) {
+            let Some(raster) = rasterize_pill(bounds.width, bounds.height, color, radius, stroke)
+            else {
+                return;
+            };
+            if self.pill_cache.len() >= PILL_CACHE_LIMIT {
+                self.pill_cache.clear();
+            }
+            self.pill_cache.insert(key, raster);
+        }
+        let Some(raster) = self.pill_cache.get(&key) else {
             return;
         };
-
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(r, g, b, a);
-        let stroke = Stroke {
-            width,
-            ..Stroke::default()
-        };
-        self.pixmap
-            .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        composite_over(&mut self.pixmap, raster, bounds.x, bounds.y);
     }
 
     /// Shape and draw `text` in `color` within `bounds`.
@@ -600,14 +675,20 @@ impl RenderContext {
         let FontResources {
             font_system,
             swash_cache,
+            icon_fallback,
         } = &mut *fonts;
         let key = ShapeKey {
             line_height: (bounds.height as f32).to_bits(),
             size: Some((bounds.width, bounds.height)),
         };
-        let shaped =
-            self.text_cache
-                .get_or_shape(font_system, &self.settings, &mut self.stats, text, key);
+        let shaped = self.text_cache.get_or_shape(
+            font_system,
+            icon_fallback,
+            &self.settings,
+            &mut self.stats,
+            text,
+            key,
+        );
 
         let text_color = Color::rgba(color.0, color.1, color.2, color.3);
         let ink = *shaped.ink.get_or_insert_with(|| {
@@ -666,13 +747,19 @@ impl RenderContext {
         }
 
         let mut fonts = self.fonts.borrow_mut();
+        let FontResources {
+            font_system,
+            icon_fallback,
+            ..
+        } = &mut *fonts;
         let key = ShapeKey {
             line_height: self.settings.font_size.to_bits(),
             size: None,
         };
         self.text_cache
             .get_or_shape(
-                &mut fonts.font_system,
+                font_system,
+                icon_fallback,
                 &self.settings,
                 &mut self.stats,
                 text,
@@ -786,6 +873,76 @@ impl RenderContext {
     pub fn pixels(&self) -> &[u8] {
         self.pixmap.data()
     }
+}
+
+/// Source-over `src` (premultiplied) onto `dst` with its origin at `(x, y)`,
+/// clipped to `dst`. Pills are mostly fully opaque or fully clear pixels, which
+/// take the copy and skip paths.
+fn composite_over(dst: &mut Pixmap, src: &Pixmap, x: u32, y: u32) {
+    let (dst_w, dst_h) = (dst.width(), dst.height());
+    if x >= dst_w || y >= dst_h {
+        return;
+    }
+    let cols = src.width().min(dst_w - x) as usize;
+    let rows = src.height().min(dst_h - y) as usize;
+    let src_stride = src.width() as usize * 4;
+    let dst_stride = dst_w as usize * 4;
+    let src = src.data();
+    let dst = dst.data_mut();
+    for row in 0..rows {
+        let s = &src[row * src_stride..][..cols * 4];
+        let d = &mut dst[(y as usize + row) * dst_stride + x as usize * 4..][..cols * 4];
+        for (s, d) in s.as_chunks::<4>().0.iter().zip(d.as_chunks_mut::<4>().0) {
+            match s[3] {
+                0 => {}
+                255 => *d = *s,
+                a => {
+                    let keep = 255 - u32::from(a);
+                    for (d, s) in d.iter_mut().zip(s) {
+                        *d = (u32::from(*s) + div255(u32::from(*d) * keep)) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A `width * height` raster of one pill: a filled rounded rectangle, or (with
+/// `stroke`) its border inset by half the stroke width. `None` when nothing
+/// is left to paint.
+fn rasterize_pill(
+    width: u32,
+    height: u32,
+    color: (u8, u8, u8, u8),
+    radius: f32,
+    stroke: Option<f32>,
+) -> Option<Pixmap> {
+    let mut raster = Pixmap::new(width, height)?;
+    let slot = Bounds::new(0, 0, width, height);
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.0, color.1, color.2, color.3);
+    match stroke {
+        None => {
+            let path = rounded_rect_path(slot, radius, 0.0)?;
+            raster.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        Some(width) => {
+            let inset = width / 2.0;
+            let path = rounded_rect_path(slot, (radius - inset).max(0.0), inset)?;
+            let stroke = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            raster.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+    Some(raster)
 }
 
 /// Render `text` over a dark background into a `width * height` pixel buffer.
@@ -1062,12 +1219,13 @@ mod tests {
         let FontResources {
             font_system,
             swash_cache,
+            icon_fallback,
         } = &mut *fonts;
         let key = ShapeKey {
             line_height: (bounds.height as f32).to_bits(),
             size: Some((bounds.width, bounds.height)),
         };
-        let mut shaped = shape_text(font_system, &ctx.settings, text, key);
+        let mut shaped = shape_text(font_system, icon_fallback, &ctx.settings, text, key);
         let text_color = Color::rgba(color.0, color.1, color.2, color.3);
         let (ox, oy) = (bounds.x as f32, bounds.y as f32);
         let dst = &mut ctx.pixmap;
@@ -1245,6 +1403,72 @@ mod tests {
         }
         assert_eq!(actual.icon_cache.len(), 1);
         assert_ne!(actual.pixels(), RenderContext::new(48, 36).pixels());
+    }
+
+    /// The pill primitives as they painted before the raster cache: straight
+    /// onto the target with tiny-skia. Kept only as the golden reference.
+    fn reference_pills(ctx: &mut RenderContext, bounds: Bounds) {
+        let fill = rounded_rect_path(bounds, 9.0, 0.0).unwrap();
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(0x30, 0x60, 0x90, 0xC0);
+        ctx.pixmap.fill_path(
+            &fill,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        let stroke = rounded_rect_path(bounds, 8.0, 1.0).unwrap();
+        paint.set_color_rgba8(0xE0, 0xA0, 0x20, 0xFF);
+        let stroke_style = Stroke {
+            width: 2.0,
+            ..Stroke::default()
+        };
+        ctx.pixmap
+            .stroke_path(&stroke, &paint, &stroke_style, Transform::identity(), None);
+    }
+
+    #[test]
+    fn pills_composite_cached_rasters_matching_direct_painting() {
+        let bounds = Bounds::new(5, 3, 70, 30);
+        let settings = RenderSettings {
+            background: (0x10, 0x20, 0x30, 0x80),
+            ..RenderSettings::default()
+        };
+        let mut expected = RenderContext::with_settings(80, 36, settings.clone());
+        expected.fill_background();
+        reference_pills(&mut expected, bounds);
+
+        let mut actual = RenderContext::with_settings(80, 36, settings);
+        // Twice: the first frame rasterises, the second composites the cache.
+        for _ in 0..2 {
+            actual.fill_background();
+            actual.fill_rounded_rect(bounds, (0x30, 0x60, 0x90, 0xC0), 9.0);
+            actual.stroke_rounded_rect(bounds, (0xE0, 0xA0, 0x20, 0xFF), 9.0, 2.0);
+            // A translucent raster over a translucent bar rounds twice: a few
+            // anti-aliased edge channels land two levels off.
+            let worst = actual
+                .pixels()
+                .iter()
+                .zip(expected.pixels())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(worst <= 2, "channel differs by {worst}");
+        }
+        assert_eq!(actual.pill_cache.len(), 2);
+
+        // Moving a pill reuses its raster; any other shape or color does not.
+        actual.fill_rounded_rect(Bounds::new(9, 4, 70, 30), (0x30, 0x60, 0x90, 0xC0), 9.0);
+        assert_eq!(actual.pill_cache.len(), 2);
+        actual.fill_rounded_rect(bounds, (0x30, 0x60, 0x90, 0xFF), 9.0);
+        actual.fill_rounded_rect(Bounds::new(5, 3, 71, 30), (0x30, 0x60, 0x90, 0xC0), 9.0);
+        actual.fill_rounded_rect(bounds, (0x30, 0x60, 0x90, 0xC0), 10.0);
+        assert_eq!(actual.pill_cache.len(), 5);
+        for width in 1..=(PILL_CACHE_LIMIT as u32 * 2) {
+            actual.fill_rounded_rect(Bounds::new(0, 0, width, 30), (1, 2, 3, 255), 9.0);
+            assert!(actual.pill_cache.len() <= PILL_CACHE_LIMIT);
+        }
     }
 
     #[test]
