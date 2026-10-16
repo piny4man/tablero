@@ -197,6 +197,7 @@ impl Widget for TitleWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "TitleWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         let text = self.display_text();
         if text.is_empty() {
@@ -211,6 +212,7 @@ impl Widget for TitleWidget {
         );
     }
 
+    #[hotpath::measure(impl_type = "TitleWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_text_pill(ctx, &self.style, &self.display_text())
     }

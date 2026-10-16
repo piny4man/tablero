@@ -52,23 +52,26 @@ pub struct CpuTimes {
 /// read. The numeric fields are `user nice system idle iowait irq softirq steal
 /// guest guest_nice`; `total` sums them and `idle` is `idle + iowait`. Returns
 /// `None` if the aggregate line is missing or malformed. Pure over its input.
+#[hotpath::measure]
 pub fn parse_cpu_times(proc_stat: &str) -> Option<CpuTimes> {
     let line = proc_stat
         .lines()
         .find(|l| l.split_whitespace().next() == Some("cpu"))?;
-    let nums: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .map(|t| t.parse::<u64>())
-        .collect::<Result<_, _>>()
-        .ok()?;
+    let (mut fields, mut total, mut idle) = (0, 0_u64, 0_u64);
+    for token in line.split_whitespace().skip(1) {
+        let value = token.parse::<u64>().ok()?;
+        total += value;
+        // Fields 3 and 4 are idle and iowait.
+        if matches!(fields, 3 | 4) {
+            idle += value;
+        }
+        fields += 1;
+    }
     // Need at least user/nice/system/idle; iowait and the rest are optional on
     // older kernels.
-    if nums.len() < 4 {
+    if fields < 4 {
         return None;
     }
-    let total: u64 = nums.iter().sum();
-    let idle = nums[3] + nums.get(4).copied().unwrap_or(0);
     Some(CpuTimes { idle, total })
 }
 
@@ -93,6 +96,7 @@ pub fn cpu_usage(prev: CpuTimes, cur: CpuTimes) -> f64 {
 /// estimate of what is reclaimable for new work, the figure a user reads as
 /// "free", so this matches what tools like `free` report. Returns `None` if
 /// either field is missing or `MemTotal` is zero. Pure over its input.
+#[hotpath::measure]
 pub fn parse_mem_usage(proc_meminfo: &str) -> Option<f64> {
     let mut total = None;
     let mut available = None;
@@ -117,13 +121,30 @@ fn parse_kb(field: &str) -> Option<u64> {
     field.split_whitespace().next()?.parse().ok()
 }
 
+/// Reads procfs files into one buffer kept across samples.
+#[derive(Default)]
+struct ProcReader {
+    buf: String,
+}
+
+impl ProcReader {
+    /// The current contents of `path`.
+    fn read(&mut self, path: &str) -> std::io::Result<&str> {
+        use std::io::Read;
+        self.buf.clear();
+        fs::File::open(path)?.read_to_string(&mut self.buf)?;
+        Ok(&self.buf)
+    }
+}
+
 /// Read and parse the current CPU counters, logging and degrading to `None` on
 /// any failure so a transient read error never ends the stream.
-fn read_cpu_times() -> Option<CpuTimes> {
+#[hotpath::measure]
+fn read_cpu_times(reader: &mut ProcReader) -> Option<CpuTimes> {
     // procfs reads are served from kernel memory, not disk, so this does not
     // meaningfully block the runtime.
-    match fs::read_to_string("/proc/stat") {
-        Ok(stat) => parse_cpu_times(&stat),
+    match reader.read("/proc/stat") {
+        Ok(stat) => parse_cpu_times(stat),
         Err(e) => {
             warn!("sysmon: reading /proc/stat failed: {e}");
             None
@@ -133,9 +154,10 @@ fn read_cpu_times() -> Option<CpuTimes> {
 
 /// Read and parse the current memory load, logging and degrading to `None` on
 /// any failure.
-fn read_mem_usage() -> Option<f64> {
-    match fs::read_to_string("/proc/meminfo") {
-        Ok(meminfo) => parse_mem_usage(&meminfo),
+#[hotpath::measure]
+fn read_mem_usage(reader: &mut ProcReader) -> Option<f64> {
+    match reader.read("/proc/meminfo") {
+        Ok(meminfo) => parse_mem_usage(meminfo),
         Err(e) => {
             warn!("sysmon: reading /proc/meminfo failed: {e}");
             None
@@ -197,13 +219,14 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
     // The first tick completes immediately; use it only to seed the CPU baseline
     // so the first emitted sample reflects real elapsed time.
     ticker.tick().await;
-    let mut prev = read_cpu_times();
+    let mut reader = ProcReader::default();
+    let mut prev = read_cpu_times(&mut reader);
     let mut sent = None;
 
     loop {
         ticker.tick().await;
 
-        let cur = read_cpu_times();
+        let cur = read_cpu_times(&mut reader);
         let cpu = match (prev, cur) {
             (Some(p), Some(c)) => cpu_usage(p, c),
             // No baseline yet (or this read failed): report 0 this tick.
@@ -213,7 +236,7 @@ async fn run(tx: MsgSender, period: Duration) -> ProducerResult {
             prev = cur;
         }
 
-        let mem = read_mem_usage().unwrap_or(0.0);
+        let mem = read_mem_usage(&mut reader).unwrap_or(0.0);
 
         if !send_if_changed(&tx, &mut sent, SystemStats::new(cpu, mem)) {
             return Ok(());
@@ -249,6 +272,35 @@ MemAvailable:    8000000 kB
 Buffers:          500000 kB
 Cached:          3000000 kB
 ";
+
+    #[test]
+    fn the_proc_reader_reuses_its_buffer_across_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stat");
+        let path = path.to_str().unwrap();
+        let mut reader = ProcReader::default();
+
+        // Once grown to the larger file, later samples fit in place.
+        assert!(PROC_MEMINFO.len() > PROC_STAT.len());
+        fs::write(path, PROC_MEMINFO).unwrap();
+        assert_eq!(reader.read(path).unwrap(), PROC_MEMINFO);
+        let buffer = reader.buf.as_ptr();
+        fs::write(path, PROC_STAT).unwrap();
+        assert_eq!(reader.read(path).unwrap(), PROC_STAT);
+        assert_eq!(
+            reader.buf.as_ptr(),
+            buffer,
+            "a sample reallocated the buffer"
+        );
+        fs::write(path, PROC_MEMINFO).unwrap();
+        assert_eq!(reader.read(path).unwrap(), PROC_MEMINFO);
+        assert_eq!(
+            reader.buf.as_ptr(),
+            buffer,
+            "a sample reallocated the buffer"
+        );
+        assert!(reader.read("/nonexistent/stat").is_err());
+    }
 
     #[test]
     fn an_unchanged_whole_percent_reading_is_not_sent_again() {

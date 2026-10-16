@@ -79,21 +79,33 @@ fn execute(
             );
             Ok(())
         }
-        cli::Action::Run => {
-            let path = cli
-                .config
-                .or_else(config_file_path)
-                .map(std::path::absolute)
-                .transpose()?;
-            let config = load_config(path.as_deref())?;
-            let mut instance = Instance::claim(identity, path.clone())?;
-            if let Some(stream) = startup {
-                instance = instance.with_ready_notifier(stream.try_clone()?);
-            }
-            run_instance(config, path, instance)
-        }
+        cli::Action::Run => run(cli.config, identity, startup),
         cli::Action::Help => unreachable!(),
     }
+}
+
+/// Claim the instance and run the bar until it is stopped.
+///
+/// Built with `--features hotpath` this is the profiling scope: the report is
+/// written when the bar stops and this returns (or after `HOTPATH_SHUTDOWN_MS`).
+/// The `reload` and `restart` client commands stay outside it, so they never
+/// print a report of their own.
+#[hotpath::main]
+fn run(
+    config: Option<std::path::PathBuf>,
+    identity: Identity,
+    startup: Option<&std::os::unix::net::UnixStream>,
+) -> Result<(), Box<dyn Error>> {
+    let path = config
+        .or_else(config_file_path)
+        .map(std::path::absolute)
+        .transpose()?;
+    let config = load_config(path.as_deref())?;
+    let mut instance = Instance::claim(identity, path.clone())?;
+    if let Some(stream) = startup {
+        instance = instance.with_ready_notifier(stream.try_clone()?);
+    }
+    run_instance(config, path, instance)
 }
 
 /// Load the bar configuration from the user's TOML file, falling back to the

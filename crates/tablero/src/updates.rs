@@ -90,6 +90,7 @@ pub fn count_output_lines(output: &[u8]) -> u32 {
 }
 
 /// Parse `name current -> new` records emitted by `checkupdates` and `paru`.
+#[hotpath::measure]
 pub fn parse_update_output(output: &[u8]) -> Vec<PackageUpdate> {
     String::from_utf8_lossy(output)
         .lines()
@@ -145,6 +146,7 @@ async fn command_output(
 /// its exit status `2` is the documented no-updates result. A missing or failed
 /// `paru` check degrades to the official count rather than hiding valid results.
 /// A zero combined count returns `None`, which is the widget's hidden state.
+#[hotpath::measure]
 pub async fn check_once(
     checkupdates: &Path,
     paru: &Path,

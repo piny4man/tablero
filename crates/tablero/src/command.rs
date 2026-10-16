@@ -22,9 +22,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use hotpath::wrap::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use log::{debug, info, warn};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::producer::ProducerResult;
 use crate::widget::{Command, LaunchSpec};
@@ -60,7 +61,9 @@ impl fmt::Debug for CommandSender {
 /// Build a command channel: the [`CommandSender`] for the loop and the
 /// [`CommandReceiver`] for the executor task.
 pub fn command_channel() -> (CommandSender, CommandReceiver) {
-    let (inner, rx) = unbounded_channel();
+    // Labels are passed as owned strings, not literals: the literal form adds an
+    // `unsafe(export_name)` uniqueness check that `unsafe_code = "deny"` rejects.
+    let (inner, rx) = hotpath::channel!(unbounded_channel(), label = "commands".to_owned());
     (CommandSender { inner }, rx)
 }
 
@@ -218,6 +221,7 @@ pub fn format_exit_status(status: std::process::ExitStatus) -> String {
 ///
 /// Returns `Ok(())` when the process was started (the waiter owns the rest).
 /// Returns `Err` with a user-facing reason when spawn never starts.
+#[hotpath::measure]
 pub async fn spawn_run_program(spec: LaunchSpec) -> Result<(), String> {
     let program = resolve_program(spec.program());
     if is_bare_name(spec.program()) && !program.is_absolute() {

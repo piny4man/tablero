@@ -154,6 +154,7 @@ fn build_path(cmds: &[Cmd]) -> Option<Path> {
 /// carve holes (a slashed bell, a battery outline) render correctly. Nothing is
 /// drawn for an unmapped icon; callers guard zero-area slots and transparent
 /// colors before reaching here.
+#[hotpath::measure]
 pub fn draw_into(pixmap: &mut Pixmap, icon: BuiltinIcon, bounds: Bounds, color: (u8, u8, u8, u8)) {
     let Some(raw) = icon.raw() else {
         return;

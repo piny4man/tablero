@@ -131,6 +131,7 @@ fn read_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
 /// adapter off, a second adapter on with two devices, the bar would say
 /// "off" but the count would already be 2. Aggregating keeps the two
 /// readings tied to the same scope.
+#[hotpath::measure]
 fn summarize(
     objects: &HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>,
 ) -> (usize, Option<bool>, u32) {
@@ -206,6 +207,7 @@ trait ObjectManager {
 /// (i.e. [`Unavailable`](BluetoothState::Unavailable)) and a logged
 /// warning rather than ending the stream — a transient DBus hiccup never
 /// takes the source down.
+#[hotpath::measure]
 async fn read_snapshot(om: &ObjectManagerProxy<'_>) -> Bluetooth {
     match om.get_managed_objects().await {
         Ok(objects) => {

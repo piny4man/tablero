@@ -8,11 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use crate::widget::{Backlight, Command, Msg, ScrollDirection};
+use hotpath::wrap::tokio::sync::mpsc;
 use log::warn;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
 use tokio::fs;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::time;
 use zbus::{Connection, proxy};
 
@@ -120,7 +121,7 @@ impl Drop for UdevMonitor {
 }
 
 fn spawn_udev_monitor() -> io::Result<UdevMonitor> {
-    let (tx, changes) = mpsc::unbounded_channel();
+    let (tx, changes) = hotpath::channel!(unbounded_channel(), label = "backlight-udev".to_owned());
     let mut poll = Poll::new()?;
     let shutdown = Arc::new(Waker::new(poll.registry(), SHUTDOWN_TOKEN)?);
     thread::Builder::new()
@@ -159,6 +160,7 @@ fn spawn_udev_monitor() -> io::Result<UdevMonitor> {
 }
 
 /// Read and normalize every usable device below a backlight sysfs class path.
+#[hotpath::measure]
 pub async fn read_backlights(root: &Path) -> io::Result<Vec<Backlight>> {
     let mut entries = match fs::read_dir(root).await {
         Ok(entries) => entries,
@@ -179,6 +181,7 @@ pub async fn read_backlights(root: &Path) -> io::Result<Vec<Backlight>> {
     Ok(devices)
 }
 
+#[hotpath::measure]
 async fn read_device(path: &Path, name: &str) -> io::Result<Backlight> {
     let max_brightness = read_u32(&path.join("max_brightness")).await?;
     let preferred_attribute = brightness_attribute(name);
@@ -289,6 +292,7 @@ pub fn is_safe_backlight_device(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
+#[hotpath::measure]
 async fn adjust_device(
     connection: &Connection,
     root: &Path,

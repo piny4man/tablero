@@ -56,6 +56,7 @@ fn required_action(active: bool, desired: bool) -> HypridleAction {
 /// Deliberately synchronous: `/proc` is memory-backed, so a walk takes a
 /// millisecond or two, whereas `tokio::fs` would hand each of its hundreds of
 /// reads to the blocking pool and wake two threads apiece.
+#[hotpath::measure]
 fn discover_hypridle_processes(root: &Path) -> io::Result<Vec<i32>> {
     let current_uid = fs::metadata(root.join("self"))
         .or_else(|_| fs::metadata(root))?
@@ -241,6 +242,7 @@ async fn wait_until_stopped(root: &Path) -> io::Result<bool> {
     }
 }
 
+#[hotpath::measure]
 async fn set_state(root: &Path, executable: &Path, desired: bool) -> io::Result<bool> {
     let pids = discover_hypridle_processes(root)?;
     match required_action(!pids.is_empty(), desired) {

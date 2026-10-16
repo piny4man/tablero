@@ -98,6 +98,7 @@ impl Widget for ClockWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "ClockWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         draw_icon_content(
             ctx,
@@ -109,6 +110,7 @@ impl Widget for ClockWidget {
         );
     }
 
+    #[hotpath::measure(impl_type = "ClockWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }

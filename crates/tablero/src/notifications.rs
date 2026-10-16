@@ -79,6 +79,7 @@ trait SwayNc {
 /// the snapshot would force repaints on invisible changes. Pure over its
 /// inputs so the tests drive the reading → message → widget path without a
 /// live bus.
+#[hotpath::measure]
 pub fn notifications_from_swaync(count: u32, dnd: bool) -> Notifications {
     Notifications::new(count, dnd)
 }

@@ -82,6 +82,7 @@ trait UPowerDevice {
 /// A failed read degrades to `None` (battery shown absent) and a logged warning
 /// rather than ending the stream — a transient DBus hiccup never takes the source
 /// down.
+#[hotpath::measure]
 async fn read_snapshot(device: &UPowerDeviceProxy<'_>) -> Option<Battery> {
     match try_read(device).await {
         Ok(snapshot) => snapshot,
@@ -93,6 +94,7 @@ async fn read_snapshot(device: &UPowerDeviceProxy<'_>) -> Option<Battery> {
 }
 
 /// Read the three properties and fold them into a normalized snapshot.
+#[hotpath::measure]
 async fn try_read(device: &UPowerDeviceProxy<'_>) -> zbus::Result<Option<Battery>> {
     let is_present = device.is_present().await?;
     let percentage = device.percentage().await?;

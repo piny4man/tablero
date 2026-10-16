@@ -984,14 +984,25 @@ pub struct Dashboard {
 
 /// The part of a freshly painted frame that differs from the one before it.
 ///
-/// The whole bar is always repainted; this only tells the compositor how much
-/// of it to recomposite, which is what bounds its blur and blend work.
+/// It bounds what [`draw_damage`](Dashboard::draw_damage) repaints, what is
+/// copied into the shared-memory buffer, and how much the compositor
+/// recomposites (its blur and blend work).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Damage {
     /// Anything may have changed: first frame, moved slots, or a forced repaint.
     Full,
     /// Only pixels inside this rectangle changed.
     Region(Bounds),
+}
+
+impl Damage {
+    /// The damage covering both `self` and `other`.
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Region(a), Self::Region(b)) => Self::Region(a.union(&b)),
+            _ => Self::Full,
+        }
+    }
 }
 
 impl Dashboard {
@@ -1034,6 +1045,7 @@ impl Dashboard {
     /// Returns `true` if at least one widget reported a visible change, i.e. the
     /// frame is now dirty and should be redrawn. Every widget is updated even
     /// once a change is seen, so each keeps its state current.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn update(&mut self, msg: &Msg) -> bool {
         let mut dirty = false;
         for (widget, changed) in self
@@ -1096,6 +1108,7 @@ impl Dashboard {
     /// [`margin`](Dashboard::with_spacing). A widget that measures zero is parked
     /// at zero width and reserves no space. Geometry is authored in logical
     /// pixels and scaled here by the context's output scale.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn layout(&mut self, ctx: &mut RenderContext, width: u32, height: u32) {
         let scale = ctx.scale_factor();
         let margin = self.margin * scale;
@@ -1151,11 +1164,44 @@ impl Dashboard {
 
     /// Clear the background and paint every widget, left zone then center then
     /// right.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn draw(&self, ctx: &mut RenderContext) {
         ctx.fill_background();
         for widget in self.left.iter().chain(&self.center).chain(&self.right) {
             widget.draw(ctx);
         }
+    }
+
+    /// Repaint only what `damage` covers, on top of the previous frame still in
+    /// `ctx`. Returns the region actually repainted.
+    ///
+    /// A widget repaints its whole slot over a cleared background, so the
+    /// region first grows until every slot it touches lies inside it; nothing
+    /// outside is painted twice, and the result matches a full repaint.
+    #[hotpath::measure(impl_type = "Dashboard")]
+    pub fn draw_damage(&self, ctx: &mut RenderContext, damage: Damage) -> Damage {
+        let Damage::Region(mut region) = damage else {
+            self.draw(ctx);
+            return Damage::Full;
+        };
+        loop {
+            let grown = self
+                .widgets()
+                .map(|widget| widget.bounds())
+                .filter(|bounds| bounds.intersects(&region))
+                .fold(region, |region, bounds| region.union(&bounds));
+            if grown == region {
+                break;
+            }
+            region = grown;
+        }
+        ctx.fill_background_in(region);
+        for widget in self.widgets() {
+            if widget.bounds().intersects(&region) {
+                widget.draw(ctx);
+            }
+        }
+        Damage::Region(region)
     }
 
     /// Route a `button` click at surface pixel `(px, py)` to the widgets.
@@ -1164,6 +1210,7 @@ impl Dashboard {
     /// claims the pixel, or `None` if none do — clicks on empty space or
     /// display-only widgets produce nothing. Zones never overlap after
     /// [`layout`](Dashboard::layout), so order only breaks ties on empty space.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
         self.left
             .iter()
@@ -1179,6 +1226,7 @@ impl Dashboard {
     /// rather than offering the pixel to every widget once per question. Slots
     /// never overlap after [`layout`](Dashboard::layout), and a widget's
     /// interactive regions lie inside its slot.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn hover_at(&self, px: u32, py: u32) -> Hover {
         let Some(widget) = self
             .widgets()
@@ -1194,6 +1242,7 @@ impl Dashboard {
     }
 
     /// Route one logical scroll step to the widget under the pointer.
+    #[hotpath::measure(impl_type = "Dashboard")]
     pub fn on_scroll(&self, px: u32, py: u32, direction: ScrollDirection) -> Option<Command> {
         self.left
             .iter()
@@ -1206,6 +1255,7 @@ impl Dashboard {
 /// Measure every widget in `widgets` against the inner pill `height`, returning a
 /// width per widget (parallel to the slice). A width of zero means the widget has
 /// nothing to show and should reserve no slot.
+#[hotpath::measure]
 fn measure_zone(widgets: &[Box<dyn Widget>], ctx: &mut RenderContext, height: u32) -> Vec<u32> {
     let mut widths = Vec::with_capacity(widgets.len());
     for widget in widgets {
@@ -1577,6 +1627,44 @@ mod tests {
         assert_eq!(frame(&mut dash, &mut ctx).0, Damage::Full);
     }
 
+    /// Repainting just the damage over the previous frame yields exactly the
+    /// pixels a full repaint does, on opaque and translucent bars alike.
+    #[test]
+    fn a_damage_limited_repaint_matches_a_full_repaint() {
+        for background in [(0x18, 0x18, 0x18, 0xFF), (0x10, 0x20, 0x30, 0x80)] {
+            let settings = crate::render::RenderSettings {
+                background,
+                ..crate::render::RenderSettings::default()
+            };
+            let (mut dash, _) = workspaces_and_clock();
+            let mut ctx = RenderContext::with_settings(400, 32, settings.clone());
+            frame(&mut dash, &mut ctx);
+
+            assert!(dash.update(&Msg::Workspaces(Workspaces::new([1, 2], 2))));
+            dash.layout(&mut ctx, 400, 32);
+            let damage = dash.take_damage();
+            let repainted = dash.draw_damage(&mut ctx, damage);
+            assert!(
+                matches!(repainted, Damage::Region(region) if region.width < 400),
+                "only part of the bar is repainted: {repainted:?}"
+            );
+
+            let mut full = RenderContext::with_settings(400, 32, settings);
+            dash.layout(&mut full, 400, 32);
+            dash.draw(&mut full);
+            assert!(ctx.pixels() == full.pixels(), "partial repaint differs");
+        }
+    }
+
+    #[test]
+    fn damage_union_widens_regions_and_full_absorbs() {
+        let a = Damage::Region(Bounds::new(0, 0, 10, 10));
+        let b = Damage::Region(Bounds::new(20, 0, 10, 10));
+        assert_eq!(a.union(b), Damage::Region(Bounds::new(0, 0, 30, 10)));
+        assert_eq!(a.union(Damage::Full), Damage::Full);
+        assert_eq!(Damage::Full.union(b), Damage::Full);
+    }
+
     #[test]
     fn bounds_union_covers_both_rectangles() {
         let a = Bounds::new(10, 4, 20, 8);
@@ -1626,7 +1714,7 @@ mod tests {
         let paint = |dash: &mut Dashboard, ctx: &mut RenderContext| {
             dash.layout(ctx, WIDTH, HEIGHT);
             let damage = dash.take_damage();
-            dash.draw(ctx);
+            dash.draw_damage(ctx, damage);
             (damage, ctx.pixels().to_vec())
         };
         let (_, before) = paint(&mut dash, &mut ctx);
@@ -1650,5 +1738,11 @@ mod tests {
             outside.is_empty(),
             "styled workspace pixels outside {region:?}: {outside:?}"
         );
+
+        // The partial repaint left exactly what a full repaint paints.
+        let mut full = RenderContext::with_settings(WIDTH, HEIGHT, ctx.settings().clone());
+        dash.layout(&mut full, WIDTH, HEIGHT);
+        dash.draw(&mut full);
+        assert!(after == full.pixels(), "partial repaint differs");
     }
 }

@@ -239,6 +239,7 @@ impl ConfigWatcher {
     }
 
     /// Explicit requests bypass debounce, but still reject incomplete or mixed reads.
+    #[hotpath::measure(impl_type = "ConfigWatcher")]
     pub(crate) fn reload_now(&mut self) -> Result<Config, ConfigError> {
         let before = self.snapshot();
         let config = Config::load_for_reload(&self.path)?;
@@ -261,6 +262,7 @@ impl ConfigWatcher {
 
     /// Returns a fully validated candidate only after a stable 400ms interval.
     /// The caller replaces UI state only on Ok; errors are emitted once per edit.
+    #[hotpath::measure(impl_type = "ConfigWatcher")]
     pub(crate) fn poll(&mut self, now: Instant) -> Option<Result<Config, ConfigError>> {
         // Before looking: a directory event may mean a missing directory now
         // exists or a symlink moved, without any watched file changing yet.

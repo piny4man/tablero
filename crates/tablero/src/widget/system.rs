@@ -163,6 +163,7 @@ impl Widget for SystemWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "SystemWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // Before the first sample the template is empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
@@ -186,6 +187,7 @@ impl Widget for SystemWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "SystemWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }

@@ -18,6 +18,7 @@ pub mod blit;
 pub mod clock;
 pub mod config;
 mod config_reload;
+mod fallback;
 pub mod icon;
 pub mod lifecycle;
 mod performance;
@@ -48,7 +49,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::blit::write_argb8888;
+use crate::blit::{write_argb8888, write_argb8888_region};
 use crate::clock::millis_until_next_minute;
 use crate::config::{Config, WidgetKind};
 use crate::redraw::RedrawScheduler;
@@ -179,6 +180,9 @@ struct Surface {
     buffer_px: (u32, u32),
     /// Next double-buffer index to try (0 or 1).
     next_buffer: usize,
+    /// What each SHM slot still lacks of the render target, so a frame copies
+    /// only that instead of the whole bar.
+    stale: StaleBuffers,
     /// When diagnostics are enabled, the start of the previous painted frame.
     last_frame: Option<Instant>,
     /// Set once the first configure has been received; drawing before that is
@@ -261,6 +265,7 @@ impl Surface {
             buffers: [None, None],
             buffer_px: (0, 0),
             next_buffer: 0,
+            stale: StaleBuffers::default(),
             last_frame: None,
             configured: false,
             presented: false,
@@ -274,6 +279,7 @@ impl Surface {
     ///
     /// `seed` is replayed into the fresh dashboard so widgets keep the last
     /// producer snapshot instead of going blank until the next event.
+    #[hotpath::measure(impl_type = "Surface")]
     fn apply_config(&mut self, config: Config, seed: &[Msg]) {
         let height = config.height;
         let height_changed = self.height != height;
@@ -316,6 +322,7 @@ impl Surface {
     /// reported a visible change. This is the steady-state redraw policy: the
     /// loop stays idle when an update changes nothing on screen, and a burst of
     /// changes shares the one frame [`Surface::flush`] paints.
+    #[hotpath::measure(impl_type = "Surface")]
     fn handle(&mut self, msg: &Msg) -> bool {
         let changed = self.dashboard.update(msg);
         if changed {
@@ -422,6 +429,7 @@ impl Surface {
     ///
     /// Uses two alternating SHM slots: when the compositor has released the
     /// next slot, its mmap is reused instead of allocating a new one.
+    #[hotpath::measure(impl_type = "Surface")]
     fn draw(&mut self, pool: &mut SlotPool, cause: &'static str) -> bool {
         let started = self.performance.start();
 
@@ -447,7 +455,7 @@ impl Surface {
 
         let timings = if can_reuse {
             match pool.canvas(self.buffers[idx].as_ref().unwrap()) {
-                Some(canvas) => Some(self.paint_frame(canvas, width, height)),
+                Some(canvas) => Some(self.paint_frame(canvas, idx, width, height)),
                 None => {
                     // Race: became active between the check and canvas(). Allocate.
                     self.paint_new_buffer(pool, idx, width, height, stride)
@@ -489,7 +497,14 @@ impl Surface {
         committed
     }
 
-    fn paint_frame(&mut self, canvas: &mut [u8], width: u32, height: u32) -> FrameTimings {
+    #[hotpath::measure(impl_type = "Surface")]
+    fn paint_frame(
+        &mut self,
+        canvas: &mut [u8],
+        idx: usize,
+        width: u32,
+        height: u32,
+    ) -> FrameTimings {
         let started = self.performance.start();
         // Zero for a surface's first frame, so its counters are still logged.
         let idle_gap = started.map(|now| {
@@ -504,12 +519,21 @@ impl Surface {
         let damage = self.dashboard.take_damage();
         let layout = phase_started.map(|started| started.elapsed());
 
+        // The render target still holds the previous frame, so only the damage
+        // is repainted, and each slot receives only what it has not yet shown.
         let phase_started = self.performance.start();
-        self.dashboard.draw(&mut self.ctx);
+        let repainted = self.dashboard.draw_damage(&mut self.ctx, damage);
+        self.stale.record(repainted);
         let draw = phase_started.map(|started| started.elapsed());
 
         let phase_started = self.performance.start();
-        write_argb8888(self.ctx.pixels(), canvas);
+        match self.stale.take(idx) {
+            Some(Damage::Full) => write_argb8888(self.ctx.pixels(), canvas),
+            Some(Damage::Region(region)) => {
+                write_argb8888_region(self.ctx.pixels(), canvas, width, region);
+            }
+            None => {}
+        }
         let blit = phase_started.map(|started| started.elapsed());
         let render = started.map(|started| started.elapsed());
         FrameTimings {
@@ -558,6 +582,7 @@ impl Surface {
         );
     }
 
+    #[hotpath::measure(impl_type = "Surface")]
     fn paint_new_buffer(
         &mut self,
         pool: &mut SlotPool,
@@ -578,15 +603,17 @@ impl Surface {
                 return None;
             }
         };
-        let timings = self.paint_frame(canvas, width, height);
+        self.stale.reset(idx);
+        let timings = self.paint_frame(canvas, idx, width, height);
         self.buffers[idx] = Some(buffer);
         Some(timings)
     }
 
     /// Attach slot `idx` and commit it, damaging only what `damage` covers so the
-    /// compositor re-composites (and re-blurs) just that part of the strip. The
-    /// buffer itself is always painted in full, so either slot is a complete
-    /// frame whichever the compositor shows.
+    /// compositor re-composites (and re-blurs) just that part of the strip.
+    /// [`StaleBuffers`] keeps either slot a complete frame whichever the
+    /// compositor shows.
+    #[hotpath::measure(impl_type = "Surface")]
     fn commit_buffer(&mut self, idx: usize, width: u32, height: u32, damage: Damage) -> bool {
         let Some(buffer) = self.buffers[idx].as_ref() else {
             return false;
@@ -606,6 +633,39 @@ impl Surface {
         self.layer.commit();
         self.redraw.committed(Instant::now());
         true
+    }
+}
+
+/// What each of a surface's two SHM slots is missing relative to the render
+/// target: a slot shown to the compositor last frame missed this frame's
+/// damage, and the other slot also missed the frame before. `None` means the
+/// slot is current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaleBuffers([Option<Damage>; 2]);
+
+impl Default for StaleBuffers {
+    fn default() -> Self {
+        Self([Some(Damage::Full); 2])
+    }
+}
+
+impl StaleBuffers {
+    /// The render target changed by `damage`; neither slot shows it yet.
+    fn record(&mut self, damage: Damage) {
+        for slot in &mut self.0 {
+            *slot = Some(slot.map_or(damage, |missed| missed.union(damage)));
+        }
+    }
+
+    /// Slot `idx` is a fresh (or unknown) buffer: it is missing everything.
+    fn reset(&mut self, idx: usize) {
+        self.0[idx] = Some(Damage::Full);
+    }
+
+    /// What must be copied into slot `idx` to make it current; it is current
+    /// afterwards.
+    fn take(&mut self, idx: usize) -> Option<Damage> {
+        self.0[idx].take()
     }
 }
 
@@ -760,6 +820,7 @@ impl TrayMenuSurface {
         })
     }
 
+    #[hotpath::measure(impl_type = "TrayMenuSurface")]
     fn update(&mut self, menu: &TrayMenu, pool: &mut SlotPool) -> bool {
         if menu.revision < self.revision {
             return true;
@@ -779,6 +840,7 @@ impl TrayMenuSurface {
         true
     }
 
+    #[hotpath::measure(impl_type = "TrayMenuSurface")]
     fn draw(&mut self, pool: &mut SlotPool) {
         if !self.configured {
             return;
@@ -900,6 +962,7 @@ impl TooltipSurface {
         self.popup.wl_surface() == surface
     }
 
+    #[hotpath::measure(impl_type = "TooltipSurface")]
     fn draw(&mut self, pool: &mut SlotPool) {
         if !self.configured {
             return;
@@ -949,6 +1012,7 @@ impl TooltipSurface {
 }
 
 /// Paint a tooltip panel of physical `size` holding `text` into `ctx`.
+#[hotpath::measure]
 fn paint_tooltip(
     ctx: &mut RenderContext,
     text: &str,
@@ -1082,6 +1146,7 @@ struct ProducerSnapshot {
     messages: Vec<Msg>,
 }
 
+#[hotpath::measure]
 fn replay_snapshot(dashboard: &mut Dashboard, seed: &[Msg]) {
     for msg in seed {
         let _ = dashboard.update(msg);
@@ -1090,6 +1155,7 @@ fn replay_snapshot(dashboard: &mut Dashboard, seed: &[Msg]) {
 }
 
 impl ProducerSnapshot {
+    #[hotpath::measure(impl_type = "ProducerSnapshot")]
     fn note(&mut self, msg: &Msg) {
         if matches!(
             msg,
@@ -1175,6 +1241,7 @@ impl App {
     /// for an output we already show never rebuilds or replaces its surface. The
     /// connector name selects the output's resolved config and scopes its
     /// workspace widget to that monitor.
+    #[hotpath::measure(impl_type = "App")]
     fn add_output(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<App>) {
         let id = output_key(&output);
         let name = self.output_state.info(&output).and_then(|info| info.name);
@@ -1219,6 +1286,7 @@ impl App {
     ///
     /// Producers already running stay as-is; newly required modules need a
     /// process restart. Invalid files are logged and ignored by the watcher.
+    #[hotpath::measure(impl_type = "App")]
     fn reload_config(&mut self, config: Config) {
         self.outputs.set_base(config);
         self.hide_tooltip();
@@ -1282,6 +1350,7 @@ impl App {
     /// Fan a message out to every output's dashboard; the ones that changed
     /// repaint at the next [`App::flush_redraws`]. The clock timer and every
     /// producer reach all bars this way.
+    #[hotpath::measure(impl_type = "App")]
     fn handle_all(&mut self, msg: &Msg) {
         self.producer_snapshot.note(msg);
         let mut changed = false;
@@ -1306,6 +1375,7 @@ impl App {
 
     /// Paint every bar with a repaint pending. Runs once per loop dispatch, after
     /// all of that dispatch's messages and Wayland events have been applied.
+    #[hotpath::measure(impl_type = "App")]
     fn flush_redraws(&mut self) {
         let App { pool, outputs, .. } = self;
         let mut committed = false;
@@ -1367,6 +1437,7 @@ impl App {
         }
     }
 
+    #[hotpath::measure(impl_type = "App")]
     fn handle_message(&mut self, msg: &Msg, qh: &QueueHandle<App>) {
         if let Msg::TrayMenu(menu) = msg {
             if let Some(shown) = self
@@ -1436,6 +1507,7 @@ impl App {
 
     /// Show `tooltip` under the bar on `output_id`, or hide the current one when
     /// the pointer is over nothing that has one.
+    #[hotpath::measure(impl_type = "App")]
     fn update_tooltip(
         &mut self,
         output_id: OutputId,
@@ -1528,6 +1600,7 @@ impl App {
         });
     }
 
+    #[hotpath::measure(impl_type = "App")]
     fn show_tray_menu(&mut self, menu: &TrayMenu, qh: &QueueHandle<App>) {
         let Some(pending) = self
             .pending_tray_menu
@@ -2261,6 +2334,7 @@ impl SeatHandler for App {
 }
 
 impl PointerHandler for App {
+    #[hotpath::measure(impl_type = "App")]
     fn pointer_frame(
         &mut self,
         conn: &Connection,
@@ -2751,6 +2825,30 @@ mod scroll_tests {
             popup_background((0x30, 0x32, 0x38, 0xD0)),
             (0x30, 0x32, 0x38, 0xF0)
         );
+    }
+
+    #[test]
+    fn each_buffer_slot_receives_the_damage_it_missed() {
+        let a = Damage::Region(Bounds::new(0, 0, 10, 10));
+        let b = Damage::Region(Bounds::new(30, 0, 10, 10));
+        let mut stale = StaleBuffers::default();
+
+        // Both slots start empty, so each gets one full copy.
+        stale.record(Damage::Full);
+        assert_eq!(stale.take(0), Some(Damage::Full));
+        stale.record(a);
+        assert_eq!(stale.take(1), Some(Damage::Full));
+        // Slot 0 missed `a` and now `b`; slot 1 only `b`.
+        stale.record(b);
+        assert_eq!(stale.take(0), Some(a.union(b)));
+        stale.record(a);
+        assert_eq!(stale.take(1), Some(b.union(a)));
+        // A frame that changes nothing leaves a current slot with nothing to copy.
+        assert_eq!(stale.take(1), None);
+
+        // A replaced buffer starts over.
+        stale.reset(0);
+        assert_eq!(stale.take(0), Some(Damage::Full));
     }
 
     #[test]

@@ -144,6 +144,7 @@ pub fn detect_platform(sys_root: &Path) -> Option<PlatformKind> {
 
 /// Read the hardware profile for a previously detected backend. Missing or
 /// unparseable sysfs falls back to `None` so the caller can keep PPD's value.
+#[hotpath::measure]
 pub fn read_platform_profile(sys_root: &Path, kind: PlatformKind) -> Option<&'static str> {
     match kind {
         PlatformKind::Qc71 => {
@@ -159,6 +160,7 @@ pub fn read_platform_profile(sys_root: &Path, kind: PlatformKind) -> Option<&'st
 /// Hardware wins for the *active* profile when it can be parsed. The daemon's
 /// advertised list is kept for click rotation. Machines with neither source
 /// yield `None`, matching the existing hidden-widget behaviour.
+#[hotpath::measure]
 pub fn overlay_snapshot(
     ppd: Option<PowerProfilesState>,
     hardware: Option<&str>,
@@ -222,6 +224,7 @@ fn default_helper_names(kind: PlatformKind) -> &'static [&'static str] {
 }
 
 /// Run the privileged helper with the profile name. Never writes sysfs itself.
+#[hotpath::measure]
 pub async fn apply_platform_profile(
     profile: &str,
     kind: PlatformKind,

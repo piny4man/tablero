@@ -53,6 +53,8 @@ RUST_LOG=info cargo run -p tablero
 
 For opt-in render and interaction timing, including the balanced-vs-performance
 A/B procedure and baseline, see [Interaction latency diagnostics](docs/interaction-latency.md).
+For a per-function timing and allocation breakdown (`--features hotpath`), and the
+latest findings, see [Profiling with hotpath](docs/hotpath-profiling.md).
 
 ## Reload, restart, and development instances
 

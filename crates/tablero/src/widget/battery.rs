@@ -261,6 +261,7 @@ impl Widget for BatteryWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "BatteryWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // An absent battery draws nothing: the dashboard has already cleared the
         // background, so the widget's slot is left blank.
@@ -276,6 +277,7 @@ impl Widget for BatteryWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "BatteryWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         match self.state {
             Some(battery) => {

@@ -55,6 +55,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all
 
+      # Clippy above already lints the profiling build via --all-features; this
+      # runs the suite with it too, including tests/hotpath_profile.rs and tests/alloc_budget.rs.
+      - name: Run tests with hotpath profiling
+        run: cargo test --locked -p tablero --features hotpath,hotpath-alloc
+
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings

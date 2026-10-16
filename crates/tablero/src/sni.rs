@@ -23,7 +23,9 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use hotpath::wrap::std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::future::{Either, select};
@@ -69,6 +71,7 @@ type RawPixmap = (i32, i32, Vec<u8>);
 type RawMenuLayout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
 
 /// Normalize one recursive DBusMenu layout node.
+#[hotpath::measure]
 pub fn parse_menu_layout(value: OwnedValue) -> Option<TrayMenuItem> {
     let (id, properties, children): RawMenuLayout = value.try_into().ok()?;
     parse_raw_menu_layout((id, properties, children))
@@ -237,6 +240,7 @@ fn absolute_icon_prefix_ok(path: &Path) -> bool {
 /// directory is probed for `<name>.png`, and the first hit wins. Names with
 /// path separators or `..` are rejected. Returns `None` when nothing matches,
 /// so a name the theme cannot satisfy degrades to no icon rather than an error.
+#[hotpath::measure]
 pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() {
@@ -260,6 +264,7 @@ pub fn find_icon_file(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Read an icon file if it exists and stays under [`MAX_ICON_FILE_BYTES`].
+#[hotpath::measure]
 async fn read_icon_file(path: &Path) -> Option<Vec<u8>> {
     let meta = tokio::fs::metadata(path).await.ok()?;
     if !meta.is_file() || meta.len() > MAX_ICON_FILE_BYTES {
@@ -322,6 +327,7 @@ pub fn menu_mode(menu_path: Option<&str>, item_is_menu: Option<bool>) -> TrayMen
 /// source uses it; one that ships neither yields `None` and shows its initial.
 ///
 /// The PNG read is async so it never blocks the single-worker producer runtime.
+#[hotpath::measure]
 async fn resolve_icon(
     icon_name: &str,
     pixmaps: &[RawPixmap],
@@ -335,6 +341,7 @@ async fn resolve_icon(
 /// Resolve `icon_name` against the item's `IconThemePath` and the standard system
 /// icon directories, decoding the first match. Any failure along the way (no
 /// file, unreadable, undecodable) yields `None`.
+#[hotpath::measure]
 async fn resolve_themed_icon(icon_name: &str, theme_path: &str) -> Option<TrayIcon> {
     let dirs = icon_search_dirs(theme_path);
     let file = find_icon_file(icon_name, &dirs)?;
@@ -394,6 +401,41 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
     dirs
 }
 
+/// The `IconPixmap` variant in a `Properties.Get` reply, decoded straight into
+/// its concrete type.
+#[derive(serde::Deserialize, zbus::zvariant::Type)]
+#[zvariant(signature = "v")]
+struct IconPixmapReply(#[serde(with = "zbus::zvariant::as_value")] Vec<RawPixmap>);
+
+/// Decode an `IconPixmap` `Properties.Get` reply.
+///
+/// Read through zbus's dynamic `OwnedValue` (as a `#[zbus(property)]` getter or
+/// the proxy property cache would), every pixel byte becomes its own value: a
+/// 256 KB pixmap allocated ~66 MB. Decoded typed it costs about its own size.
+#[hotpath::measure]
+pub fn decode_icon_pixmap(reply: &zbus::Message) -> Option<Vec<(i32, i32, Vec<u8>)>> {
+    reply
+        .body()
+        .deserialize::<IconPixmapReply>()
+        .ok()
+        .map(|reply| reply.0)
+}
+
+/// An item's `IconPixmap`, or none when it has none or the read fails.
+async fn read_icon_pixmap(conn: &Connection, name: &str, path: &str) -> Vec<RawPixmap> {
+    conn.call_method(
+        Some(name),
+        path,
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &("org.kde.StatusNotifierItem", "IconPixmap"),
+    )
+    .await
+    .ok()
+    .and_then(|reply| decode_icon_pixmap(&reply))
+    .unwrap_or_default()
+}
+
 /// The host's view of a single registered item, read fresh from its proxy.
 ///
 /// `Id` is mandatory and doubles as a liveness check: once the item's bus owner
@@ -405,6 +447,7 @@ fn icon_search_dirs(theme_path: &str) -> Vec<PathBuf> {
 /// never replies is treated as unreadable, exactly like a fast failure — the
 /// cached item is retained and the read is retried, so one hung peer can never
 /// park the producer.
+#[hotpath::measure]
 async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
     match tokio::time::timeout(CALL_TIMEOUT, read_item_props(conn, key)).await {
         Ok(item) => item,
@@ -417,25 +460,40 @@ async fn read_item(conn: &Connection, key: &str) -> Option<TrayItem> {
 
 /// The raw, unbounded property read behind [`read_item`]; separated so the
 /// caller can apply the timeout.
+#[hotpath::measure]
 async fn read_item_props(conn: &Connection, key: &str) -> Option<TrayItem> {
     let (name, path) = parse_item_address(key)?;
+    // Uncached: the cache is filled by `GetAll`, which would decode the pixmap
+    // through dynamic values (see `decode_icon_pixmap`).
     let item = StatusNotifierItemProxy::builder(conn)
-        .destination(name)
+        .destination(name.as_str())
         .ok()?
-        .path(path)
+        .path(path.as_str())
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
 
-    let id = item.id().await.ok()?;
-    let title = item.title().await.unwrap_or_default();
-    let status = item.status().await.unwrap_or_default();
-    let icon_name = item.icon_name().await.unwrap_or_default();
-    let theme_path = item.icon_theme_path().await.unwrap_or_default();
-    let pixmaps = item.icon_pixmap().await.unwrap_or_default();
-    let menu = item.menu().await.ok();
-    let item_is_menu = item.item_is_menu().await.ok();
+    // Each property is now its own call; issue them together.
+    let ((id, title, status, icon_name), (theme_path, pixmaps, menu, item_is_menu)) =
+        futures_util::future::join(
+            futures_util::future::join4(item.id(), item.title(), item.status(), item.icon_name()),
+            futures_util::future::join4(
+                item.icon_theme_path(),
+                read_icon_pixmap(conn, &name, &path),
+                item.menu(),
+                item.item_is_menu(),
+            ),
+        )
+        .await;
+    let id = id.ok()?;
+    let title = title.unwrap_or_default();
+    let status = status.unwrap_or_default();
+    let icon_name = icon_name.unwrap_or_default();
+    let theme_path = theme_path.unwrap_or_default();
+    let menu = menu.ok();
+    let item_is_menu = item_is_menu.ok();
 
     let icon = resolve_icon(&icon_name, &pixmaps, &theme_path).await;
     let mode = menu_mode(menu.as_deref().map(|path| path.as_str()), item_is_menu);
@@ -472,6 +530,7 @@ async fn reconcile_state(
 /// Watcher membership is authoritative for removal. A failed property read for
 /// an address that is still registered retains its cached item and requests a
 /// retry, preventing one transient DBus error from clearing the whole tray.
+#[hotpath::measure]
 fn reconcile_items(
     items: &mut HashMap<String, TrayItem>,
     addresses: &[String],
@@ -772,6 +831,7 @@ async fn exported_item_address(conn: &Connection, name: &str) -> Option<String> 
     Some(format!("{name}{path}"))
 }
 
+#[hotpath::measure]
 async fn introspect_path(conn: &Connection, name: &str, path: &str) -> Option<String> {
     let proxy = zbus::fdo::IntrospectableProxy::builder(conn)
         .destination(name)
@@ -926,10 +986,6 @@ trait StatusNotifierItem {
     #[zbus(property)]
     fn icon_theme_path(&self) -> zbus::Result<String>;
 
-    /// Embedded ARGB32 icon data at one or more sizes.
-    #[zbus(property)]
-    fn icon_pixmap(&self) -> zbus::Result<Vec<RawPixmap>>;
-
     /// Object path implementing `com.canonical.dbusmenu`.
     #[zbus(property)]
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
@@ -1031,8 +1087,14 @@ impl Producer for SniHostProducer {
 /// watcher purely through its proxy.
 async fn ensure_watcher(conn: &Connection) -> zbus::Result<()> {
     let watcher = Watcher {
-        items: Arc::new(Mutex::new(HashSet::new())),
-        host_registered: Arc::new(Mutex::new(false)),
+        items: Arc::new(hotpath::mutex!(
+            std::sync::Mutex::new(HashSet::new()),
+            label = "sni-items".to_owned()
+        )),
+        host_registered: Arc::new(hotpath::mutex!(
+            std::sync::Mutex::new(false),
+            label = "sni-host-registered".to_owned()
+        )),
     };
     conn.object_server().at(WATCHER_PATH, watcher).await?;
     let reply = conn
@@ -1304,11 +1366,13 @@ async fn item_change_stream(
     address: &str,
 ) -> Option<futures_util::stream::BoxStream<'static, ()>> {
     let (name, path) = parse_item_address(address)?;
+    // Only its signals are used; never cache (and so decode) its properties.
     let item = StatusNotifierItemProxy::builder(conn)
         .destination(name.clone())
         .ok()?
         .path(path)
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
@@ -1434,9 +1498,11 @@ async fn item_proxy<'a>(
 ) -> zbus::Result<StatusNotifierItemProxy<'a>> {
     let (name, path) = parse_item_address(key)
         .ok_or_else(|| zbus::Error::Failure(format!("bad address {key}")))?;
+    // Uncached so a click never pulls (and decodes) the pixmap via GetAll.
     StatusNotifierItemProxy::builder(conn)
         .destination(name)?
         .path(path)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
 }
@@ -1462,6 +1528,7 @@ async fn menu_proxy<'a>(
     ))
 }
 
+#[hotpath::measure]
 async fn open_menu(
     conn: &Connection,
     updates: &MsgSender,
@@ -1494,6 +1561,7 @@ async fn context_menu_fallback(
     result
 }
 
+#[hotpath::measure]
 async fn send_menu_layout(
     menu: &DBusMenuProxy<'_>,
     updates: &MsgSender,
@@ -1566,6 +1634,7 @@ async fn monitor_menu(conn: Connection, updates: MsgSender, key: String) -> zbus
     Ok(())
 }
 
+#[hotpath::measure]
 async fn activate_menu_item(conn: &Connection, key: &str, id: i32) -> zbus::Result<()> {
     let Some(menu) = menu_proxy(conn, key).await? else {
         return Ok(());
@@ -1625,7 +1694,7 @@ mod tests {
     #[test]
     fn owner_loss_allows_the_same_item_address_to_register_again() {
         let address = "org.example.Tray/StatusNotifierItem";
-        let items = Mutex::new(HashSet::from([address.to_string()]));
+        let items = hotpath::mutex!(std::sync::Mutex::new(HashSet::from([address.to_string()])));
 
         assert!(remove_registered_item(&items, address));
         assert!(items.lock().unwrap().insert(address.to_string()));
@@ -2039,6 +2108,57 @@ mod tests {
             .build()
             .await
             .expect("connection to private bus")
+    }
+
+    /// An item that ships only an embedded pixmap.
+    struct PixmapItem;
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl PixmapItem {
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "pixmap"
+        }
+
+        #[zbus(property)]
+        fn icon_pixmap(&self) -> Vec<RawPixmap> {
+            vec![
+                (1, 1, vec![255, 255, 0, 0]),
+                (2, 1, vec![255, 0, 255, 0, 255, 0, 0, 255]),
+            ]
+        }
+    }
+
+    /// The typed `IconPixmap` read (see `decode_icon_pixmap`) still turns a
+    /// live item's largest pixmap into its icon.
+    #[test]
+    fn a_live_item_pixmap_becomes_its_icon() {
+        let Some(bus) = PrivateBus::spawn() else {
+            eprintln!("skipping: dbus-daemon is not available");
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let app = connect(&bus.address).await;
+                app.object_server()
+                    .at(DEFAULT_ITEM_PATH, PixmapItem)
+                    .await
+                    .unwrap();
+                let key = format!(
+                    "{}{DEFAULT_ITEM_PATH}",
+                    app.unique_name().expect("unique name")
+                );
+                let host = connect(&bus.address).await;
+
+                let item = read_item_props(&host, &key)
+                    .await
+                    .expect("item is readable");
+                let icon = item.icon().expect("the pixmap becomes the icon");
+                assert_eq!((icon.width(), icon.height()), (2, 1));
+            });
     }
 
     /// Regression test for the frozen tray: membership read through the

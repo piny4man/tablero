@@ -195,6 +195,7 @@ impl Widget for BluetoothWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "BluetoothWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // Always draws: the initial Unavailable state still has a non-empty
         // label, so the slot is reserved from the very first frame.
@@ -208,6 +209,7 @@ impl Widget for BluetoothWidget {
         );
     }
 
+    #[hotpath::measure(impl_type = "BluetoothWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         measure_icon_content(ctx, &self.style, &self.icon(), &self.template())
     }

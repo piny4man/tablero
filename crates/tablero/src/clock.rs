@@ -9,6 +9,7 @@ pub fn format_time(now: DateTime<Local>) -> String {
 }
 
 /// Format the current local time as "HH:MM".
+#[hotpath::measure]
 pub fn format_clock() -> String {
     format_time(Local::now())
 }

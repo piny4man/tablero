@@ -226,6 +226,7 @@ impl Widget for NetworkWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "NetworkWidget")]
     fn draw(&self, ctx: &mut RenderContext) {
         // An unavailable network leaves the template empty, so the pill paints
         // nothing: the dashboard has already cleared the background.
@@ -241,6 +242,7 @@ impl Widget for NetworkWidget {
         }
     }
 
+    #[hotpath::measure(impl_type = "NetworkWidget")]
     fn measure(&self, ctx: &mut RenderContext, _height: u32) -> u32 {
         match &self.state {
             Some(network) => {

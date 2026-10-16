@@ -85,8 +85,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+
+use hotpath::wrap::std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -263,6 +265,7 @@ pub fn is_audio_sink(props: &DictRef) -> bool {
 /// by their name and returns the id of the first one — a deterministic
 /// tiebreak that is independent of registry iteration order. Returns
 /// `None` when no candidate is running.
+#[hotpath::measure]
 pub fn pick_active_sink_id(candidates: &[(u32, &str, bool)]) -> Option<u32> {
     candidates
         .iter()
@@ -317,6 +320,7 @@ pub struct PropsUpdate {
 /// `channelVolumes`, applies `cbrt` to recover the user-volume in
 /// `[0, 1]`, clamps to `[0, 1]`, and returns that — so the widget shows
 /// the same number pactl / waybar do.
+#[hotpath::measure]
 pub fn parse_props_pod(pod_bytes: &[u8]) -> Option<PropsUpdate> {
     use pipewire::spa::pod::Value;
     use pipewire::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
@@ -686,7 +690,10 @@ fn run_main_loop(tx: &Emitter, period: Duration, handshook: &Rc<Cell<bool>>) -> 
     // The state is shared by the periodic timer (the safety-net poll) AND
     // by the per-sink / metadata listeners (instant feedback on every
     // PipeWire event).
-    let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
+    let state: Arc<Mutex<State>> = Arc::new(hotpath::mutex!(
+        std::sync::Mutex::new(State::default()),
+        label = "volume-state".to_owned()
+    ));
     let state_for_timer = state.clone();
     let tx_for_timer = tx.clone();
 
@@ -784,6 +791,7 @@ struct State {
 /// changed. Without this, a `Msg::Volume` that never reached the render loop
 /// leaves the widget blank until the volume physically changes, because
 /// `last_emitted` is written on send rather than on delivery.
+#[hotpath::measure]
 fn on_poll_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
     {
         let mut s = state.lock().expect("volume state poisoned");
@@ -803,6 +811,7 @@ fn on_poll_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
 /// mute, or device kind) or when the source goes from absent to present (or
 /// vice versa). Identical snapshots are dropped, so a steady-state machine
 /// costs one PipeWire event and zero render-loop work per tick.
+#[hotpath::measure]
 fn on_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
     let snapshot = compute_snapshot(state);
     let changed = {
@@ -847,6 +856,7 @@ fn on_tick(state: &Arc<Mutex<State>>, tx: &Emitter) {
 /// `Vol 0%` and back once the real reading lands. A sink that reported a volume
 /// but no mute flag yet renders as unmuted rather than staying invisible —
 /// PipeWire may push the two in separate PODs.
+#[hotpath::measure]
 fn compute_snapshot(state: &Arc<Mutex<State>>) -> Option<Volume> {
     let state = state.lock().expect("volume state poisoned");
     let sinks = &state.sinks;
@@ -1575,7 +1585,7 @@ mod tests {
 
     #[test]
     fn compute_snapshot_returns_none_for_no_sinks() {
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(hotpath::mutex!(std::sync::Mutex::new(State::default())));
         assert!(compute_snapshot(&state).is_none());
     }
 
@@ -1602,7 +1612,7 @@ mod tests {
                 muted: Some(true),
             },
         );
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(hotpath::mutex!(std::sync::Mutex::new(state)));
         let snap = compute_snapshot(&state).expect("snapshot");
         assert_eq!(snap.level(), 50);
         assert!(!snap.muted());
@@ -1633,7 +1643,7 @@ mod tests {
             },
         );
         state.default_sink_name = Some("speakers".to_string());
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(hotpath::mutex!(std::sync::Mutex::new(state)));
         let snap = compute_snapshot(&state).expect("snapshot");
         // The default-sink path is what wins when no sink is running.
         assert_eq!(snap.device(), DeviceKind::Speakers);
@@ -1655,7 +1665,7 @@ mod tests {
                 muted: None,
             },
         );
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(hotpath::mutex!(std::sync::Mutex::new(state)));
         assert!(compute_snapshot(&state).is_none());
     }
 
@@ -1675,7 +1685,7 @@ mod tests {
                 muted: None,
             },
         );
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(hotpath::mutex!(std::sync::Mutex::new(state)));
         let snap = compute_snapshot(&state).expect("snapshot");
         assert_eq!(snap.level(), 42);
         assert!(!snap.muted());
