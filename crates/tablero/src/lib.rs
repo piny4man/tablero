@@ -2559,6 +2559,12 @@ fn scroll_directions(
         // Continuous devices report pixels; ten pixels is one deliberate step.
         vertical.absolute / 10.0
     };
+    // Under natural scrolling the compositor flips the axis and flags it;
+    // undo the flip so a slider follows the fingers, as GTK does.
+    let delta = match vertical.relative_direction {
+        Some(wl_pointer::AxisRelativeDirection::Inverted) => -delta,
+        _ => delta,
+    };
     *remainder += delta;
     let mut directions = Vec::new();
     while *remainder >= 1.0 {
@@ -2756,6 +2762,26 @@ mod scroll_tests {
                 },
                 &mut remainder,
             ),
+            vec![ScrollDirection::Decrease]
+        );
+    }
+
+    #[test]
+    fn natural_scrolling_follows_the_fingers() {
+        // With natural scrolling the compositor inverts the axis and says so;
+        // a slider follows the physical motion, as GTK does.
+        let mut remainder = 0.0;
+        let inverted = |value120| AxisScroll {
+            value120,
+            relative_direction: Some(wl_pointer::AxisRelativeDirection::Inverted),
+            ..AxisScroll::default()
+        };
+        assert_eq!(
+            scroll_directions(inverted(120), &mut remainder),
+            vec![ScrollDirection::Increase]
+        );
+        assert_eq!(
+            scroll_directions(inverted(-120), &mut remainder),
             vec![ScrollDirection::Decrease]
         );
     }

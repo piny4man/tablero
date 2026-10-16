@@ -515,6 +515,9 @@ pub struct WidgetStyle {
     pub padding: u32,
     /// Which glyph to draw before the label.
     pub icon: IconSetting,
+    /// Icon size in logical pixels: the built-in icon's edge, or a text
+    /// glyph's font size. `None` follows the bar font size.
+    pub icon_size: Option<u32>,
     /// Percent below which a discharging battery uses [`warn`](WidgetStyle::warn).
     pub warn_threshold: u32,
     /// Colors for a low/warning state (e.g. low battery).
@@ -538,6 +541,7 @@ impl Default for WidgetStyle {
             radius: DEFAULT_RADIUS,
             padding: DEFAULT_PADDING,
             icon: IconSetting::Default,
+            icon_size: None,
             warn_threshold: DEFAULT_WARN_THRESHOLD,
             warn: StateColors {
                 background: Some(ALERT_BACKGROUND),
@@ -856,19 +860,52 @@ pub(crate) fn measure_icon_content(
 ) -> u32 {
     match icon {
         ResolvedIcon::Builtin(_) => {
-            let edge = ctx.icon_edge();
+            let edge = builtin_edge(ctx, style);
             let boxes = icon_boxes(ctx, edge, template);
-            if boxes.is_empty() {
-                return 0;
-            }
-            let gap = icon_gap(edge);
-            let content: u32 =
-                boxes.iter().map(|b| b.width).sum::<u32>() + gap * (boxes.len() as u32 - 1);
-            content + 2 * style.padding * ctx.scale_factor()
+            measure_boxes(ctx, style, &boxes, icon_gap(edge))
+        }
+        ResolvedIcon::Text(glyph) if style.icon_size.is_some() => {
+            let (boxes, gap, _) = sized_glyph_boxes(ctx, style, glyph, template);
+            measure_boxes(ctx, style, &boxes, gap)
         }
         ResolvedIcon::None => measure_text_pill(ctx, style, &icon_as_text(template, None)),
         ResolvedIcon::Text(s) => measure_text_pill(ctx, style, &icon_as_text(template, Some(s))),
     }
+}
+
+/// The built-in icon edge in physical pixels: the style's `icon-size`, or the
+/// bar font size.
+fn builtin_edge(ctx: &RenderContext, style: &WidgetStyle) -> u32 {
+    style
+        .icon_size
+        .map_or_else(|| ctx.icon_edge(), |size| size * ctx.scale_factor())
+}
+
+/// Boxes for a text glyph enlarged to the style's `icon-size`: the glyph box
+/// is as wide as the glyph at that size, while labels keep the bar font.
+/// Returns the boxes, the gap between them, and the glyph's font size.
+fn sized_glyph_boxes(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    glyph: &str,
+    template: &str,
+) -> (Vec<ContentBox>, u32, Option<f32>) {
+    let size = style
+        .icon_size
+        .map(|size| (size * ctx.scale_factor()) as f32);
+    let width = ctx.measure_text_sized(glyph.trim(), size);
+    let gap = icon_gap(size.map_or_else(|| ctx.icon_edge(), |size| size as u32));
+    (icon_boxes(ctx, width, template), gap, size)
+}
+
+/// The pill width for `boxes` separated by `gap`, plus the style's padding;
+/// zero when there is nothing to show.
+fn measure_boxes(ctx: &RenderContext, style: &WidgetStyle, boxes: &[ContentBox], gap: u32) -> u32 {
+    if boxes.is_empty() {
+        return 0;
+    }
+    let content: u32 = boxes.iter().map(|b| b.width).sum::<u32>() + gap * (boxes.len() as u32 - 1);
+    content + 2 * style.padding * ctx.scale_factor()
 }
 
 /// Paint an icon `template` resolved for `icon`, in `colors`.
@@ -890,6 +927,24 @@ pub(crate) fn draw_icon_content(
     match icon {
         ResolvedIcon::Builtin(builtin) => {
             draw_builtin_content(ctx, style, bounds, &[*builtin], template, colors);
+        }
+        ResolvedIcon::Text(glyph) if style.icon_size.is_some() => {
+            if bounds.width == 0 || bounds.height == 0 {
+                return;
+            }
+            let (boxes, gap, size) = sized_glyph_boxes(ctx, style, glyph, template);
+            let glyph = glyph.trim();
+            draw_boxes(
+                ctx,
+                style,
+                bounds,
+                &boxes,
+                gap,
+                colors,
+                |ctx, _, slot, color| {
+                    ctx.draw_text_centered_sized(glyph, slot, color, size);
+                },
+            );
         }
         ResolvedIcon::None => {
             draw_text_pill(ctx, style, bounds, &icon_as_text(template, None), colors);
@@ -936,8 +991,36 @@ fn draw_builtin_content(
     if bounds.width == 0 || bounds.height == 0 || icons.is_empty() {
         return;
     }
-    let edge = ctx.icon_edge();
+    let edge = builtin_edge(ctx, style);
     let boxes = icon_boxes(ctx, edge, template);
+    draw_boxes(
+        ctx,
+        style,
+        bounds,
+        &boxes,
+        icon_gap(edge),
+        colors,
+        |ctx, slot_index, slot, color| {
+            let builtin = icons[slot_index.min(icons.len() - 1)];
+            let iy = slot.y + slot.height.saturating_sub(edge) / 2;
+            ctx.draw_builtin_icon(builtin, Bounds::new(slot.x, iy, edge, edge), color);
+        },
+    );
+}
+
+/// Paint the pill behind `boxes`, then lay them out left to right `gap`
+/// apart: text runs at the bar font, and each icon slot handed to
+/// `draw_icon` with its index among the icon slots, its full-height box, and
+/// the foreground color.
+fn draw_boxes(
+    ctx: &mut RenderContext,
+    style: &WidgetStyle,
+    bounds: Bounds,
+    boxes: &[ContentBox],
+    gap: u32,
+    colors: StateColors,
+    mut draw_icon: impl FnMut(&mut RenderContext, usize, Bounds, (u8, u8, u8, u8)),
+) {
     if boxes.is_empty() {
         return;
     }
@@ -954,7 +1037,6 @@ fn draw_builtin_content(
             (style.border_width * scale) as f32,
         );
     }
-    let gap = icon_gap(edge);
     let pad = style.padding * scale;
     let mut x = bounds.x + pad;
     let mut icon_slot = 0;
@@ -964,10 +1046,9 @@ fn draw_builtin_content(
         }
         match &content.text {
             None => {
-                let builtin = icons[icon_slot.min(icons.len() - 1)];
+                let slot = Bounds::new(x, bounds.y, content.width, bounds.height);
+                draw_icon(ctx, icon_slot, slot, colors.foreground);
                 icon_slot += 1;
-                let iy = bounds.y + bounds.height.saturating_sub(edge) / 2;
-                ctx.draw_builtin_icon(builtin, Bounds::new(x, iy, edge, edge), colors.foreground);
             }
             Some(text) => {
                 ctx.draw_text(
@@ -1785,6 +1866,67 @@ mod tests {
                 border: Some((9, 9, 9, 9)),
             }
         );
+    }
+
+    /// Rows of `ctx` holding any pixel brighter than the dark background.
+    fn ink_rows(ctx: &RenderContext, width: u32) -> u32 {
+        ctx.pixels()
+            .chunks(width as usize * 4)
+            .filter(|row| row.chunks(4).any(|px| px[0] > 0x80))
+            .count() as u32
+    }
+
+    #[test]
+    fn icon_size_sizes_a_builtin_icon_slot() {
+        let mut ctx = RenderContext::new(200, 48);
+        let style = WidgetStyle {
+            icon_size: Some(30),
+            padding: 0,
+            ..WidgetStyle::default()
+        };
+        let icon = ResolvedIcon::Builtin(BuiltinIcon::Power);
+        assert_eq!(measure_icon_content(&mut ctx, &style, &icon, "{icon}"), 30);
+        let default = WidgetStyle {
+            padding: 0,
+            ..WidgetStyle::default()
+        };
+        assert_eq!(
+            measure_icon_content(&mut ctx, &default, &icon, "{icon}"),
+            ctx.icon_edge()
+        );
+    }
+
+    #[test]
+    fn icon_size_enlarges_a_text_glyph_but_not_its_label() {
+        let draw = |icon_size: Option<u32>, template: &str| {
+            let mut ctx = RenderContext::new(200, 48);
+            let style = WidgetStyle {
+                icon_size,
+                ..WidgetStyle::default()
+            };
+            let icon = ResolvedIcon::Text("█".into());
+            let width = measure_icon_content(&mut ctx, &style, &icon, template);
+            ctx.fill_background();
+            draw_icon_content(
+                &mut ctx,
+                &style,
+                Bounds::new(0, 0, 200, 48),
+                &icon,
+                template,
+                style.base_colors(),
+            );
+            (width, ink_rows(&ctx, 200))
+        };
+        let (small_w, small_h) = draw(None, "{icon}");
+        let (big_w, big_h) = draw(Some(32), "{icon}");
+        assert!(big_w > small_w, "{big_w} > {small_w}");
+        assert!(big_h > small_h, "{big_h} > {small_h}");
+        // A label next to the glyph keeps the bar font size: the pill grows
+        // only by the glyph's extra width.
+        let (label_small, _) = draw(None, "{icon}50%");
+        let (label_big, _) = draw(Some(32), "{icon}50%");
+        assert!(label_big > label_small);
+        assert!(label_big - label_small < big_w);
     }
 
     #[test]

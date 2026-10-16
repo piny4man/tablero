@@ -440,6 +440,10 @@ an `icon` field on its `[widget.<name>]` table:
 - `icon = "<text>"` → override with any literal string, e.g. a Nerd Font glyph
   or an emoji, rendered as text in place of the vector icon.
 
+`icon-size = <px>` (1–64 logical pixels) enlarges a widget's icon without
+changing its label: it sets the built-in icon's edge, or the font size of a
+text glyph from `icon` or `format-icons`. Unset, icons follow the bar font size.
+
 For widgets with a `format`/`format-icons` string (battery, backlight,
 bluetooth, network, power-profiles-daemon, system, updates, volume), the `{icon}`
 placeholder marks where the icon sits; a `format-icons` entry supplies a

@@ -374,6 +374,10 @@ pub struct WidgetStyleConfig {
     /// Glyph override: absent keeps the widget's built-in glyph, `"none"`
     /// disables it, any other string is used verbatim.
     pub icon: Option<String>,
+    /// Icon size in logical pixels (1–64): the built-in icon's edge, or the
+    /// font size of a text glyph icon. Unset follows the bar font size.
+    #[serde(rename = "icon-size", deserialize_with = "deserialize_icon_size")]
+    pub icon_size: Option<u32>,
     /// Percent below which a discharging battery shows its warn colors.
     #[serde(rename = "warn-threshold")]
     pub warn_threshold: Option<u32>,
@@ -530,6 +534,7 @@ impl WidgetStyleConfig {
             radius: self.radius.unwrap_or(defaults.radius),
             padding: self.padding.unwrap_or(defaults.padding),
             icon: resolve_icon(self.icon.as_deref()),
+            icon_size: self.icon_size,
             warn_threshold: self.warn_threshold.unwrap_or(defaults.warn_threshold),
             warn: resolve_state(self.warn, defaults.warn),
             attention: resolve_state(self.attention, defaults.attention),
@@ -585,6 +590,9 @@ impl WidgetStyleConfig {
         }
         if self.icon.is_some() {
             base.icon = self.icon.clone();
+        }
+        if self.icon_size.is_some() {
+            base.icon_size = self.icon_size;
         }
         if self.warn_threshold.is_some() {
             base.warn_threshold = self.warn_threshold;
@@ -1422,6 +1430,23 @@ fn validate_bluetooth_config(field: &str, config: &WidgetStyleConfig) -> Result<
         ));
     }
     validate_level_icons(field, config, BLUETOOTH_ICON_NAMES)
+}
+
+/// Largest accepted `icon-size`, in logical pixels.
+const MAX_ICON_SIZE: u32 = 64;
+
+fn deserialize_icon_size<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let size = u32::deserialize(deserializer)?;
+    if (1..=MAX_ICON_SIZE).contains(&size) {
+        Ok(Some(size))
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "icon-size must be between 1 and {MAX_ICON_SIZE}, got {size}"
+        )))
+    }
 }
 
 fn validate_interval(field: &str, config: &WidgetStyleConfig) -> Result<(), String> {
@@ -3219,6 +3244,34 @@ mod tests {
         assert_eq!(hover.background, Some((0x20, 0x20, 0x20, 0xFF)));
         assert_eq!(hover.foreground, Some((0xFF, 0, 0, 0xFF)));
         assert!(Config::from_toml_str("[widget.volume.hover]\nglow = \"#fff\"").is_err());
+    }
+
+    #[test]
+    fn icon_size_resolves_and_merges_per_monitor() {
+        let config = Config::from_toml_str(
+            r#"
+            [widget.network]
+            icon-size = 20
+
+            [[monitor]]
+            name = "DP-1"
+            [monitor.widget.network]
+            icon-size = 24
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.widget.network.resolve(&config.theme).icon_size,
+            Some(20)
+        );
+        let mut merged = config.widget.network.clone();
+        config.monitors[0].widget.network.apply(&mut merged);
+        assert_eq!(merged.resolve(&config.theme).icon_size, Some(24));
+        assert_eq!(config.widget.volume.resolve(&config.theme).icon_size, None);
+        let error = Config::from_toml_str("[widget.network]\nicon-size = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("icon-size"), "{error}");
     }
 
     #[test]

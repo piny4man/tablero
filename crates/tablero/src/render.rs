@@ -209,14 +209,17 @@ const PILL_CACHE_LIMIT: usize = 64;
 /// `f32::to_bits` of its radius and stroke width (`None` for a fill).
 type PillKey = ((u32, u32), (u8, u8, u8, u8), u32, Option<u32>);
 
-/// The shaping box a string was laid out in. Font size and family live in
-/// [`RenderSettings`], and the cache is cleared whenever those change.
+/// The shaping box a string was laid out in. The default font size and family
+/// live in [`RenderSettings`], and the cache is cleared whenever those change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ShapeKey {
     /// `f32::to_bits` of the line height.
     line_height: u32,
     /// Constrained box, or `None` for an unconstrained measurement.
     size: Option<(u32, u32)>,
+    /// `f32::to_bits` of a font size overriding the settings' (an enlarged
+    /// icon glyph), or `None` for the bar font size.
+    font_size: Option<u32>,
 }
 
 /// Ink extents `(left, top, right, bottom)` of a shaped string, in buffer
@@ -289,7 +292,8 @@ fn shape_text(
     text: &str,
     key: ShapeKey,
 ) -> ShapedText {
-    let metrics = Metrics::new(settings.font_size, f32::from_bits(key.line_height));
+    let font_size = key.font_size.map_or(settings.font_size, f32::from_bits);
+    let metrics = Metrics::new(font_size, f32::from_bits(key.line_height));
     let mut buffer = Buffer::new(font_system, metrics);
     let (width, height) = match key.size {
         Some((width, height)) => (Some(width as f32), Some(height as f32)),
@@ -648,7 +652,7 @@ impl RenderContext {
             return;
         }
         let offset = (i64::from(bounds.x), i64::from(bounds.y));
-        self.blit_text(text, bounds, color, |_| Some(offset));
+        self.blit_text(text, bounds, color, None, |_| Some(offset));
     }
 
     /// Shape and draw `text` with its visible ink centered within `bounds`.
@@ -658,10 +662,23 @@ impl RenderContext {
     /// [`draw_text`](Self::draw_text) so their shared baseline remains stable.
     #[hotpath::measure(impl_type = "RenderContext")]
     pub fn draw_text_centered(&mut self, text: &str, bounds: Bounds, color: (u8, u8, u8, u8)) {
+        self.draw_text_centered_sized(text, bounds, color, None);
+    }
+
+    /// [`draw_text_centered`](Self::draw_text_centered) at `font_size`
+    /// physical pixels instead of the bar font size, for an enlarged icon
+    /// glyph; `None` keeps the bar font size.
+    pub fn draw_text_centered_sized(
+        &mut self,
+        text: &str,
+        bounds: Bounds,
+        color: (u8, u8, u8, u8),
+        font_size: Option<f32>,
+    ) {
         if text.is_empty() || bounds.width == 0 || bounds.height == 0 {
             return;
         }
-        self.blit_text(text, bounds, color, |ink| {
+        self.blit_text(text, bounds, color, font_size, |ink| {
             let (left, top, right, bottom) = ink?;
             let ink_width = i64::from(right) - i64::from(left);
             let ink_height = i64::from(bottom) - i64::from(top);
@@ -683,6 +700,7 @@ impl RenderContext {
         text: &str,
         bounds: Bounds,
         color: (u8, u8, u8, u8),
+        font_size: Option<f32>,
         place: impl FnOnce(Option<InkBounds>) -> Option<(i64, i64)>,
     ) {
         let mut fonts = self.fonts.borrow_mut();
@@ -694,6 +712,7 @@ impl RenderContext {
         let key = ShapeKey {
             line_height: (bounds.height as f32).to_bits(),
             size: Some((bounds.width, bounds.height)),
+            font_size: font_size.map(f32::to_bits),
         };
         let shaped = self.text_cache.get_or_shape(
             font_system,
@@ -756,6 +775,12 @@ impl RenderContext {
     /// text measures zero, so an empty widget reserves no slot.
     #[hotpath::measure(impl_type = "RenderContext")]
     pub fn measure_text(&mut self, text: &str) -> u32 {
+        self.measure_text_sized(text, None)
+    }
+
+    /// [`measure_text`](Self::measure_text) at `font_size` physical pixels
+    /// instead of the bar font size; `None` keeps the bar font size.
+    pub fn measure_text_sized(&mut self, text: &str, font_size: Option<f32>) -> u32 {
         if text.is_empty() {
             return 0;
         }
@@ -767,8 +792,9 @@ impl RenderContext {
             ..
         } = &mut *fonts;
         let key = ShapeKey {
-            line_height: self.settings.font_size.to_bits(),
+            line_height: font_size.unwrap_or(self.settings.font_size).to_bits(),
             size: None,
+            font_size: font_size.map(f32::to_bits),
         };
         self.text_cache
             .get_or_shape(
@@ -1238,6 +1264,7 @@ mod tests {
         let key = ShapeKey {
             line_height: (bounds.height as f32).to_bits(),
             size: Some((bounds.width, bounds.height)),
+            font_size: None,
         };
         let mut shaped = shape_text(font_system, icon_fallback, &ctx.settings, text, key);
         let text_color = Color::rgba(color.0, color.1, color.2, color.3);
