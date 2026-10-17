@@ -390,7 +390,10 @@ file during reload is rejected; use a nonempty document such as `height = 32`
 to return to defaults deliberately.
 
 Tooltip and locally rendered tray menus use each output's resolved render
-settings, including the shared font and theme colors. An accepted reload closes
+settings, including the shared font and theme colors. Their fill is the bar
+background when it is mostly opaque (alpha `0xC0` or more), otherwise the theme
+background, always raised to near-opaque; a fixed dark grey applies only when
+neither is opaque enough. An accepted reload closes
 existing popups; reopen them to see the new measurements. External tray-owned
 windows and supplied tray icon artwork are not recolored.
 
