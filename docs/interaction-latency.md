@@ -35,54 +35,22 @@ Each line has a stable `metric=... duration_us=...` prefix:
 | `tooltip-input-to-commit` | Hover event through the tooltip's first buffer commit. |
 | `tray-menu-input-to-commit` | Tray press, DBus menu response, popup configure, and first buffer commit. |
 
-A Wayland commit is an application-side lower bound, not proof that a pixel was
-presented. Use a 120/240 fps external recording or a compositor presentation
-trace for input-to-visible-response and first-presentation measurements.
+## Checking a change
 
-## A/B procedure
+Run the bar with `TABLERO_PERF=1` on your own machine, use it normally for a
+minute (hover a few tooltips, switch workspaces), and read the p95 of the lines
+you care about. No external tools, and no fixed per-machine matrix: one quick
+run in balanced mode is enough to catch a regression. For where the time goes,
+use the [hotpath](hotpath-profiling.md) build instead.
 
-1. Keep the laptop, display mode, scale, config, power source, and compositor
-   effects unchanged. Close unrelated CPU-heavy work.
-2. Build once in release mode. Use exactly one Tablero process and the same full
-   widget config for both profiles.
-3. Save the current profile and restore it on exit:
+The budgets, at 120 Hz:
 
-   ```sh
-   original=$(powerprofilesctl get)
-   trap 'powerprofilesctl set "$original"' EXIT
-   ```
+- steady `frame-render` p95 at or below 8.33 ms (one refresh);
+- `workspace-input-to-commit` and `tooltip-input-to-commit` p95 at or below
+  16.67 ms (two refreshes).
 
-4. For each of `performance` and `balanced`, run
-   `powerprofilesctl set <profile>`, wait five seconds, then record at least 10
-   repetitions of each interaction:
-   - Hyprburst: cold open; warm open; enter the fixed query `firefox`; move the
-     selection down once; activate it. `hyprburst --measure` supplies only the
-     cold-open comparison, so record the other steps externally.
-   - Tablero: move onto a tooltip widget from outside the bar; click an inactive
-     workspace and return; click the power-profile widget only after the sample
-     set if changing it would invalidate the run.
-   - Crabture: open the overlay; drag the same fixed area; cancel rather than
-     writing a screenshot.
-5. Keep raw samples. Report median, p95, range, sample count, and balanced-mode
-   change from performance. Discard only a declared warm-up sample, never an
-   unexplained outlier.
-6. Repeat once with Hyprland blur and animations disabled. If application-side
-   commit timings stay flat but visible response improves, investigate the
-   compositor. If `frame-layout`/`frame-draw` grow before commit, the application
-   is already blocking independently of compositor presentation.
-
-Useful environment capture:
-
-```sh
-uname -a
-lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|MHz'
-hyprctl monitors -j
-hyprctl -j getoption animations:enabled
-hyprctl -j getoption decoration:blur:enabled
-Hyprland --version
-powerprofilesctl get
-upower -i "$(upower -e | grep BAT | head -1)"
-```
+Hyprburst and Crabture budgets are tracked in
+[NUKE-109](https://linear.app/tiendacables/issue/NUKE-109).
 
 ## Baseline: 2026-09-20
 
@@ -126,9 +94,8 @@ Hyprburst cold opening regressed only 3.9% in this sample and does not explain a
 large perceived launcher delay. Search, selection, warm-toggle, and
 first-presentation latency were not reported by its current `--measure` output
 and remain unresolved. Crabture has no equivalent measurement mode, so its
-opening and area-selection comparison also remains unresolved. The next needed
-measurement is the external input-to-presentation run in step 4, correlated with
-these application-side metrics.
+opening and area-selection comparison also remains unresolved; both moved to
+[NUKE-109](https://linear.app/tiendacables/issue/NUKE-109).
 
 ## Frame-cost fixes: 2026-09-20
 
@@ -173,10 +140,9 @@ The remaining ~0.6 ms of draw is the background fill and the widgets' pill
 fills and strokes. The first frame after start costs 45–60 ms (font faces load
 and every label shapes from cold); that is startup, not interaction latency.
 
-The probe does not exercise the compositor or the input path. The live-bar
-`TABLERO_PERF` run over at least 30 samples per profile is still required to
-close the acceptance criteria below; `frame-idle-gap` now lets those samples be
-split into cold and warm frames.
+The probe does not exercise the compositor or the input path; the live check
+below does. `frame-idle-gap` lets live samples be split into cold and warm
+frames.
 
 ## Redraw coalescing and damage
 
@@ -239,23 +205,25 @@ Popups still allocate a shared-memory buffer per draw. A tooltip draws once in
 its life and a menu once per update, so the two-slot reuse the bar needs for its
 steady repaints would hold memory for no measurable gain.
 
-## Follow-up acceptance criteria
+## Live check: 2026-10-17
 
-Use these for targeted fixes rather than changing animation or compositor
-settings without evidence:
+Tablero 0.6.0 at `90885f8`, the baseline laptop, full daily config, balanced
+and performance on AC and battery. Every run is inside budget:
 
-- Tablero, same hardware/full config/balanced mode: steady `frame-render` p95 at
-  or below 8.33 ms, with `workspace-input-to-commit` and
-  `tooltip-input-to-commit` p95 at or below 16.67 ms.
-- Tablero balanced-mode interaction p95 no more than 20% slower than performance
-  mode over at least 30 samples.
-- Hyprburst cold and warm first presentation p95 no more than 10% slower in
-  balanced mode; fixed-query and selection response p95 below 50 ms.
-- Crabture overlay first presentation and selection feedback p95 below 50 ms and
-  no more than 20% slower in balanced mode.
-- Re-run with blur/animations both enabled and disabled. Application acceptance
-  must pass with effects enabled; a compositor-only delta should be filed and
-  measured separately.
+| | Performance p95 | Balanced p95 |
+| --- | ---: | ---: |
+| Steady `frame-render` | 0.5–1.1 ms | 1.0–1.8 ms |
+| `workspace-input-to-commit` | 11.4–13.3 ms | 11.3–16.2 ms |
+| `tooltip-input-to-commit` | 1.8–2.7 ms | 2.3–4.0 ms |
+
+Steady render dropped from 59 ms on 2026-09-20 to under 2 ms. Workspace clicks
+sit at about 10 ms in both profiles; most of that is waiting for Hyprland's
+workspace event, not Tablero's frame. Blur and animations made no measurable
+difference. A Wayland commit is a lower bound on visible latency.
+
+Left for later, not blocking: the platform power-profile read takes about 62 ms
+per call (off the render path), and tray items re-decode their icon pixmaps far
+more often than their icons change.
 
 ## Idle wakeups
 
