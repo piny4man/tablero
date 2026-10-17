@@ -723,7 +723,6 @@ const MENU_SEPARATOR_HEIGHT: u32 = 8;
 const POPUP_RADIUS: f32 = 6.0;
 const POPUP_PADDING_X: u32 = 10;
 const POPUP_PADDING_Y: u32 = 5;
-const POPUP_FALLBACK_BACKGROUND: (u8, u8, u8, u8) = (0x20, 0x22, 0x27, 0xF8);
 
 #[derive(Clone)]
 struct MenuRow {
@@ -951,14 +950,6 @@ impl TrayMenuSurface {
 
 fn dim_color((r, g, b, a): (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
     (r / 2, g / 2, b / 2, a)
-}
-
-fn popup_background((r, g, b, a): (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
-    if a < 0xC0 {
-        POPUP_FALLBACK_BACKGROUND
-    } else {
-        (r, g, b, a.max(0xF0))
-    }
 }
 
 impl TooltipSurface {
@@ -1544,7 +1535,7 @@ impl App {
         let scale = bar.scale;
         let mut settings = bar.config.scaled_render_settings(scale);
 
-        let background = popup_background(settings.background);
+        let background = settings.popup_background;
         let foreground = settings.foreground;
         settings.background = (0, 0, 0, 0);
         self.hide_tooltip();
@@ -1624,7 +1615,7 @@ impl App {
         }
 
         let mut settings = pending.settings;
-        let background = popup_background(settings.background);
+        let background = settings.popup_background;
         let foreground = settings.foreground;
         let accent = settings.accent;
         settings.background = (0, 0, 0, 0);
@@ -2581,6 +2572,7 @@ fn scroll_directions(
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
+    use crate::render::{POPUP_FALLBACK_BACKGROUND, popup_background};
     use smithay_client_toolkit::seat::pointer::AxisScroll;
 
     #[test]
@@ -2682,10 +2674,7 @@ mod scroll_tests {
                 }
             }
             assert_eq!(snapshot.as_slice().len(), 4);
-            assert_eq!(
-                popup_background(config.render_settings().background),
-                (16, 37, 63, 255)
-            );
+            assert_eq!(config.render_settings().popup_background, (16, 37, 63, 255));
         }
     }
 
@@ -2861,11 +2850,11 @@ mod scroll_tests {
     #[test]
     fn transparent_bar_background_uses_an_opaque_popup_surface() {
         assert_eq!(
-            popup_background((0x18, 0x18, 0x18, 0x00)),
+            popup_background((0x18, 0x18, 0x18, 0x00), (0x18, 0x18, 0x18, 0x40)),
             POPUP_FALLBACK_BACKGROUND
         );
         assert_eq!(
-            popup_background((0x30, 0x32, 0x38, 0xD0)),
+            popup_background((0x30, 0x32, 0x38, 0xD0), (0x18, 0x18, 0x18, 0xFF)),
             (0x30, 0x32, 0x38, 0xF0)
         );
     }

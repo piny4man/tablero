@@ -53,6 +53,24 @@ pub const BG: (u8, u8, u8, u8) = (0x18, 0x18, 0x18, 0xFF);
 /// Opaque light foreground text color (R, G, B, A).
 pub const FG: (u8, u8, u8, u8) = (0xEA, 0xEA, 0xEA, 0xFF);
 
+/// Popup fill used when neither the bar nor the theme background is opaque enough.
+pub const POPUP_FALLBACK_BACKGROUND: (u8, u8, u8, u8) = (0x20, 0x22, 0x27, 0xF8);
+
+/// The near-opaque fill tooltips and tray menus paint on.
+///
+/// Popups float over arbitrary windows, so a see-through fill would make their
+/// text unreadable. Each candidate in turn — the bar fill, then the theme
+/// background — is used if it is mostly opaque, with its alpha raised to at
+/// least `0xF0`; otherwise [`POPUP_FALLBACK_BACKGROUND`] applies.
+pub fn popup_background(bar: (u8, u8, u8, u8), theme: (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+    [bar, theme]
+        .into_iter()
+        .find(|&(_, _, _, a)| a >= 0xC0)
+        .map_or(POPUP_FALLBACK_BACKGROUND, |(r, g, b, a)| {
+            (r, g, b, a.max(0xF0))
+        })
+}
+
 /// Default font size (px) used when no configuration overrides it.
 const FONT_SIZE: f32 = 16.0;
 
@@ -66,6 +84,8 @@ pub struct RenderSettings {
     /// Background fill behind every widget. A non-opaque alpha lets the desktop
     /// show through, which is what makes a "floating pills" bar possible.
     pub background: (u8, u8, u8, u8),
+    /// Near-opaque fill for tooltips and tray menus; see [`popup_background`].
+    pub popup_background: (u8, u8, u8, u8),
     /// Default text color.
     pub foreground: (u8, u8, u8, u8),
     /// Emphasis color (e.g. the active workspace).
@@ -85,6 +105,7 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             background: BG,
+            popup_background: popup_background(BG, BG),
             foreground: FG,
             accent: FG,
             font_size: FONT_SIZE,

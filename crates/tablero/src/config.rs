@@ -76,7 +76,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 
-use crate::render::{Bounds, RenderSettings};
+use crate::render::{Bounds, RenderSettings, popup_background};
 use crate::scale::Scale;
 use crate::widget::{
     BacklightWidget, BatteryWidget, BluetoothWidget, ClockWidget, Dashboard, HoverColors,
@@ -1539,12 +1539,14 @@ impl Config {
     /// scaled output, resolve physical settings with
     /// [`scaled_render_settings`](Config::scaled_render_settings).
     pub fn render_settings(&self) -> RenderSettings {
+        let background = self
+            .bar
+            .background
+            .unwrap_or(self.theme.background)
+            .to_rgba();
         RenderSettings {
-            background: self
-                .bar
-                .background
-                .unwrap_or(self.theme.background)
-                .to_rgba(),
+            background,
+            popup_background: popup_background(background, self.theme.background.to_rgba()),
             foreground: self.theme.foreground.to_rgba(),
             accent: self.theme.accent.to_rgba(),
             font_size: self.font.size,
@@ -1787,7 +1789,7 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::RenderContext;
+    use crate::render::{POPUP_FALLBACK_BACKGROUND, RenderContext};
     use crate::widget::ClickButton;
 
     #[test]
@@ -2927,6 +2929,41 @@ mod tests {
         assert_eq!(resolved.bar.gap, 4);
         // The translucent background reaches the render settings this output clears to.
         assert_eq!(resolved.render_settings().background, (0, 0, 0, 0x80));
+    }
+
+    #[test]
+    fn popups_follow_the_theme_background_behind_a_translucent_bar() {
+        let popup = |toml: &str| {
+            Config::from_toml_str(toml)
+                .unwrap()
+                .render_settings()
+                .popup_background
+        };
+        // A translucent bar hands popups the theme background.
+        assert_eq!(
+            popup("[theme]\nbackground = '#10253F'\n[bar]\nbackground = '#00000000'"),
+            (0x10, 0x25, 0x3F, 0xFF)
+        );
+        // A mostly opaque theme background is forced near-opaque.
+        assert_eq!(
+            popup("[theme]\nbackground = '#10253FC8'\n[bar]\nbackground = '#00000000'"),
+            (0x10, 0x25, 0x3F, 0xF0)
+        );
+        // A mostly opaque bar still lends popups its own fill.
+        assert_eq!(
+            popup("[theme]\nbackground = '#10253F'\n[bar]\nbackground = '#303238D0'"),
+            (0x30, 0x32, 0x38, 0xF0)
+        );
+        // The default theme backs a transparent bar's popups too.
+        assert_eq!(
+            popup("[bar]\nbackground = '#00000000'"),
+            (0x18, 0x18, 0x18, 0xFF)
+        );
+        // Only when neither color is opaque enough does the fallback grey apply.
+        assert_eq!(
+            popup("[theme]\nbackground = '#10253F40'\n[bar]\nbackground = '#00000000'"),
+            POPUP_FALLBACK_BACKGROUND
+        );
     }
 
     #[test]
