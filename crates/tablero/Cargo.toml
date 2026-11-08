@@ -64,6 +64,8 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 
 [dev-dependencies]
 tempfile = "3"
+# Spike only (examples/tui-popup.rs): Rio's VT core + PTY driver, no renderer.
+rio-vt = "0.5.29"
 
 [lints]
 workspace = true
