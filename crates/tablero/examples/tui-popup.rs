@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -31,7 +32,8 @@ use cosmic_text::{
     Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight,
 };
 use rio_vt::ansi::CursorShape;
-use rio_vt::config::colors::term::TermColors;
+use rio_vt::config::colors::Colors as RioColors;
+use rio_vt::config::colors::term::{List, TermColors};
 use rio_vt::config::colors::{AnsiColor, ColorArray, ColorRgb};
 use rio_vt::corcovado;
 use rio_vt::crosswords::grid::Scroll;
@@ -273,14 +275,9 @@ fn from_arr(a: ColorArray) -> Rgb {
     (f(a[0]), f(a[1]), f(a[2]))
 }
 
-/// Color `i` of rio-vt's color table (0–255 indexed, then the named colors),
-/// honoring colors the program set with OSC 4/10/11.
-fn index_rgb(i: usize, overrides: &TermColors) -> Rgb {
-    if i < TERM_COLORS
-        && let Some(set) = overrides[i]
-    {
-        return from_arr(set);
-    }
+/// The built-in color for entry `i` of rio-vt's color table (0–255 indexed,
+/// then the named colors), used when there is no Rio config.
+fn builtin_rgb(i: usize) -> Rgb {
     match i {
         0..=255 => palette(i as u8),
         257 => BG,
@@ -290,16 +287,25 @@ fn index_rgb(i: usize, overrides: &TermColors) -> Rgb {
     }
 }
 
-fn resolve(color: AnsiColor, overrides: &TermColors) -> Rgb {
+/// Color `i` of the color table, honoring colors the program set with
+/// OSC 4/10/11 over the configured palette.
+fn index_rgb(i: usize, overrides: &TermColors, base: &Palette) -> Rgb {
+    if i >= TERM_COLORS {
+        return base.0[256];
+    }
+    overrides[i].map_or(base.0[i], from_arr)
+}
+
+fn resolve(color: AnsiColor, overrides: &TermColors, base: &Palette) -> Rgb {
     match color {
         AnsiColor::Spec(c) => (c.r, c.g, c.b),
-        AnsiColor::Indexed(i) => index_rgb(usize::from(i), overrides),
-        AnsiColor::Named(n) => index_rgb(n as usize, overrides),
+        AnsiColor::Indexed(i) => index_rgb(usize::from(i), overrides, base),
+        AnsiColor::Named(n) => index_rgb(n as usize, overrides, base),
     }
 }
 
 /// Foreground and background of a cell after bold-as-bright, dim and inverse.
-fn cell_colors(style: &Style, overrides: &TermColors) -> (Rgb, Rgb) {
+fn cell_colors(style: &Style, overrides: &TermColors, base: &Palette) -> (Rgb, Rgb) {
     let mut fg = style.fg;
     if style.flags.contains(StyleFlags::BOLD) {
         fg = match fg {
@@ -308,8 +314,8 @@ fn cell_colors(style: &Style, overrides: &TermColors) -> (Rgb, Rgb) {
             other => other,
         };
     }
-    let mut fg = resolve(fg, overrides);
-    let mut bg = resolve(style.bg, overrides);
+    let mut fg = resolve(fg, overrides, base);
+    let mut bg = resolve(style.bg, overrides, base);
     if style.flags.contains(StyleFlags::DIM) {
         fg = dim(fg);
     }
@@ -317,6 +323,124 @@ fn cell_colors(style: &Style, overrides: &TermColors) -> (Rgb, Rgb) {
         std::mem::swap(&mut fg, &mut bg);
     }
     (fg, bg)
+}
+
+// ---------------------------------------------------------------- rio config
+
+/// The full color table (rio-vt's 269 entries) the panel paints with.
+#[derive(Debug, Clone, PartialEq)]
+struct Palette([Rgb; TERM_COLORS]);
+
+impl Default for Palette {
+    fn default() -> Self {
+        Palette(std::array::from_fn(builtin_rgb))
+    }
+}
+
+impl Palette {
+    /// The table Rio builds from a `[colors]` section or theme.
+    fn from_rio(colors: &RioColors) -> Self {
+        let list = List::from(colors);
+        let mut palette = Palette(std::array::from_fn(|i| from_arr(list[i])));
+        // rio-vt's `List` leaves the cursor entry unset; Rio paints it from `cursor`.
+        palette.0[258] = from_arr(colors.cursor);
+        palette
+    }
+}
+
+/// The parts of Rio's config this panel follows.
+#[derive(Debug, Default)]
+struct RioLook {
+    palette: Option<Palette>,
+    cursor: Option<CursorShape>,
+    font_size: Option<f32>,
+    font_family: Option<String>,
+}
+
+/// Rio's config directory: `$RIO_CONFIG_HOME`, else `$XDG_CONFIG_HOME/rio`,
+/// else `~/.config/rio`.
+fn rio_dir(rio_home: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let set = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    set(rio_home)
+        .or_else(|| set(xdg).map(|x| x.join("rio")))
+        .or_else(|| set(home).map(|h| h.join(".config/rio")))
+}
+
+/// Read Rio's `config.toml` text; `theme` returns the text of
+/// `themes/<name>.toml`. Anything missing or malformed keeps the defaults.
+fn parse_rio(config: &str, theme: impl Fn(&str) -> Option<String>) -> RioLook {
+    let Ok(root) = toml::from_str::<toml::Table>(config) else {
+        return RioLook::default();
+    };
+    // As in Rio, a theme's colors win over the config's own `[colors]`.
+    let colors = root
+        .get("theme")
+        .and_then(toml::Value::as_str)
+        .and_then(theme)
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .and_then(|mut table| table.remove("colors"))
+        .or_else(|| root.get("colors").cloned());
+    let palette = colors
+        .and_then(|value| value.try_into::<RioColors>().ok())
+        .map(|colors| Palette::from_rio(&colors));
+    let cursor = root
+        .get("cursor")
+        .and_then(|c| c.get("shape"))
+        .and_then(toml::Value::as_str)
+        .and_then(|shape| match shape.to_ascii_lowercase().as_str() {
+            "block" => Some(CursorShape::Block),
+            "underline" => Some(CursorShape::Underline),
+            "beam" => Some(CursorShape::Beam),
+            _ => None,
+        });
+    let fonts = root.get("fonts");
+    let font_size = fonts
+        .and_then(|f| f.get("size"))
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+        .filter(|size| *size > 0.0)
+        .map(|size| size as f32);
+    let font_family = fonts
+        .and_then(|f| {
+            f.get("family")
+                .or_else(|| f.get("regular").and_then(|r| r.get("family")))
+        })
+        .and_then(toml::Value::as_str)
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned);
+    RioLook {
+        palette,
+        cursor,
+        font_size,
+        font_family,
+    }
+}
+
+/// Rio's config from disk, or the defaults when there is none.
+fn load_rio() -> RioLook {
+    let var = |name| std::env::var(name).ok();
+    let Some(dir) = rio_dir(
+        var("RIO_CONFIG_HOME").as_deref(),
+        var("XDG_CONFIG_HOME").as_deref(),
+        var("HOME").as_deref(),
+    ) else {
+        return RioLook::default();
+    };
+    let Ok(config) = std::fs::read_to_string(dir.join("config.toml")) else {
+        log::info!("no Rio config in {}", dir.display());
+        return RioLook::default();
+    };
+    let look = parse_rio(&config, |name| {
+        std::fs::read_to_string(dir.join("themes").join(format!("{name}.toml"))).ok()
+    });
+    log::info!(
+        "Rio config {}: colors={} cursor={:?} font={:?} {:?}",
+        dir.display(),
+        look.palette.is_some(),
+        look.cursor,
+        look.font_family,
+        look.font_size,
+    );
+    look
 }
 
 // ---------------------------------------------------------------- painting
@@ -399,9 +523,14 @@ fn mono(bold: bool) -> Attrs<'static> {
 }
 
 impl Font {
-    fn new() -> Self {
+    /// Load the system fonts, with `family` as the monospace face when given.
+    fn new(family: Option<&str>) -> Self {
+        let mut system = FontSystem::new();
+        if let Some(family) = family {
+            system.db_mut().set_monospace_family(family);
+        }
         let mut font = Self {
-            system: FontSystem::new(),
+            system,
             swash: SwashCache::new(),
             metrics: Metrics::new(FONT_PX, FONT_PX),
             cell_w: 1,
@@ -512,12 +641,12 @@ fn paint_row(
     g: Geom,
     y: usize,
     cells: &[(Square, Style)],
-    colors: &TermColors,
+    (colors, base): (&TermColors, &Palette),
     cursor: Option<(usize, CursorShape)>,
 ) {
     let top = g.pad + y as u32 * g.cell_h;
-    let default_bg = index_rgb(257, colors);
-    let cursor_color = index_rgb(258, colors);
+    let default_bg = index_rgb(257, colors, base);
+    let cursor_color = index_rgb(258, colors, base);
     frame.fill(g.pad, top, frame.w - 2 * g.pad, g.cell_h, default_bg);
     let clip = (top as i32, (top + g.cell_h) as i32);
     for (x, (square, style)) in cells.iter().enumerate() {
@@ -526,7 +655,7 @@ fn paint_row(
         }
         let span = if square.wide() == Wide::Wide { 2 } else { 1 };
         let left = g.pad + x as u32 * g.cell_w;
-        let (mut fg, mut bg) = cell_colors(style, colors);
+        let (mut fg, mut bg) = cell_colors(style, colors, base);
         if cursor == Some((x, CursorShape::Block)) {
             fg = bg;
             bg = cursor_color;
@@ -784,6 +913,9 @@ struct App {
     pointer: Option<WlPointer>,
 
     font: Font,
+    palette: Palette,
+    cursor_shape: CursorShape,
+    font_px: f32,
     frame: Frame,
     geom: Geom,
     logical: (u32, u32),
@@ -866,7 +998,7 @@ impl App {
         let proxy = Proxy(self.events.clone());
         let term = Arc::new(FairMutex::new(Crosswords::new(
             self.crosswords_size(),
-            CursorShape::Block,
+            self.cursor_shape,
             proxy.clone(),
             WindowId::from(0),
             0,
@@ -916,7 +1048,8 @@ impl App {
             Ev::Write(text) => self.send(text.into_bytes()),
             Ev::Color(index, format) => {
                 let colors = self.term.as_ref().map(|t| *t.lock().colors());
-                let (r, g, b) = colors.map_or(FG, |c| index_rgb(index, &c));
+                let (r, g, b) =
+                    colors.map_or(self.palette.0[256], |c| index_rgb(index, &c, &self.palette));
                 self.send(format(ColorRgb { r, g, b }).into_bytes());
             }
             Ev::Size(format) => self.send(format(self.window_size()).into_bytes()),
@@ -1068,7 +1201,7 @@ impl App {
                 g.scale,
                 w - 2 * g.scale,
                 h - 2 * g.scale,
-                index_rgb(257, &snap.colors),
+                index_rgb(257, &snap.colors, &self.palette),
             );
         }
         for (y, cells) in &snap.lines {
@@ -1079,7 +1212,7 @@ impl App {
                 g,
                 *y,
                 cells,
-                &snap.colors,
+                (&snap.colors, &self.palette),
                 cursor,
             );
         }
@@ -1484,7 +1617,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| e.error)?;
 
     let font_started = Instant::now();
-    let font = Font::new();
+    let look = load_rio();
+    let font = Font::new(look.font_family.as_deref());
     let font_load = font_started.elapsed();
 
     let mut app = App {
@@ -1502,6 +1636,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyboard: None,
         pointer: None,
         font,
+        palette: look.palette.unwrap_or_default(),
+        cursor_shape: look.cursor.unwrap_or(CursorShape::Block),
+        font_px: look.font_size.unwrap_or(FONT_PX),
         frame: Frame::new(1, 1),
         geom: Geom::default(),
         logical: (0, 0),
@@ -1541,7 +1678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     app.geom.scale = scale;
     app.logical = popup_size(output_size);
-    app.font.set_size(FONT_PX * scale as f32);
+    app.font.set_size(app.font_px * scale as f32);
 
     let surface = compositor.create_surface(&qh);
     let layer =
@@ -1671,6 +1808,84 @@ mod tests {
     #[test]
     fn bare_modifiers_send_nothing() {
         assert_eq!(encode_key(Keysym::Shift_L, NONE, None, false), None);
+    }
+
+    const RIO_CONFIG: &str = r#"
+theme = "arc"
+padding = [0, 8]
+[cursor]
+shape = 'underline'
+blinking = true
+[fonts]
+size = 16
+family = "Iosevka Term"
+[window]
+opacity = 0.9
+"#;
+
+    const RIO_THEME: &str = r#"
+[colors]
+background = '#140917'
+foreground = '#eae2cf'
+cursor = '#7decff'
+red = '#f7080b'
+"#;
+
+    #[test]
+    fn rio_config_reads_theme_cursor_and_font() {
+        let look = parse_rio(RIO_CONFIG, |name| {
+            (name == "arc").then(|| RIO_THEME.to_owned())
+        });
+        assert_eq!(look.cursor, Some(CursorShape::Underline));
+        assert_eq!(look.font_size, Some(16.0));
+        assert_eq!(look.font_family.as_deref(), Some("Iosevka Term"));
+        let palette = look.palette.expect("theme colors");
+        assert_eq!(palette.0[257], (0x14, 0x09, 0x17));
+        assert_eq!(palette.0[256], (0xea, 0xe2, 0xcf));
+        assert_eq!(palette.0[258], (0x7d, 0xec, 0xff));
+        assert_eq!(palette.0[1], (0xf7, 0x08, 0x0b));
+        assert_eq!(palette.0[196], (255, 0, 0));
+    }
+
+    #[test]
+    fn rio_inline_colors_apply_without_a_theme() {
+        let config = "[colors]\nbackground = '#000000'\n[fonts.regular]\nfamily = 'Hack'\n";
+        let look = parse_rio(config, |_| None);
+        assert_eq!(look.palette.expect("colors").0[257], (0, 0, 0));
+        assert_eq!(look.font_family.as_deref(), Some("Hack"));
+    }
+
+    #[test]
+    fn missing_or_broken_rio_config_keeps_the_defaults() {
+        for config in ["", "not = [toml", "cursor = '_'\ntheme = 'gone'"] {
+            let look = parse_rio(config, |_| None);
+            assert!(look.palette.is_none(), "{config:?}");
+            assert_eq!(look.cursor, None);
+            assert_eq!(look.font_size, None);
+        }
+    }
+
+    #[test]
+    fn rio_dir_follows_rio_then_xdg_then_home() {
+        let dir = |r, x, h| rio_dir(r, x, h).map(|p| p.display().to_string());
+        assert_eq!(
+            dir(Some("/r"), Some("/x"), Some("/h")).as_deref(),
+            Some("/r")
+        );
+        assert_eq!(dir(None, Some("/x"), Some("/h")).as_deref(), Some("/x/rio"));
+        assert_eq!(
+            dir(None, Some(""), Some("/h")).as_deref(),
+            Some("/h/.config/rio")
+        );
+        assert_eq!(dir(None, None, None), None);
+    }
+
+    #[test]
+    fn default_palette_is_the_built_in_one() {
+        let palette = Palette::default();
+        assert_eq!(palette.0[257], BG);
+        assert_eq!(palette.0[1], ANSI[1]);
+        assert_eq!(palette.0[232], (8, 8, 8));
     }
 
     #[test]

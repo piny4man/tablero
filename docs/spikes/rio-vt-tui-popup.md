@@ -30,6 +30,16 @@ on-click = ["/…/target/release/examples/tui-popup", "btm"]
   - When mouse reporting is off, the wheel scrolls the scrollback, or sends arrow keys on the alt screen.
 - **Lifecycle:** the panel closes when the program exits. Ctrl+Shift+Q unmaps the panel and sends `Msg::Shutdown`, and teletypewriter then hangs up, kills and reaps the child. Each click starts a fresh process.
 
+## User configuration
+
+- **App configs (`~/.config/<app>`):** the program inherits the bar's environment (`HOME`, `XDG_CONFIG_HOME`, `USER`, `PATH`), and teletypewriter sets `HOME` and `USER` again. Each TUI therefore reads its usual config, for example btm reads `~/.config/bottom/bottom.toml`. Only `TERM=xterm-256color` and `COLORTERM=truecolor` are added.
+- **Rio's config:** read from `$RIO_CONFIG_HOME`, else `$XDG_CONFIG_HOME/rio`, else `~/.config/rio`, from the file `config.toml`.
+  - `theme = "<name>"` loads `themes/<name>.toml`, and its `[colors]` win over the config's own `[colors]`, as in Rio. Colors are parsed with rio-vt's own `Colors` type and expanded with `term::List`, so the defaults, dim and light colors, and the 256-color cube match Rio. rio-vt's `List` never fills the cursor entry, so the example sets it from `colors.cursor`.
+  - `[cursor] shape` (block, underline or beam).
+  - `[fonts] size`, and `[fonts] family` or `[fonts.regular] family`, used as the monospace face.
+  - A missing or malformed file, or a missing theme, falls back to the built-in look.
+  - Ignored: opacity, blur, padding, cursor blinking, the kitty keyboard protocol, and key bindings.
+
 ## Results
 
 These were measured on Hyprland at 2560×1440 with scale 1, giving a 2304×1440 px panel and a 134×40 grid, using a release build (`opt-level = "z"`; tiny-skia, cosmic-text and swash at opt-level 3). Each program ran for 5 s.
