@@ -47,6 +47,9 @@ fn execute(
         print!("{}", cli::HELP);
         return Ok(());
     }
+    if cli.action == cli::Action::Tui {
+        return tablero::tui::run(cli.program);
+    }
     let identity = Identity::current(&cli.instance)?;
     match cli.action {
         cli::Action::Reload => {
@@ -80,7 +83,7 @@ fn execute(
             Ok(())
         }
         cli::Action::Run => run(cli.config, identity, startup),
-        cli::Action::Help => unreachable!(),
+        cli::Action::Help | cli::Action::Tui => unreachable!(),
     }
 }
 

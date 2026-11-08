@@ -520,6 +520,35 @@ spawns the file directly (**no shell**) — typical use is
   child exits are logged with the resolved path. Child stderr is inherited, so
   script errors also appear next to tablero's logs.
 
+#### Terminal programs in a floating panel
+
+`tablero tui PROGRAM [ARGS...]` runs a terminal (TUI) program in a centered
+floating panel, so a click can open `btm`, `nmtui` and the like without an
+external terminal emulator:
+
+```toml
+[widget.system]
+on-click = ["tablero", "tui", "btm"]
+
+[widget.network]
+on-click = ["tablero", "tui", "nmtui"]
+```
+
+- The panel is 60% x 60% of the output, centered, and takes keyboard focus.
+  It closes when the program exits; **Ctrl+Shift+Q** closes it and kills the
+  program. Escape and `q` go to the program. Each click starts a fresh process.
+- The program inherits the bar's environment (`HOME`, `XDG_CONFIG_HOME`,
+  `PATH`), so it reads its usual `~/.config` files. It runs with
+  `TERM=xterm-256color` and `COLORTERM=truecolor`.
+- If you use [Rio](https://rioterm.com), the panel follows its `config.toml`
+  (`$RIO_CONFIG_HOME`, else `$XDG_CONFIG_HOME/rio`, else `~/.config/rio`):
+  `theme` or `[colors]`, `[cursor] shape`, and `[fonts] size` / `family`.
+  Without it, a built-in dark palette and the system monospace font are used.
+- Supports 256 colors and truecolor, mouse reporting and scrollback (mouse
+  wheel). Not supported: the kitty keyboard protocol, clipboard and selection,
+  images, and fractional scaling (fractional outputs render at the integer
+  scale). Implementation notes: [docs/tui-popup.md](docs/tui-popup.md).
+
 ```toml
 [bar]
 modules-right = ["hypridle", "power", "clock"]
