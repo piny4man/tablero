@@ -5,6 +5,7 @@ pub(crate) enum Action {
     Run,
     Reload,
     Restart,
+    Tui,
     Help,
 }
 
@@ -13,9 +14,11 @@ pub(crate) struct Cli {
     pub action: Action,
     pub instance: String,
     pub config: Option<PathBuf>,
+    /// The program and its arguments for `tui`.
+    pub program: Vec<String>,
 }
 
-pub(crate) const HELP: &str = "Usage: tablero [reload|restart] [--instance NAME] [--config PATH]\n\nWithout a command, start the bar. Instance defaults to 'default'.\n  reload     Re-read the running instance's config and theme\n  restart    Replace or start the instance in the background\n  --instance NAME  Separate named bar (e.g. dev) in this Wayland session\n  --config PATH    Optional config file; restart retains the running path\n  -h, --help       Show this help\n";
+pub(crate) const HELP: &str = "Usage: tablero [reload|restart] [--instance NAME] [--config PATH]\n       tablero tui PROGRAM [ARGS...]\n\nWithout a command, start the bar. Instance defaults to 'default'.\n  reload     Re-read the running instance's config and theme\n  restart    Replace or start the instance in the background\n  tui        Run a terminal program in a centered floating panel\n  --instance NAME  Separate named bar (e.g. dev) in this Wayland session\n  --config PATH    Optional config file; restart retains the running path\n  -h, --help       Show this help\n";
 
 impl Cli {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
@@ -24,6 +27,7 @@ impl Cli {
             action: Action::Run,
             instance: "default".into(),
             config: None,
+            program: Vec::new(),
         };
         let mut named = false;
         let mut command = false;
@@ -40,6 +44,19 @@ impl Cli {
                         Action::Restart
                     };
                     command = true;
+                }
+                Some("tui") if !command && !named && cli.config.is_none() => {
+                    cli.action = Action::Tui;
+                    cli.program = args
+                        .map(|arg| {
+                            arg.into_string()
+                                .map_err(|arg| format!("non-UTF-8 argument {arg:?}"))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if cli.program.is_empty() {
+                        return Err("tui requires a program, e.g. tablero tui btm".into());
+                    }
+                    return Ok(cli);
                 }
                 Some("--instance") if !named => {
                     cli.instance = args
@@ -111,6 +128,16 @@ mod tests {
             assert!(parse(&args).is_err(), "{args:?}");
         }
     }
+    #[test]
+    fn tui_takes_the_rest_of_the_line_as_the_program() {
+        let cli = parse(&["tui", "btm", "--basic", "--config", "x"]).unwrap();
+        assert_eq!(cli.action, Action::Tui);
+        assert_eq!(cli.program, ["btm", "--basic", "--config", "x"]);
+        assert_eq!(cli.config, None);
+        assert!(parse(&["tui"]).is_err());
+        assert!(parse(&["reload", "tui", "btm"]).is_err());
+    }
+
     #[test]
     fn config_paths_need_not_be_utf8() {
         use std::os::unix::ffi::OsStringExt;

@@ -1,30 +1,20 @@
-//! Spike (throwaway): run a TUI program in a centered floating panel, using
-//! Rio's terminal core (`rio-vt`) for the VT state and the PTY.
-//!
-//! ```text
-//! cargo run --release -p tablero --example tui-popup -- btm
-//! ```
-//!
-//! From the bar, point a widget's `on-click` at the built binary:
-//! `on-click = ["/…/target/release/examples/tui-popup", "btm"]`.
+//! `tablero tui PROGRAM [ARGS...]`: run a terminal program in a centered
+//! floating panel, so a widget's `on-click` can open btm, nmtui and the like
+//! without an external terminal emulator.
 //!
 //! The panel is an overlay layer surface with no anchors (the compositor
-//! centers it), sized to 60% × 60% of the output, with exclusive keyboard
-//! focus. It closes when the program exits, or on Ctrl+Shift+Q, which kills
-//! the program. Timings are logged when it closes.
+//! centers it), 60% x 60% of the output, with exclusive keyboard focus. It
+//! closes when the program exits, or on Ctrl+Shift+Q, which kills the program.
+//! Colors, cursor shape and font follow Rio's `config.toml` when there is one.
 //!
-//! rio-vt provides parsing, the grid and the PTY reader thread; everything on
-//! screen (cell painting, glyphs, colors, input encoding) is this file.
+//! Rio's terminal core (`rio-vt`) provides the PTY, the parser, the grid and
+//! the PTY reader thread; this module paints the cells and encodes input.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use calloop::{EventLoop, LoopHandle};
 use calloop_wayland_source::WaylandSource;
@@ -44,7 +34,7 @@ use rio_vt::crosswords::{Crosswords, CrosswordsSize, Mode, TermDamage};
 use rio_vt::event::sync::FairMutex;
 use rio_vt::event::{EventListener, Msg, RioEvent, WindowId, WindowSize};
 use rio_vt::performer::{Machine, State as MachineState};
-use rio_vt::teletypewriter::{self, ChildEvent, EventedPty, ProcessReadWrite, Pty, WinsizeBuilder};
+use rio_vt::teletypewriter::{self, Pty};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -730,99 +720,6 @@ impl EventListener for Proxy {
     }
 }
 
-/// Reads the PTY through a duplicate of its descriptor, counting bytes.
-struct CountingReader {
-    file: File,
-    bytes: Arc<AtomicU64>,
-}
-
-impl Read for CountingReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.file.read(buf)?;
-        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
-}
-
-/// teletypewriter's PTY with a byte-counting reader, so the spike can report
-/// the program's output rate.
-struct CountingPty {
-    pty: Pty,
-    reader: CountingReader,
-}
-
-impl CountingPty {
-    fn new(mut pty: Pty, bytes: Arc<AtomicU64>) -> io::Result<Self> {
-        let file = ProcessReadWrite::reader(&mut pty).try_clone()?;
-        Ok(Self {
-            pty,
-            reader: CountingReader { file, bytes },
-        })
-    }
-}
-
-impl ProcessReadWrite for CountingPty {
-    type Reader = CountingReader;
-    type Writer = <Pty as ProcessReadWrite>::Writer;
-
-    fn reader(&mut self) -> &mut CountingReader {
-        &mut self.reader
-    }
-
-    fn read_token(&self) -> corcovado::Token {
-        ProcessReadWrite::read_token(&self.pty)
-    }
-
-    fn writer(&mut self) -> &mut Self::Writer {
-        ProcessReadWrite::writer(&mut self.pty)
-    }
-
-    fn write_token(&self) -> corcovado::Token {
-        ProcessReadWrite::write_token(&self.pty)
-    }
-
-    fn set_winsize(&mut self, size: WinsizeBuilder) -> io::Result<()> {
-        ProcessReadWrite::set_winsize(&mut self.pty, size)
-    }
-
-    fn register(
-        &mut self,
-        poll: &corcovado::Poll,
-        tokens: &mut dyn Iterator<Item = corcovado::Token>,
-        interest: corcovado::Ready,
-        opts: corcovado::PollOpt,
-    ) -> io::Result<()> {
-        ProcessReadWrite::register(&mut self.pty, poll, tokens, interest, opts)
-    }
-
-    fn reregister(
-        &mut self,
-        poll: &corcovado::Poll,
-        interest: corcovado::Ready,
-        opts: corcovado::PollOpt,
-    ) -> io::Result<()> {
-        ProcessReadWrite::reregister(&mut self.pty, poll, interest, opts)
-    }
-
-    fn deregister(&mut self, poll: &corcovado::Poll) -> io::Result<()> {
-        ProcessReadWrite::deregister(&mut self.pty, poll)
-    }
-}
-
-impl EventedPty for CountingPty {
-    fn shutdown(&mut self) -> io::Result<()> {
-        EventedPty::shutdown(&mut self.pty)
-    }
-
-    fn child_event_token(&self) -> corcovado::Token {
-        self.pty.child_event_token()
-    }
-
-    fn next_child_event(&mut self) -> Option<ChildEvent> {
-        self.pty.next_child_event()
-    }
-}
-
 type Term = Arc<FairMutex<Crosswords<Proxy>>>;
 
 /// The rows to repaint, copied out under the terminal lock.
@@ -885,17 +782,6 @@ fn take_snapshot(
 
 // ---------------------------------------------------------------- app
 
-#[derive(Default)]
-struct Stats {
-    font_load: Duration,
-    spawned: Option<Instant>,
-    first_frame: Option<Duration>,
-    first_content: Option<Duration>,
-    frame_times: Vec<Duration>,
-    changed_lines: Vec<usize>,
-    bytes: Arc<AtomicU64>,
-}
-
 struct App {
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -904,7 +790,6 @@ struct App {
     qh: QueueHandle<App>,
     loop_handle: LoopHandle<'static, App>,
     events: calloop::channel::Sender<Ev>,
-    start: Instant,
 
     layer: Option<LayerSurface>,
     pool: Option<SlotPool>,
@@ -933,10 +818,9 @@ struct App {
     command: Vec<String>,
     term: Option<Term>,
     pty_tx: Option<corcovado::channel::Sender<Msg>>,
-    machine: Option<JoinHandle<(Machine<CountingPty, Proxy>, MachineState)>>,
+    machine: Option<JoinHandle<(Machine<Pty, Proxy>, MachineState)>>,
     child_alive: bool,
 
-    stats: Stats,
     exit: bool,
 }
 
@@ -1019,13 +903,11 @@ impl App {
             ws.width,
             ws.height,
         )?;
-        let pty = CountingPty::new(pty, self.stats.bytes.clone())?;
         let machine = Machine::new(term.clone(), pty, proxy, WindowId::from(0), 0)?;
         self.pty_tx = Some(machine.channel());
         self.machine = Some(machine.spawn());
         self.term = Some(term);
         self.child_alive = true;
-        self.stats.spawned = Some(Instant::now());
         log::info!("spawned {:?}", self.command);
         Ok(())
     }
@@ -1177,7 +1059,6 @@ impl App {
             return;
         }
         self.dirty = false;
-        let started = Instant::now();
         let force_full = std::mem::take(&mut self.force_full);
         let Some(term) = self.term.clone() else {
             return;
@@ -1226,15 +1107,7 @@ impl App {
             ),
             _ => (0, 0, self.frame.w as i32, self.frame.h as i32),
         };
-        if self.commit(damage) {
-            let elapsed = self.start.elapsed();
-            self.stats.first_frame.get_or_insert(elapsed);
-            if self.stats.bytes.load(Ordering::Relaxed) > 0 {
-                self.stats.first_content.get_or_insert(elapsed);
-            }
-            self.stats.frame_times.push(started.elapsed());
-            self.stats.changed_lines.push(snap.lines.len());
-        }
+        self.commit(damage);
     }
 
     fn commit(&mut self, (x, y, w, h): (i32, i32, i32, i32)) -> bool {
@@ -1280,43 +1153,6 @@ impl App {
         }
         if let Some(handle) = self.machine.take() {
             let _ = handle.join();
-        }
-    }
-
-    fn report(&mut self) {
-        let s = &mut self.stats;
-        let ms = |d: Duration| d.as_secs_f64() * 1e3;
-        log::info!("font load: {:.1}ms", ms(s.font_load));
-        if let Some(d) = s.first_frame {
-            log::info!("time to first frame: {:.1}ms", ms(d));
-        }
-        if let Some(d) = s.first_content {
-            log::info!("time to first frame with program output: {:.1}ms", ms(d));
-        }
-        if !s.frame_times.is_empty() {
-            s.frame_times.sort_unstable();
-            let n = s.frame_times.len();
-            let pct = |p: usize| s.frame_times[(n * p / 100).min(n - 1)];
-            log::info!(
-                "frames: {n}, paint p50={:.2}ms p95={:.2}ms max={:.2}ms",
-                ms(pct(50)),
-                ms(pct(95)),
-                ms(s.frame_times[n - 1]),
-            );
-            let lines: usize = s.changed_lines.iter().sum();
-            log::info!(
-                "changed lines per frame: mean {:.1} of {}",
-                lines as f64 / n as f64,
-                self.geom.rows
-            );
-        }
-        let bytes = s.bytes.load(Ordering::Relaxed);
-        let secs = s.spawned.map_or(0.0, |t| t.elapsed().as_secs_f64());
-        if secs > 0.0 {
-            log::info!(
-                "program output: {bytes} bytes in {secs:.1}s ({:.0} B/s)",
-                bytes as f64 / secs
-            );
         }
     }
 }
@@ -1590,12 +1426,11 @@ delegate_keyboard!(App);
 delegate_pointer!(App);
 delegate_registry!(App);
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let mut command: Vec<String> = std::env::args().skip(1).collect();
+/// Run `command` (a program and its arguments) in the floating panel until
+/// the program exits or the panel is closed.
+pub fn run(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if command.is_empty() {
-        command.push("btm".to_owned());
+        return Err("tui requires a program".into());
     }
 
     let conn = Connection::connect_to_env()?;
@@ -1616,10 +1451,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(|e| e.error)?;
 
-    let font_started = Instant::now();
     let look = load_rio();
     let font = Font::new(look.font_family.as_deref());
-    let font_load = font_started.elapsed();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -1629,7 +1462,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         qh: qh.clone(),
         loop_handle: event_loop.handle(),
         events,
-        start,
         layer: None,
         pool: None,
         buffer: None,
@@ -1656,10 +1488,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pty_tx: None,
         machine: None,
         child_alive: false,
-        stats: Stats {
-            font_load,
-            ..Stats::default()
-        },
         exit: false,
     };
 
@@ -1702,7 +1530,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.buffer = None;
     conn.flush()?;
     app.shutdown();
-    app.report();
     Ok(())
 }
 

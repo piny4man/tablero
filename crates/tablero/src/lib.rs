@@ -39,6 +39,7 @@ pub mod power_profiles;
 pub mod producer;
 pub mod sni;
 pub mod sysmon;
+pub mod tui;
 pub mod updates;
 pub mod upower;
 pub mod volume;
