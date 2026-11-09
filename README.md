@@ -535,8 +535,9 @@ on-click = ["tablero", "tui", "nmtui"]
 ```
 
 - The panel is 60% x 60% of the output, centered, and takes keyboard focus.
-  It closes when the program exits; **Ctrl+Shift+Q** closes it and kills the
-  program. Escape and `q` go to the program. Each click starts a fresh process.
+  It closes when the program exits; **Esc** or **Ctrl+Shift+Q** closes it and
+  kills the program, so the program never sees a bare Esc. `q` goes to the
+  program. Each click starts a fresh process.
 - The program inherits the bar's environment (`HOME`, `XDG_CONFIG_HOME`,
   `PATH`), so it reads its usual `~/.config` files. It runs with
   `TERM=xterm-256color` and `COLORTERM=truecolor`.

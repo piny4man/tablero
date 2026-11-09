@@ -24,7 +24,7 @@ on-click = ["tablero", "tui", "btm"]
   - xterm keys (cursor/app-cursor mode, modified arrows, F1–F12, Ctrl → C0 codes, Alt → ESC prefix).
   - SGR mouse (press, release, drag/motion, wheel) when the program enables it.
   - When mouse reporting is off, the wheel scrolls the scrollback, or sends arrow keys on the alt screen.
-- **Lifecycle:** the panel closes when the program exits. Ctrl+Shift+Q unmaps the panel and sends `Msg::Shutdown`, and teletypewriter then hangs up, kills and reaps the child. Each click starts a fresh process.
+- **Lifecycle:** the panel closes when the program exits. Esc or Ctrl+Shift+Q unmaps the panel and sends `Msg::Shutdown`, and teletypewriter then hangs up, kills and reaps the child. Each click starts a fresh process.
 
 ## User configuration
 

@@ -1491,7 +1491,11 @@ impl WidgetKind {
             WidgetKind::Clock => Box::new(ClockWidget::new(bounds).with_style(style)),
             WidgetKind::Battery => Box::new(BatteryWidget::new(bounds).with_style(style)),
             WidgetKind::Backlight => Box::new(BacklightWidget::new(bounds).with_style(style)),
-            WidgetKind::System => Box::new(SystemWidget::new(bounds).with_style(style)),
+            WidgetKind::System => Box::new(
+                SystemWidget::new(bounds)
+                    .with_style(style)
+                    .with_on_click(on_click),
+            ),
             WidgetKind::Network => Box::new(NetworkWidget::new(bounds).with_style(style)),
             WidgetKind::Tray => Box::new(TrayWidget::new(bounds).with_style(style)),
             WidgetKind::Title => Box::new(
@@ -1671,6 +1675,8 @@ impl Config {
                         WidgetKind::System => Box::new(
                             SystemWidget::new(bounds)
                                 .with_style(style)
+                                .with_on_click(style_config.on_click.clone())
+                                .with_on_click_right(style_config.on_click_right.clone())
                                 .with_format(style_config.format.clone())
                                 .with_tooltip(style_config.tooltip)
                                 .with_tooltip_format(style_config.tooltip_format.clone()),
@@ -2223,6 +2229,50 @@ mod tests {
         assert_eq!(
             dashboard.on_click(99, 16, ClickButton::Right),
             Some(crate::widget::Command::RunProgram("hyprlock".into()))
+        );
+    }
+
+    #[test]
+    fn system_and_network_clicks_reach_the_built_dashboard() {
+        let config = Config::from_toml_str(
+            r#"
+            [bar]
+            modules-left = ["system"]
+            modules-center = []
+            modules-right = ["network"]
+
+            [widget.system]
+            on-click = ["tablero", "tui", "btm"]
+            on-click-right = "htop"
+
+            [widget.network]
+            on-click = ["tablero", "tui", "nmtui"]
+            "#,
+        )
+        .unwrap();
+        let mut dashboard = config.build_dashboard(Bounds::new(0, 0, 400, 32), None);
+        dashboard.update(&crate::widget::Msg::System(
+            crate::widget::SystemStats::new(12.0, 40.0),
+        ));
+        dashboard.update(&crate::widget::Msg::Network(Some(
+            crate::widget::Network::new(crate::widget::NetworkState::Wired, None),
+        )));
+        let mut ctx = RenderContext::new(400, 32);
+        dashboard.layout(&mut ctx, 400, 32);
+
+        let btm = LaunchSpec::with_args("tablero", ["tui".into(), "btm".into()]);
+        let nmtui = LaunchSpec::with_args("tablero", ["tui".into(), "nmtui".into()]);
+        assert_eq!(
+            dashboard.on_click(1, 16, ClickButton::Left),
+            Some(crate::widget::Command::RunProgram(btm))
+        );
+        assert_eq!(
+            dashboard.on_click(1, 16, ClickButton::Right),
+            Some(crate::widget::Command::RunProgram("htop".into()))
+        );
+        assert_eq!(
+            dashboard.on_click(399, 16, ClickButton::Left),
+            Some(crate::widget::Command::RunProgram(nmtui))
         );
     }
 
