@@ -14,8 +14,8 @@ use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
 
 use super::{
-    Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle, draw_builtin_icons, draw_icon_content, expand,
-    measure_icon_content,
+    ClickButton, Command, LaunchSpec, Msg, ResolvedIcon, Tooltip, Widget, WidgetStyle,
+    draw_builtin_icons, draw_icon_content, expand, measure_icon_content,
 };
 
 /// Placeholders accepted by the system `format` and `tooltip-format`.
@@ -119,6 +119,8 @@ pub struct SystemWidget {
     format: Option<String>,
     tooltip: bool,
     tooltip_format: Option<String>,
+    on_click: Option<LaunchSpec>,
+    on_click_right: Option<LaunchSpec>,
 }
 
 impl SystemWidget {
@@ -133,7 +135,21 @@ impl SystemWidget {
             format: None,
             tooltip: true,
             tooltip_format: None,
+            on_click: None,
+            on_click_right: None,
         }
+    }
+
+    /// Set the program a left click spawns; `None` keeps the widget display-only.
+    pub fn with_on_click(mut self, program: Option<LaunchSpec>) -> Self {
+        self.on_click = program;
+        self
+    }
+
+    /// Set the program a right click spawns.
+    pub fn with_on_click_right(mut self, program: Option<LaunchSpec>) -> Self {
+        self.on_click_right = program;
+        self
     }
 
     /// Set the label format (`{icon}`, `{cpu}`, `{mem}`). With built-in icons,
@@ -295,6 +311,17 @@ impl Widget for SystemWidget {
 
     fn set_bounds(&mut self, bounds: Bounds) {
         self.bounds = bounds;
+    }
+
+    fn on_click(&self, px: u32, py: u32, button: ClickButton) -> Option<Command> {
+        if !self.contains(px, py) {
+            return None;
+        }
+        let program = match button {
+            ClickButton::Left => self.on_click.as_ref(),
+            ClickButton::Right => self.on_click_right.as_ref(),
+        }?;
+        Some(Command::RunProgram(program.clone()))
     }
 
     fn tooltip_at(&self, px: u32, py: u32) -> Option<Tooltip> {

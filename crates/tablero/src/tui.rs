@@ -4,7 +4,8 @@
 //!
 //! The panel is an overlay layer surface with no anchors (the compositor
 //! centers it), 60% x 60% of the output, with exclusive keyboard focus. It
-//! closes when the program exits, or on Ctrl+Shift+Q, which kills the program.
+//! closes when the program exits, or on Esc or Ctrl+Shift+Q, which kill the
+//! program.
 //! Colors, cursor shape and font follow Rio's `config.toml` when there is one.
 //!
 //! Rio's terminal core (`rio-vt`) provides the PTY, the parser, the grid and
@@ -129,9 +130,12 @@ fn popup_size((w, h): (i32, i32)) -> (u32, u32) {
     (w as u32 * 3 / 5, h as u32 * 3 / 5)
 }
 
-/// Ctrl+Shift+Q closes the panel; everything else goes to the program.
+/// Ctrl+Shift+Q or a bare Esc closes the panel; everything else goes to the
+/// program, so programs never see a bare Esc (Alt+key still sends ESC-prefixed).
 fn is_close_chord(keysym: Keysym, mods: Mods) -> bool {
-    mods.ctrl && mods.shift && !mods.alt && (keysym == Keysym::q || keysym == Keysym::Q)
+    let bare = !mods.ctrl && !mods.shift && !mods.alt;
+    (bare && keysym == Keysym::Escape)
+        || (mods.ctrl && mods.shift && !mods.alt && (keysym == Keysym::q || keysym == Keysym::Q))
 }
 
 /// The bytes an xterm-compatible terminal sends for a key press, or `None`
@@ -949,7 +953,7 @@ impl App {
 
     fn handle_key(&mut self, event: KeyEvent) {
         if is_close_chord(event.keysym, self.mods) {
-            log::info!("closed with Ctrl+Shift+Q");
+            log::info!("closed with {:?}", event.keysym);
             self.exit = true;
             return;
         }
@@ -1571,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn close_chord_is_ctrl_shift_q_only() {
+    fn close_chord_is_ctrl_shift_q_or_bare_escape() {
         let ctrl_shift = Mods {
             ctrl: true,
             alt: false,
@@ -1581,6 +1585,8 @@ mod tests {
         assert!(is_close_chord(Keysym::q, ctrl_shift));
         assert!(!is_close_chord(Keysym::q, CTRL));
         assert!(!is_close_chord(Keysym::q, NONE));
+        assert!(is_close_chord(Keysym::Escape, NONE));
+        assert!(!is_close_chord(Keysym::Escape, CTRL));
         assert!(!is_close_chord(Keysym::Escape, ctrl_shift));
     }
 
