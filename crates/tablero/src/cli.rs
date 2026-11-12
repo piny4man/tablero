@@ -16,9 +16,11 @@ pub(crate) struct Cli {
     pub config: Option<PathBuf>,
     /// The program and its arguments for `tui`.
     pub program: Vec<String>,
+    /// `tui --hold`: keep the panel open after the program exits.
+    pub hold: bool,
 }
 
-pub(crate) const HELP: &str = "Usage: tablero [reload|restart] [--instance NAME] [--config PATH]\n       tablero tui PROGRAM [ARGS...]\n\nWithout a command, start the bar. Instance defaults to 'default'.\n  reload     Re-read the running instance's config and theme\n  restart    Replace or start the instance in the background\n  tui        Run a terminal program in a centered floating panel\n  --instance NAME  Separate named bar (e.g. dev) in this Wayland session\n  --config PATH    Optional config file; restart retains the running path\n  -h, --help       Show this help\n";
+pub(crate) const HELP: &str = "Usage: tablero [reload|restart] [--instance NAME] [--config PATH]\n       tablero tui [--hold] PROGRAM [ARGS...]\n\nWithout a command, start the bar. Instance defaults to 'default'.\n  reload     Re-read the running instance's config and theme\n  restart    Replace or start the instance in the background\n  tui        Run a terminal program in a centered floating panel\n             --hold: Esc goes to the program; after it exits, wait for a key\n  --instance NAME  Separate named bar (e.g. dev) in this Wayland session\n  --config PATH    Optional config file; restart retains the running path\n  -h, --help       Show this help\n";
 
 impl Cli {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
@@ -28,6 +30,7 @@ impl Cli {
             instance: "default".into(),
             config: None,
             program: Vec::new(),
+            hold: false,
         };
         let mut named = false;
         let mut command = false;
@@ -47,6 +50,11 @@ impl Cli {
                 }
                 Some("tui") if !command && !named && cli.config.is_none() => {
                     cli.action = Action::Tui;
+                    let mut args = args.peekable();
+                    if args.peek().is_some_and(|arg| arg == "--hold") {
+                        cli.hold = true;
+                        args.next();
+                    }
                     cli.program = args
                         .map(|arg| {
                             arg.into_string()
@@ -136,6 +144,20 @@ mod tests {
         assert_eq!(cli.config, None);
         assert!(parse(&["tui"]).is_err());
         assert!(parse(&["reload", "tui", "btm"]).is_err());
+    }
+
+    #[test]
+    fn tui_hold_is_read_only_before_the_program() {
+        let cli = parse(&["tui", "--hold", "anzen", "upgrade"]).unwrap();
+        assert!(cli.hold);
+        assert_eq!(cli.program, ["anzen", "upgrade"]);
+
+        let cli = parse(&["tui", "btm", "--hold"]).unwrap();
+        assert!(!cli.hold);
+        assert_eq!(cli.program, ["btm", "--hold"]);
+
+        assert!(!parse(&["tui", "btm"]).unwrap().hold);
+        assert!(parse(&["tui", "--hold"]).is_err());
     }
 
     #[test]

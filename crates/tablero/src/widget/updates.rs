@@ -1,9 +1,15 @@
 //! Arch Linux package-update widget.
 //!
-//! The asynchronous host producer counts official repository and optional AUR
-//! updates, then emits a normalized [`PackageUpdates`] snapshot. A `None`
-//! snapshot means there is nothing to show: zero updates, a missing helper, and
-//! the pre-first-check state all reserve no space in the bar.
+//! The asynchronous host producer reads `anzen updates --json` and emits an
+//! [`UpdatesStatus`]: either a [`PackageUpdates`] snapshot of the repository,
+//! AUR and vendor lists with any per-source problems, or the reason the check
+//! could not run at all.
+//!
+//! The widget hides only when a trustworthy check found nothing. A problem in
+//! any source, stale repository databases, or a failed check stays visible with
+//! a marker, so a failure never reads as "up to date".
+
+use std::time::Duration;
 
 use crate::icon::BuiltinIcon;
 use crate::render::{Bounds, RenderContext};
@@ -56,27 +62,73 @@ impl PackageUpdate {
     }
 }
 
-/// Available official-repository and AUR package updates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Marker appended to the count when a source has a problem.
+const PROBLEM_MARKER: &str = "!";
+/// Marker appended to the count when the repository databases are stale.
+const STALE_MARKER: &str = "~";
+
+/// One update check: repository, AUR and vendor updates, plus anything that
+/// makes the count incomplete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageUpdates {
     official: Vec<PackageUpdate>,
     aur: Vec<PackageUpdate>,
+    vendor: Vec<PackageUpdate>,
+    problems: Vec<String>,
+    stale_for: Option<Duration>,
 }
 
 impl PackageUpdates {
-    /// Build a snapshot from the two independently collected package lists.
+    /// Build a snapshot from the repository and AUR lists.
     pub fn new(official: Vec<PackageUpdate>, aur: Vec<PackageUpdate>) -> Self {
-        Self { official, aur }
+        Self {
+            official,
+            aur,
+            ..Self::default()
+        }
     }
 
-    /// Official repository updates reported by `checkupdates`.
+    /// Add vendor package updates.
+    pub fn with_vendor(mut self, vendor: Vec<PackageUpdate>) -> Self {
+        self.vendor = vendor;
+        self
+    }
+
+    /// Add the problems that make the count incomplete, one line each.
+    pub fn with_problems(mut self, problems: Vec<String>) -> Self {
+        self.problems = problems;
+        self
+    }
+
+    /// Mark the repository databases stale, last synced `age` before the check.
+    pub fn with_stale_for(mut self, age: Option<Duration>) -> Self {
+        self.stale_for = age;
+        self
+    }
+
+    /// Official repository updates.
     pub fn official(&self) -> &[PackageUpdate] {
         &self.official
     }
 
-    /// AUR updates reported by `paru -Qua`.
+    /// AUR updates.
     pub fn aur(&self) -> &[PackageUpdate] {
         &self.aur
+    }
+
+    /// Vendor package updates.
+    pub fn vendor(&self) -> &[PackageUpdate] {
+        &self.vendor
+    }
+
+    /// Problems that make the count incomplete.
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+
+    /// How old the repository databases were, when they are stale.
+    pub fn stale_for(&self) -> Option<Duration> {
+        self.stale_for
     }
 
     /// Total visible update count, saturating rather than wrapping.
@@ -84,15 +136,31 @@ impl PackageUpdates {
         self.official
             .len()
             .saturating_add(self.aur.len())
+            .saturating_add(self.vendor.len())
             .try_into()
             .unwrap_or(u32::MAX)
     }
+
+    /// Whether a count of zero can be trusted as "up to date".
+    fn is_complete(&self) -> bool {
+        self.problems.is_empty() && self.stale_for.is_none()
+    }
 }
 
-/// A compact available-package count, hidden when no updates are available.
+/// The outcome of one update check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatesStatus {
+    /// The check ran; sources may still report problems.
+    Checked(PackageUpdates),
+    /// The check could not run or its output was unusable.
+    Failed(String),
+}
+
+/// A compact available-package count. Hidden only when a complete check found
+/// no updates; problems and failures stay visible with a marker.
 pub struct UpdatesWidget {
     bounds: Bounds,
-    state: Option<PackageUpdates>,
+    state: Option<UpdatesStatus>,
     style: WidgetStyle,
     format: Option<String>,
     on_click: Option<LaunchSpec>,
@@ -128,22 +196,46 @@ impl UpdatesWidget {
         self
     }
 
-    /// The displayed total, or an empty string while hidden.
+    /// The displayed count with its marker, or an empty string while hidden:
+    /// `!` when a source has a problem or the check failed, `~` when the
+    /// repository databases are stale.
     pub fn label(&self) -> String {
-        self.state
-            .as_ref()
-            .map(|updates| updates.total().to_string())
-            .unwrap_or_default()
+        match &self.state {
+            None => String::new(),
+            Some(UpdatesStatus::Failed(_)) => PROBLEM_MARKER.to_owned(),
+            Some(UpdatesStatus::Checked(updates)) => {
+                if updates.total() == 0 && updates.is_complete() {
+                    return String::new();
+                }
+                let marker = if !updates.problems().is_empty() {
+                    PROBLEM_MARKER
+                } else if updates.stale_for().is_some() {
+                    STALE_MARKER
+                } else {
+                    ""
+                };
+                format!("{}{marker}", updates.total())
+            }
+        }
+    }
+
+    /// Whether the count is incomplete enough to draw in the warn colors.
+    fn needs_attention(&self) -> bool {
+        match &self.state {
+            Some(UpdatesStatus::Failed(_)) => true,
+            Some(UpdatesStatus::Checked(updates)) => !updates.problems().is_empty(),
+            None => false,
+        }
     }
 
     /// The format template — the icon slot marked by `{icon}`, with `{count}`
-    /// already substituted — or empty while no updates are available (so the
-    /// widget reserves no slot).
+    /// already substituted — or empty while hidden (so the widget reserves no
+    /// slot).
     fn template(&self) -> String {
-        let Some(updates) = &self.state else {
+        let count = self.label();
+        if count.is_empty() {
             return String::new();
-        };
-        let count = updates.total().to_string();
+        }
         match &self.format {
             Some(format) => format.replace("{count}", &count),
             None => format!("{{icon}} {count}"),
@@ -157,7 +249,10 @@ impl UpdatesWidget {
     }
 
     fn tooltip_text(&self) -> Option<String> {
-        let updates = self.state.as_ref()?;
+        let updates = match self.state.as_ref()? {
+            UpdatesStatus::Failed(error) => return Some(format!("Update check failed\n{error}")),
+            UpdatesStatus::Checked(updates) => updates,
+        };
         let mut sections = Vec::new();
         if !updates.official().is_empty() {
             sections.push(format_update_section(
@@ -168,6 +263,20 @@ impl UpdatesWidget {
         if !updates.aur().is_empty() {
             sections.push(format_update_section("AUR", updates.aur()));
         }
+        if !updates.vendor().is_empty() {
+            sections.push(format_update_section("Vendor", updates.vendor()));
+        }
+        if !updates.problems().is_empty() {
+            let mut lines = vec!["Incomplete check".to_owned()];
+            lines.extend(updates.problems().iter().cloned());
+            sections.push(lines.join("\n"));
+        }
+        if let Some(age) = updates.stale_for() {
+            sections.push(format!(
+                "Repository databases last synced {} ago",
+                format_age(age)
+            ));
+        }
         (!sections.is_empty()).then(|| sections.join("\n\n"))
     }
 
@@ -176,6 +285,16 @@ impl UpdatesWidget {
             && px < self.bounds.x + self.bounds.width
             && py >= self.bounds.y
             && py < self.bounds.y + self.bounds.height
+    }
+}
+
+/// A coarse age: hours under two days, days after.
+fn format_age(age: Duration) -> String {
+    let hours = age.as_secs() / 3600;
+    if hours < 48 {
+        format!("{hours} h")
+    } else {
+        format!("{} days", hours / 24)
     }
 }
 
@@ -198,10 +317,10 @@ impl Widget for UpdatesWidget {
         let Msg::Updates(next) = msg else {
             return false;
         };
-        if self.state == *next {
+        if self.state.as_ref() == Some(next) {
             return false;
         }
-        self.state = next.clone();
+        self.state = Some(next.clone());
         true
     }
 
@@ -213,7 +332,11 @@ impl Widget for UpdatesWidget {
             self.bounds,
             &self.icon(),
             &self.template(),
-            self.style.base_colors(),
+            if self.needs_attention() {
+                self.style.warn
+            } else {
+                self.style.base_colors()
+            },
         );
     }
 
@@ -268,24 +391,43 @@ mod tests {
         let aur = (0..aur)
             .map(|index| package(&format!("aur-{index}")))
             .collect();
-        Msg::Updates(Some(PackageUpdates::new(official, aur)))
+        checked(PackageUpdates::new(official, aur))
+    }
+
+    fn checked(updates: PackageUpdates) -> Msg {
+        Msg::Updates(UpdatesStatus::Checked(updates))
+    }
+
+    fn widget_with(msg: &Msg) -> UpdatesWidget {
+        let mut widget = UpdatesWidget::new(Bounds::new(10, 0, 100, 32));
+        widget.update(msg);
+        widget
+    }
+
+    fn tooltip(widget: &UpdatesWidget) -> String {
+        widget
+            .tooltip_at(20, 10)
+            .map(|tooltip| tooltip.text)
+            .unwrap_or_default()
     }
 
     #[test]
-    fn total_combines_official_and_aur_counts() {
-        let updates = PackageUpdates::new(vec![package("linux")], vec![package("paru-bin")]);
+    fn total_combines_repository_aur_and_vendor_counts() {
+        let updates = PackageUpdates::new(vec![package("linux")], vec![package("paru-bin")])
+            .with_vendor(vec![package("vendor-app")]);
         assert_eq!(updates.official().len(), 1);
         assert_eq!(updates.aur().len(), 1);
-        assert_eq!(updates.total(), 2);
+        assert_eq!(updates.vendor().len(), 1);
+        assert_eq!(updates.total(), 3);
     }
 
     #[test]
     fn tooltip_groups_packages_with_current_and_new_versions() {
         let mut widget = UpdatesWidget::new(Bounds::new(10, 0, 100, 32));
-        widget.update(&Msg::Updates(Some(PackageUpdates::new(
+        widget.update(&checked(PackageUpdates::new(
             vec![PackageUpdate::new("linux", "6.15.6", "6.15.7")],
             vec![PackageUpdate::new("paru-bin", "2.0.4", "2.0.5")],
-        ))));
+        )));
 
         assert_eq!(
             widget.tooltip_at(20, 10).map(|tooltip| tooltip.text),
@@ -306,12 +448,99 @@ mod tests {
     }
 
     #[test]
-    fn none_hides_a_previous_count() {
-        let mut widget = UpdatesWidget::new(Bounds::new(0, 0, 100, 32));
-        widget.update(&updates(7, 3));
-        assert!(widget.update(&Msg::Updates(None)));
+    fn the_widget_is_hidden_before_the_first_check() {
+        let widget = UpdatesWidget::new(Bounds::new(0, 0, 100, 32));
         assert_eq!(widget.label(), "");
         assert_eq!(widget.template(), "");
+        assert_eq!(tooltip(&widget), "");
+    }
+
+    #[test]
+    fn a_complete_check_with_no_updates_hides_a_previous_count() {
+        let mut widget = widget_with(&updates(7, 3));
+        assert!(widget.update(&updates(0, 0)));
+        assert_eq!(widget.label(), "");
+        assert_eq!(widget.template(), "");
+    }
+
+    #[test]
+    fn a_failed_check_stays_visible_instead_of_reading_as_up_to_date() {
+        let mut widget = widget_with(&updates(7, 3));
+        assert!(widget.update(&Msg::Updates(UpdatesStatus::Failed(
+            "could not run anzen: No such file or directory".to_owned()
+        ))));
+        assert_eq!(widget.label(), "!");
+        assert!(widget.needs_attention());
+        assert_eq!(
+            tooltip(&widget),
+            "Update check failed\ncould not run anzen: No such file or directory"
+        );
+    }
+
+    #[test]
+    fn a_source_problem_marks_the_count_even_at_zero() {
+        let widget =
+            widget_with(&checked(PackageUpdates::default().with_problems(vec![
+                "AUR unavailable: AUR returned 503".to_owned(),
+            ])));
+        assert_eq!(widget.label(), "0!");
+        assert!(widget.needs_attention());
+        assert_eq!(
+            tooltip(&widget),
+            "Incomplete check\nAUR unavailable: AUR returned 503"
+        );
+    }
+
+    #[test]
+    fn a_partial_check_keeps_the_updates_it_found() {
+        let widget = widget_with(&checked(
+            PackageUpdates::new(vec![PackageUpdate::new("linux", "1", "2")], Vec::new())
+                .with_problems(vec!["vendor tool: download failed".to_owned()]),
+        ));
+        assert_eq!(widget.label(), "1!");
+        assert_eq!(
+            tooltip(&widget),
+            "Official repositories (1)\nlinux  1 -> 2\n\nIncomplete check\nvendor tool: download failed"
+        );
+    }
+
+    #[test]
+    fn stale_databases_get_their_own_marker_and_age() {
+        let widget = widget_with(&checked(
+            PackageUpdates::new(vec![package("linux")], Vec::new())
+                .with_stale_for(Some(Duration::from_secs(30 * 3600))),
+        ));
+        assert_eq!(widget.label(), "1~");
+        assert!(!widget.needs_attention());
+        assert!(tooltip(&widget).ends_with("Repository databases last synced 30 h ago"));
+
+        let zero = widget_with(&checked(
+            PackageUpdates::default().with_stale_for(Some(Duration::from_secs(5 * 86_400))),
+        ));
+        assert_eq!(zero.label(), "0~");
+        assert_eq!(
+            tooltip(&zero),
+            "Repository databases last synced 5 days ago"
+        );
+    }
+
+    #[test]
+    fn a_problem_marker_wins_over_the_stale_marker() {
+        let widget = widget_with(&checked(
+            PackageUpdates::default()
+                .with_problems(vec!["refresh failed".to_owned()])
+                .with_stale_for(Some(Duration::from_secs(3 * 86_400))),
+        ));
+        assert_eq!(widget.label(), "0!");
+    }
+
+    #[test]
+    fn the_tooltip_lists_vendor_updates() {
+        let widget = widget_with(&checked(
+            PackageUpdates::default()
+                .with_vendor(vec![PackageUpdate::new("app-deb", "1.0-1", "1.1-1")]),
+        ));
+        assert_eq!(tooltip(&widget), "Vendor (1)\napp-deb  1.0-1 -> 1.1-1");
     }
 
     #[test]

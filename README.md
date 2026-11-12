@@ -154,12 +154,13 @@ and launch the updated binary once; commands cannot control pre-support bars.
     polling, and the widget reserves no slot when no screen backlight is present.
   - **System** — CPU and memory load sampled from procfs. Hovering shows CPU
     load and memory used over total in GiB.
-  - **Updates** — available Arch Linux package updates, checked immediately and
-    every five minutes. **Opt-in** in the built-in config and enabled first in the
-    ARC preset's right zone. Official repository updates come from the safe,
-    isolated database used by `checkupdates`; when `paru` is installed, pending
-    AUR updates from `paru -Qua` are added. The widget hides when the total is
-    zero or the required official check is unavailable.
+  - **Updates** — available Arch Linux package updates from `anzen`, checked
+    immediately and every five minutes. **Opt-in** in the built-in config and
+    enabled first in the ARC preset's right zone. The count covers official
+    repositories, the AUR and vendor packages. It hides only when a complete
+    check finds nothing; an incomplete check shows `!`, stale databases show
+    `~`, and a failed check shows `!` alone, so a failure never looks like
+    "up to date".
   - **Network** — connection state via NetworkManager (disconnected, wired,
     wireless, or unknown), with the Wi-Fi SSID shown when available; blank when
     NetworkManager is unavailable. The built-in Wi-Fi icon follows the access
@@ -538,6 +539,11 @@ on-click = ["tablero", "tui", "nmtui"]
   It closes when the program exits; **Esc** or **Ctrl+Shift+Q** closes it and
   kills the program, so the program never sees a bare Esc. `q` goes to the
   program. Each click starts a fresh process.
+- `tablero tui --hold PROGRAM` is for programs that ask questions and print a
+  result, such as `anzen upgrade`. Esc goes to the program, and only
+  **Ctrl+Shift+Q** force-closes the panel. When the program exits, the panel
+  stays open with a banner naming its exit status, and closes on any key
+  except a bare modifier.
 - The program inherits the bar's environment (`HOME`, `XDG_CONFIG_HOME`,
   `PATH`), so it reads its usual `~/.config` files. It runs with
   `TERM=xterm-256color` and `COLORTERM=truecolor`.
@@ -573,13 +579,11 @@ on-click = "~/.config/hypr/scripts/networkmanager.sh"
 on-click = "/usr/bin/gnome-calendar"
 ```
 
-The Arch package-updates module requires `checkupdates` from the official
-`pacman-contrib` package. `paru` is optional; when available, its AUR count is
-added to the official repository count. No Waybar helper module is required:
-
-```sh
-sudo pacman -S --needed pacman-contrib
-```
+The Arch package-updates module reads `anzen updates --refresh --json`, so
+`anzen` must be on `PATH`. `--refresh` syncs anzen's private copy of the sync
+databases; the system databases are never touched, so a check cannot cause a
+partial upgrade. Tablero only reads: upgrading stays in `anzen upgrade`, which
+reviews and audits every package. No Waybar helper module is required.
 
 ```toml
 [bar]
@@ -587,15 +591,27 @@ modules-right = ["updates", "clock"]
 
 [widget.updates]
 format = "{icon} {count}"
-# Optional direct executable or script; no shell or arguments are implied.
-# on-click = "/path/to/update-system"
+# Open anzen's reviewed upgrade in a floating panel that stays open afterwards.
+on-click = "tablero tui --hold anzen upgrade"
 ```
 
 Only `{count}` and `{icon}` are accepted in `format`. Checks run immediately and
-then every 300 seconds, or every `interval` seconds when that is set. A missing or failed `paru` command falls back to official
-updates; a missing or failed `checkupdates` command hides the module rather than
-presenting a misleading partial total. Hovering the module lists each package's
-installed and available versions, grouped by official repositories and AUR.
+then every 300 seconds, or every `interval` seconds when that is set. Each check
+is bounded by a one-minute timeout that kills anzen and its children. The
+module reads only the JSON report (schema 1); another schema is reported as an
+error rather than guessed at. It shows:
+
+| State | Label | Colors |
+| --- | --- | --- |
+| Complete, nothing pending | hidden | — |
+| Complete, updates pending | `{count}` | normal |
+| A source failed, was unavailable or partial, or the refresh failed | `{count}!` | warn |
+| Repository databases are stale | `{count}~` | normal |
+| anzen could not run or its report was unreadable | `!` | warn |
+
+Hovering the module lists each package's installed and available versions,
+grouped by official repositories, AUR and vendor packages, followed by what
+made the check incomplete and how long ago the databases were last synced.
 
 The polled modules take an optional `interval`, in whole seconds from 1 to
 86400. Every other module is event-driven and wakes only when its source
@@ -606,7 +622,7 @@ changes, so these three are the ones worth slowing down on battery:
 interval = 3    # CPU and memory sample; redraws only when a shown percent moves
 
 [widget.updates]
-interval = 300  # checkupdates / paru run
+interval = 300  # anzen updates --refresh --json run
 
 [widget.hypridle]
 interval = 10   # scan for a hypridle started outside the bar; a running one is
