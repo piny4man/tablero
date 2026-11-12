@@ -56,7 +56,7 @@ pub use tray::{
     TrayIcon, TrayItem, TrayMenu, TrayMenuItem, TrayMenuMode, TrayMenuToggle, TrayMenuToggleKind,
     TrayMenuToggleState, TrayState, TrayStatus, TrayWidget,
 };
-pub use updates::{PackageUpdate, PackageUpdates, UpdatesWidget};
+pub use updates::{PackageUpdate, PackageUpdates, UpdatesStatus, UpdatesWidget};
 pub use volume::{DeviceKind, Volume, VolumeWidget};
 pub use workspaces::{WorkspaceWidget, Workspaces};
 
@@ -152,8 +152,8 @@ pub enum Msg {
     /// The power-profiles-daemon state, with an optional platform overlay;
     /// `None` means neither the daemon nor a known hardware backend is available.
     PowerProfiles(Option<PowerProfilesState>),
-    /// Available Arch repository and AUR updates; `None` hides the widget.
-    Updates(Option<PackageUpdates>),
+    /// The latest `anzen updates` check, or why it could not run.
+    Updates(UpdatesStatus),
     /// Whether the session's Hypridle daemon is currently running.
     Hypridle(Hypridle),
 }

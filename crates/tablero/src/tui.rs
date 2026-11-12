@@ -6,6 +6,11 @@
 //! centers it), 60% x 60% of the output, with exclusive keyboard focus. It
 //! closes when the program exits, or on Esc or Ctrl+Shift+Q, which kill the
 //! program.
+//!
+//! With `--hold`, for programs that need Esc or whose last words matter (an
+//! interactive upgrade): Esc goes to the program and only Ctrl+Shift+Q closes
+//! the panel early. After the program exits, the panel shows its exit status
+//! and closes on the next key.
 //! Colors, cursor shape and font follow Rio's `config.toml` when there is one.
 //!
 //! Rio's terminal core (`rio-vt`) provides the PTY, the parser, the grid and
@@ -34,6 +39,7 @@ use rio_vt::crosswords::style::{Style, StyleFlags};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize, Mode, TermDamage};
 use rio_vt::event::sync::FairMutex;
 use rio_vt::event::{EventListener, Msg, RioEvent, WindowId, WindowSize};
+use rio_vt::performer::handler::Processor;
 use rio_vt::performer::{Machine, State as MachineState};
 use rio_vt::teletypewriter::{self, Pty};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
@@ -132,10 +138,27 @@ fn popup_size((w, h): (i32, i32)) -> (u32, u32) {
 
 /// Ctrl+Shift+Q or a bare Esc closes the panel; everything else goes to the
 /// program, so programs never see a bare Esc (Alt+key still sends ESC-prefixed).
-fn is_close_chord(keysym: Keysym, mods: Mods) -> bool {
+/// With `hold`, a bare Esc goes to the program too.
+fn is_close_chord(keysym: Keysym, mods: Mods, hold: bool) -> bool {
     let bare = !mods.ctrl && !mods.shift && !mods.alt;
-    (bare && keysym == Keysym::Escape)
+    (bare && !hold && keysym == Keysym::Escape)
         || (mods.ctrl && mods.shift && !mods.alt && (keysym == Keysym::q || keysym == Keysym::Q))
+}
+
+/// Whether a key press closes a held panel whose program has exited: any key
+/// but a bare modifier, so reaching for Ctrl does not dismiss the output.
+fn closes_finished_panel(keysym: Keysym) -> bool {
+    !keysym.is_modifier_key()
+}
+
+/// The line written below a held program's output once it exits.
+fn exit_banner(program: &str, status: Option<i32>) -> String {
+    let outcome = match status {
+        Some(0) => "finished".to_owned(),
+        Some(code) => format!("exited with status {code}"),
+        None => "was stopped by a signal".to_owned(),
+    };
+    format!("\x1b[0m\r\n\r\n\x1b[7m {program} {outcome}. Press any key to close. \x1b[0m")
 }
 
 /// The bytes an xterm-compatible terminal sends for a key press, or `None`
@@ -824,6 +847,10 @@ struct App {
     pty_tx: Option<corcovado::channel::Sender<Msg>>,
     machine: Option<JoinHandle<(Machine<Pty, Proxy>, MachineState)>>,
     child_alive: bool,
+    /// `--hold`: Esc goes to the program, and the panel waits after it exits.
+    hold: bool,
+    /// A held program has exited; the next key closes the panel.
+    finished: bool,
 
     exit: bool,
 }
@@ -942,7 +969,11 @@ impl App {
             Ev::Exited(status) => {
                 log::info!("program exited: {status:?}");
                 self.child_alive = false;
-                self.exit = true;
+                if self.hold {
+                    self.show_exit(status);
+                } else {
+                    self.exit = true;
+                }
             }
             Ev::Close => {
                 self.child_alive = false;
@@ -951,8 +982,32 @@ impl App {
         }
     }
 
+    /// Write the exit banner into the grid and wait for a key.
+    fn show_exit(&mut self, status: Option<i32>) {
+        self.finished = true;
+        let Some(term) = self.term.clone() else {
+            self.exit = true;
+            return;
+        };
+        let program = self.command.first().map_or("program", String::as_str);
+        let banner = exit_banner(program, status);
+        {
+            let mut t = term.lock();
+            t.scroll_display(Scroll::Bottom);
+            Processor::default().advance(&mut *t, banner.as_bytes());
+        }
+        self.force_full = true;
+        self.draw();
+    }
+
     fn handle_key(&mut self, event: KeyEvent) {
-        if is_close_chord(event.keysym, self.mods) {
+        if self.finished {
+            if closes_finished_panel(event.keysym) {
+                self.exit = true;
+            }
+            return;
+        }
+        if is_close_chord(event.keysym, self.mods, self.hold) {
             log::info!("closed with {:?}", event.keysym);
             self.exit = true;
             return;
@@ -1432,7 +1487,7 @@ delegate_registry!(App);
 
 /// Run `command` (a program and its arguments) in the floating panel until
 /// the program exits or the panel is closed.
-pub fn run(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(command: Vec<String>, hold: bool) -> Result<(), Box<dyn std::error::Error>> {
     if command.is_empty() {
         return Err("tui requires a program".into());
     }
@@ -1492,6 +1547,8 @@ pub fn run(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         pty_tx: None,
         machine: None,
         child_alive: false,
+        hold,
+        finished: false,
         exit: false,
     };
 
@@ -1581,13 +1638,85 @@ mod tests {
             alt: false,
             shift: true,
         };
-        assert!(is_close_chord(Keysym::Q, ctrl_shift));
-        assert!(is_close_chord(Keysym::q, ctrl_shift));
-        assert!(!is_close_chord(Keysym::q, CTRL));
-        assert!(!is_close_chord(Keysym::q, NONE));
-        assert!(is_close_chord(Keysym::Escape, NONE));
-        assert!(!is_close_chord(Keysym::Escape, CTRL));
-        assert!(!is_close_chord(Keysym::Escape, ctrl_shift));
+        assert!(is_close_chord(Keysym::Q, ctrl_shift, false));
+        assert!(is_close_chord(Keysym::q, ctrl_shift, false));
+        assert!(!is_close_chord(Keysym::q, CTRL, false));
+        assert!(!is_close_chord(Keysym::q, NONE, false));
+        assert!(is_close_chord(Keysym::Escape, NONE, false));
+        assert!(!is_close_chord(Keysym::Escape, CTRL, false));
+        assert!(!is_close_chord(Keysym::Escape, ctrl_shift, false));
+    }
+
+    #[test]
+    fn held_panels_pass_escape_to_the_program_and_keep_the_kill_chord() {
+        let ctrl_shift = Mods {
+            ctrl: true,
+            alt: false,
+            shift: true,
+        };
+        assert!(!is_close_chord(Keysym::Escape, NONE, true));
+        assert!(is_close_chord(Keysym::q, ctrl_shift, true));
+        assert!(is_close_chord(Keysym::Q, ctrl_shift, true));
+    }
+
+    #[test]
+    fn a_finished_held_panel_closes_on_any_key_but_a_bare_modifier() {
+        assert!(closes_finished_panel(Keysym::Return));
+        assert!(closes_finished_panel(Keysym::Escape));
+        assert!(closes_finished_panel(Keysym::a));
+        assert!(!closes_finished_panel(Keysym::Control_L));
+        assert!(!closes_finished_panel(Keysym::Shift_R));
+        assert!(!closes_finished_panel(Keysym::Super_L));
+    }
+
+    #[test]
+    fn exit_banner_names_the_program_and_its_status() {
+        assert!(exit_banner("anzen", Some(0)).contains("anzen finished."));
+        assert!(exit_banner("anzen", Some(2)).contains("anzen exited with status 2."));
+        assert!(exit_banner("anzen", None).contains("stopped by a signal"));
+        assert!(exit_banner("anzen", Some(0)).contains("Press any key to close."));
+    }
+
+    #[test]
+    fn exit_banner_lands_on_its_own_line_in_the_grid() {
+        let (tx, _rx) = calloop::channel::channel::<Ev>();
+        let size = CrosswordsSize {
+            columns: 60,
+            screen_lines: 6,
+            width: 600,
+            height: 120,
+            square_width: 10,
+            square_height: 20,
+        };
+        let mut term = Crosswords::new(
+            size,
+            CursorShape::Block,
+            Proxy(tx),
+            WindowId::from(0),
+            0,
+            SCROLLBACK,
+        );
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"upgrade done");
+        parser.advance(&mut term, exit_banner("anzen", Some(0)).as_bytes());
+        let snap = take_snapshot(&mut term, 6, 60, true, None);
+        let text: Vec<String> = snap
+            .lines
+            .iter()
+            .map(|(_, cells)| {
+                cells
+                    .iter()
+                    .map(|(square, _)| square.c())
+                    .collect::<String>()
+            })
+            .map(|line| line.trim_end_matches([' ', '\0']).to_owned())
+            .collect();
+        assert_eq!(text[0], "upgrade done");
+        assert_eq!(text[1], "");
+        assert!(
+            text[2].contains("anzen finished. Press any key to close."),
+            "{text:?}"
+        );
     }
 
     #[test]

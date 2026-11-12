@@ -88,8 +88,9 @@ background = "#f7080b30"
 foreground = "#ff4a4d"
 border = "#f7080b"
 
-# Hidden when the machine is current. checkupdates supplies official repository
-# updates; when paru is installed its pending AUR updates are added to the count.
+# Hidden when a complete check finds nothing. Counts come from
+# `anzen updates --refresh --json` (repositories, AUR and vendor packages);
+# `!` marks an incomplete or failed check and `~` stale databases.
 [widget.updates]
 background = "#1c0e1ee8"
 foreground = "#f9cf07"

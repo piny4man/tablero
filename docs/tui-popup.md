@@ -25,6 +25,7 @@ on-click = ["tablero", "tui", "btm"]
   - SGR mouse (press, release, drag/motion, wheel) when the program enables it.
   - When mouse reporting is off, the wheel scrolls the scrollback, or sends arrow keys on the alt screen.
 - **Lifecycle:** the panel closes when the program exits. Esc or Ctrl+Shift+Q unmaps the panel and sends `Msg::Shutdown`, and teletypewriter then hangs up, kills and reaps the child. Each click starts a fresh process.
+  - With `--hold`, a bare Esc goes to the program and only Ctrl+Shift+Q closes early. When the program exits, an inverse-video banner with its exit status is fed through the same VT processor, so it lands in the grid like program output, and the next non-modifier key closes the panel.
 
 ## User configuration
 

@@ -48,7 +48,7 @@ fn execute(
         return Ok(());
     }
     if cli.action == cli::Action::Tui {
-        return tablero::tui::run(cli.program);
+        return tablero::tui::run(cli.program, cli.hold);
     }
     let identity = Identity::current(&cli.instance)?;
     match cli.action {
