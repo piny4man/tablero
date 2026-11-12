@@ -154,7 +154,8 @@ and launch the updated binary once; commands cannot control pre-support bars.
     polling, and the widget reserves no slot when no screen backlight is present.
   - **System** — CPU and memory load sampled from procfs. Hovering shows CPU
     load and memory used over total in GiB.
-  - **Updates** — available Arch Linux package updates from `anzen`, checked
+  - **Updates** — available Arch Linux package updates from `anzen`, or from
+    `checkupdates` and `paru` when anzen is not installed, checked
     immediately and every five minutes. **Opt-in** in the built-in config and
     enabled first in the ARC preset's right zone. The count covers official
     repositories, the AUR and vendor packages. It hides only when a complete
@@ -540,7 +541,7 @@ on-click = ["tablero", "tui", "nmtui"]
   kills the program, so the program never sees a bare Esc. `q` goes to the
   program. Each click starts a fresh process.
 - `tablero tui --hold PROGRAM` is for programs that ask questions and print a
-  result, such as `anzen upgrade`. Esc goes to the program, and only
+  result, such as `paru` or `anzen upgrade`. Esc goes to the program, and only
   **Ctrl+Shift+Q** force-closes the panel. When the program exits, the panel
   stays open with a banner naming its exit status, and closes on any key
   except a bare modifier.
@@ -579,11 +580,19 @@ on-click = "~/.config/hypr/scripts/networkmanager.sh"
 on-click = "/usr/bin/gnome-calendar"
 ```
 
-The Arch package-updates module reads `anzen updates --refresh --json`, so
-`anzen` must be on `PATH`. `--refresh` syncs anzen's private copy of the sync
-databases; the system databases are never touched, so a check cannot cause a
-partial upgrade. Tablero only reads: upgrading stays in `anzen upgrade`, which
-reviews and audits every package. No Waybar helper module is required.
+The Arch package-updates module picks its source on every check:
+
+- When `anzen` is on `PATH`, it reads `anzen updates --refresh --json`. The
+  report covers official repositories, the AUR and vendor packages.
+- Otherwise it runs `checkupdates --nocolor` from `pacman-contrib` for the
+  official repositories, and `paru -Qua` for the AUR when paru is installed.
+  Without paru the AUR is not checked. Vendor packages are anzen-only.
+
+Both sources sync a private copy of the sync databases; the system databases
+are never touched, so a check cannot cause a partial upgrade. Only a missing
+`anzen` switches to the fallback: if anzen is installed but fails, the check
+fails rather than silently changing source. Tablero only reads; upgrading
+stays in your package manager. No Waybar helper module is required.
 
 ```toml
 [bar]
@@ -591,23 +600,25 @@ modules-right = ["updates", "clock"]
 
 [widget.updates]
 format = "{icon} {count}"
-# Open anzen's reviewed upgrade in a floating panel that stays open afterwards.
-on-click = "tablero tui --hold anzen upgrade"
+# Upgrade in a floating panel that stays open afterwards.
+on-click = "tablero tui --hold paru"
 ```
+
+With anzen, use `on-click = "tablero tui --hold anzen upgrade"` instead.
 
 Only `{count}` and `{icon}` are accepted in `format`. Checks run immediately and
 then every 300 seconds, or every `interval` seconds when that is set. Each check
-is bounded by a one-minute timeout that kills anzen and its children. The
-module reads only the JSON report (schema 1); another schema is reported as an
-error rather than guessed at. It shows:
+runs each command under a one-minute timeout that kills it and its children.
+With anzen, the module reads only the JSON report (schema 1); another schema is
+reported as an error rather than guessed at. It shows:
 
 | State | Label | Colors |
 | --- | --- | --- |
 | Complete, nothing pending | hidden | — |
 | Complete, updates pending | `{count}` | normal |
-| A source failed, was unavailable or partial, or the refresh failed | `{count}!` | warn |
+| A source failed, was unavailable or partial, or the refresh failed; or paru failed | `{count}!` | warn |
 | Repository databases are stale | `{count}~` | normal |
-| anzen could not run or its report was unreadable | `!` | warn |
+| anzen or `checkupdates` could not run, or the anzen report was unreadable | `!` | warn |
 
 Hovering the module lists each package's installed and available versions,
 grouped by official repositories, AUR and vendor packages, followed by what
@@ -622,7 +633,7 @@ changes, so these three are the ones worth slowing down on battery:
 interval = 3    # CPU and memory sample; redraws only when a shown percent moves
 
 [widget.updates]
-interval = 300  # anzen updates --refresh --json run
+interval = 300  # one package-update check
 
 [widget.hypridle]
 interval = 10   # scan for a hypridle started outside the bar; a running one is

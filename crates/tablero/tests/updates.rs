@@ -1,5 +1,7 @@
-//! Integration coverage for the `anzen updates --json` boundary, using a fake
-//! `anzen` script so no test touches the real package databases.
+//! Integration coverage for the package-update boundary: `anzen updates
+//! --json`, and the `checkupdates`/`paru -Qua` fallback when anzen is not
+//! installed. Every program is a fake script, so no test touches the real
+//! package databases.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,7 +11,9 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop::channel::Event as ChannelEvent;
 use tablero::producer::ProducerBridge;
-use tablero::updates::{UpdatesError, UpdatesProducer, check_once, parse_report};
+use tablero::updates::{
+    UpdatesError, UpdatesProducer, check_fallback, check_once, parse_report, parse_update_lines,
+};
 use tablero::widget::{Msg, PackageUpdates, UpdatesStatus};
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -29,14 +33,19 @@ fn parse(json: &str) -> PackageUpdates {
     parse_report(json.as_bytes()).unwrap()
 }
 
-/// Write an executable `anzen` that runs `body` under `/bin/sh`.
-fn fake_anzen(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("anzen");
+/// Write an executable `name` that runs `body` under `/bin/sh`.
+fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
     fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+/// Write an executable `anzen` that runs `body` under `/bin/sh`.
+fn fake_anzen(dir: &Path, body: &str) -> PathBuf {
+    fake_program(dir, "anzen", body)
 }
 
 /// A fake `anzen` that prints `json` verbatim.
@@ -261,15 +270,57 @@ fn first_message(producer: UpdatesProducer) -> Msg {
 }
 
 #[test]
-fn the_producer_reports_a_missing_anzen_as_a_failed_check() {
+fn without_anzen_the_producer_checks_with_checkupdates_and_paru() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(
+        temp.path(),
+        "checkupdates",
+        "echo 'linux 6.17.1-1 -> 6.17.2-1'",
+    );
+    let paru = fake_program(temp.path(), "paru", "echo 'paru-bin 2.0.4-1 -> 2.0.5-1'");
+    let producer = UpdatesProducer::with_interval(Duration::from_secs(3600))
+        .with_program(temp.path().join("missing-anzen"))
+        .with_fallback_programs(checkupdates, paru)
+        .with_command_timeout(DEADLINE);
+
+    let Msg::Updates(UpdatesStatus::Checked(updates)) = first_message(producer) else {
+        panic!("expected a checked report");
+    };
+    assert_eq!(updates.official()[0].name(), "linux");
+    assert_eq!(updates.aur()[0].name(), "paru-bin");
+    assert!(updates.problems().is_empty());
+}
+
+#[test]
+fn without_anzen_or_checkupdates_the_producer_reports_a_failed_check() {
     let temp = tempfile::tempdir().unwrap();
     let producer = UpdatesProducer::with_interval(Duration::from_secs(3600))
-        .with_program(temp.path().join("missing-anzen"));
+        .with_program(temp.path().join("missing-anzen"))
+        .with_fallback_programs(
+            temp.path().join("missing-checkupdates"),
+            temp.path().join("missing-paru"),
+        );
 
     let Msg::Updates(UpdatesStatus::Failed(error)) = first_message(producer) else {
         panic!("expected a failed check");
     };
-    assert!(error.contains("missing-anzen"), "{error}");
+    assert!(error.contains("missing-checkupdates"), "{error}");
+}
+
+#[test]
+fn a_failing_anzen_never_falls_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let anzen = fake_anzen(temp.path(), "echo 'database locked' >&2; exit 1");
+    let checkupdates = fake_program(temp.path(), "checkupdates", "exit 2");
+    let producer = UpdatesProducer::with_interval(Duration::from_secs(3600))
+        .with_program(anzen)
+        .with_fallback_programs(checkupdates, temp.path().join("missing-paru"))
+        .with_command_timeout(DEADLINE);
+
+    let Msg::Updates(UpdatesStatus::Failed(error)) = first_message(producer) else {
+        panic!("expected a failed check, not a silent fallback");
+    };
+    assert!(error.contains("database locked"), "{error}");
 }
 
 #[test]
@@ -284,4 +335,134 @@ fn the_producer_sends_a_checked_report() {
         panic!("expected a checked report");
     };
     assert_eq!(updates, PackageUpdates::default());
+}
+
+fn fallback(checkupdates: &Path, paru: &Path) -> Result<PackageUpdates, UpdatesError> {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(check_fallback(checkupdates, paru, DEADLINE))
+}
+
+#[test]
+fn update_lines_are_parsed_and_other_lines_skipped() {
+    let updates = parse_update_lines(
+        b"linux 6.17.1-1 -> 6.17.2-1\n:: Synchronizing package databases...\n\n  mesa 1:25.2-1 -> 1:25.3-1  \n",
+    );
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].name(), "linux");
+    assert_eq!(updates[0].current_version(), "6.17.1-1");
+    assert_eq!(updates[0].new_version(), "6.17.2-1");
+    assert_eq!(updates[1].name(), "mesa");
+    assert_eq!(updates[1].new_version(), "1:25.3-1");
+}
+
+#[test]
+fn the_fallback_runs_checkupdates_nocolor_and_paru_qua() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(
+        temp.path(),
+        "checkupdates",
+        r#"[ "$*" = "--nocolor" ] || { echo "unexpected args: $*" >&2; exit 3; }
+echo 'linux 6.17.1-1 -> 6.17.2-1'"#,
+    );
+    let paru = fake_program(
+        temp.path(),
+        "paru",
+        r#"[ "$*" = "-Qua" ] || { echo "unexpected args: $*" >&2; exit 3; }
+echo 'paru-bin 2.0.4-1 -> 2.0.5-1'"#,
+    );
+
+    let updates = fallback(&checkupdates, &paru).unwrap();
+    assert_eq!(updates.official().len(), 1);
+    assert_eq!(updates.aur().len(), 1);
+    assert!(updates.vendor().is_empty());
+    assert!(updates.problems().is_empty());
+}
+
+#[test]
+fn checkupdates_status_two_means_no_repository_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(temp.path(), "checkupdates", "exit 2");
+    let paru = fake_program(temp.path(), "paru", "exit 1");
+
+    let updates = fallback(&checkupdates, &paru).unwrap();
+    assert_eq!(updates, PackageUpdates::default());
+}
+
+#[test]
+fn a_failing_checkupdates_fails_the_check_instead_of_showing_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(
+        temp.path(),
+        "checkupdates",
+        "echo 'Cannot fetch updates' >&2; exit 1",
+    );
+    let paru = fake_program(temp.path(), "paru", "exit 1");
+
+    let error = fallback(&checkupdates, &paru).unwrap_err();
+    assert!(
+        matches!(error, UpdatesError::Failed { code: Some(1), .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Cannot fetch updates"),
+        "{error}"
+    );
+}
+
+#[test]
+fn without_paru_the_aur_is_not_checked_and_not_a_problem() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(temp.path(), "checkupdates", "echo 'linux 1 -> 2'");
+
+    let updates = fallback(&checkupdates, &temp.path().join("missing-paru")).unwrap();
+    assert_eq!(updates.official().len(), 1);
+    assert!(updates.aur().is_empty());
+    assert!(updates.problems().is_empty());
+}
+
+#[test]
+fn a_failing_paru_keeps_the_repository_list_and_reports_a_problem() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(temp.path(), "checkupdates", "echo 'linux 1 -> 2'");
+    let paru = fake_program(
+        temp.path(),
+        "paru",
+        "echo 'error: AUR request failed' >&2; exit 1",
+    );
+
+    let updates = fallback(&checkupdates, &paru).unwrap();
+    assert_eq!(updates.official().len(), 1);
+    assert!(updates.aur().is_empty());
+    assert_eq!(
+        updates.problems(),
+        ["AUR failed: paru exited with status 1: error: AUR request failed"]
+    );
+}
+
+#[test]
+fn a_timed_out_paru_is_a_problem_not_zero_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkupdates = fake_program(temp.path(), "checkupdates", "exit 2");
+    let paru = fake_program(temp.path(), "paru", "sleep 5");
+
+    let updates = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(check_fallback(
+            &checkupdates,
+            &paru,
+            Duration::from_millis(200),
+        ))
+        .unwrap();
+    assert_eq!(updates.problems().len(), 1);
+    assert!(
+        updates.problems()[0].starts_with("AUR failed:"),
+        "{:?}",
+        updates.problems()
+    );
+    assert!(
+        updates.problems()[0].contains("timed out"),
+        "{:?}",
+        updates.problems()
+    );
 }

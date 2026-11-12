@@ -1,6 +1,6 @@
 //! Arch Linux package-update widget.
 //!
-//! The asynchronous host producer reads `anzen updates --json` and emits an
+//! The asynchronous host producer reads anzen or checkupdates/paru and emits an
 //! [`UpdatesStatus`]: either a [`PackageUpdates`] snapshot of the repository,
 //! AUR and vendor lists with any per-source problems, or the reason the check
 //! could not run at all.
