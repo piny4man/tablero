@@ -101,3 +101,51 @@ fn help_does_not_require_a_wayland_session() {
     assert!(result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout).contains("reload|restart"));
 }
+
+/// Regression (NUKE-171): a bar started by `tablero restart` used to leak its
+/// one-shot readiness socket into every click. `tablero tui` then answered a
+/// handshake meant for the bar (or failed when the socket was gone) before it
+/// ever opened a panel. Only the bar itself may connect to it.
+#[test]
+fn restart_handshake_is_answered_only_by_the_bar() {
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("startup.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tablero"))
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env("WAYLAND_DISPLAY", "tablero-test-no-compositor")
+            .env("TABLERO_STARTUP_SOCKET", &socket)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let nobody_connected = |listener: &UnixListener| matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+
+    // No compositor here, so tui fails on Wayland, but must not touch the socket.
+    run(&["tui", "true"]);
+    assert!(
+        nobody_connected(&listener),
+        "tui answered the restart handshake"
+    );
+    let reload = run(&["reload", "--instance", "dev"]);
+    assert!(String::from_utf8_lossy(&reload.stderr).contains("tablero restart --instance dev"));
+    assert!(
+        nobody_connected(&listener),
+        "reload answered the restart handshake"
+    );
+    assert!(run(&["--help"]).status.success());
+    assert!(
+        nobody_connected(&listener),
+        "help answered the restart handshake"
+    );
+
+    // The bar itself still reports through it (here: its Wayland failure).
+    run(&["--instance", "dev"]);
+    let (stream, _) = listener.accept().expect("bar reports startup");
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line).unwrap();
+    assert!(line.starts_with("ERR "), "{line}");
+}

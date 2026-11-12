@@ -14,16 +14,36 @@ fn main() -> ExitCode {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     env_logger::init();
+    // Take the restart handshake before anything can launch a child. It names a
+    // one-shot socket that is gone once this bar reports ready; left in the
+    // environment, every on-click program would inherit it and `tablero tui`
+    // would fail connecting to it (NUKE-171).
+    let startup_path = std::env::var_os(tablero::lifecycle::STARTUP_ENV);
+    // SAFETY: nothing else runs yet. No thread has been spawned (the tokio
+    // runtime, producers and Wayland loop start later), so no concurrent
+    // environment access is possible. Clearing it here, rather than at each
+    // spawn site, covers every child the bar will ever launch.
+    #[expect(
+        unsafe_code,
+        reason = "edition 2024 remove_var; sound while still single-threaded"
+    )]
+    unsafe {
+        std::env::remove_var(tablero::lifecycle::STARTUP_ENV)
+    };
     let mut startup = None;
     let result = (|| -> Result<(), Box<dyn Error>> {
-        if let Some(path) = std::env::var_os(restart::STARTUP_ENV) {
+        let cli = cli::Cli::parse(std::env::args_os().skip(1))?;
+        // Only the bar itself reports readiness; `tui`, `reload` and `restart`
+        // ignore a handshake they were never meant to answer.
+        if cli.action == cli::Action::Run
+            && let Some(path) = startup_path
+        {
             let stream = UnixStream::connect(path)?;
             stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
             startup = Some(stream);
             // A detached session plus null stdio survives the invoking terminal.
             nix::unistd::setsid()?;
         }
-        let cli = cli::Cli::parse(std::env::args_os().skip(1))?;
         execute(cli, startup.as_ref())
     })();
     match result {
