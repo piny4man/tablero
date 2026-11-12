@@ -222,6 +222,26 @@ pub fn format_exit_status(status: std::process::ExitStatus) -> String {
 /// Returns `Ok(())` when the process was started (the waiter owns the rest).
 /// Returns `Err` with a user-facing reason when spawn never starts.
 #[hotpath::measure]
+/// Build the command for an on-click program.
+///
+/// Desktop-launcher hygiene: no stdin (scripts never hang on a closed tty),
+/// discarded stdout (GUI noise), inherited stderr so short-lived script errors
+/// land next to tablero's own logs. kill_on_drop is off so dropping a waiter
+/// handle never kills a long-lived mixer or calendar. The restart handshake
+/// variable is removed explicitly: `main` already clears it, but a click must
+/// never hand a stale readiness socket to a `tablero tui` child.
+fn on_click_command(program: &Path, args: &[String]) -> TokioCommand {
+    let mut command = TokioCommand::new(program);
+    command
+        .args(args)
+        .env_remove(crate::lifecycle::STARTUP_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(false);
+    command
+}
+
 pub async fn spawn_run_program(spec: LaunchSpec) -> Result<(), String> {
     let program = resolve_program(spec.program());
     if is_bare_name(spec.program()) && !program.is_absolute() {
@@ -244,19 +264,7 @@ pub async fn spawn_run_program(spec: LaunchSpec) -> Result<(), String> {
         out
     };
 
-    // Desktop-launcher hygiene: no stdin (scripts never hang on a closed tty),
-    // discarded stdout (GUI noise), inherited stderr so short-lived script
-    // errors land next to tablero's own logs when the bar is journaled or run
-    // from a terminal. kill_on_drop is off so dropping a waiter handle never
-    // kills a long-lived mixer or calendar.
-    let mut command = TokioCommand::new(&program);
-    command
-        .args(spec.args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(false);
-
+    let mut command = on_click_command(&program, spec.args());
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn {display:?}: {error}"))?;
@@ -634,5 +642,22 @@ mod tests {
         let spec = LaunchSpec::parse("gtk-launch org.gnome.Calendar").unwrap();
         assert_eq!(spec.program(), Path::new("gtk-launch"));
         assert_eq!(spec.args(), &["org.gnome.Calendar".to_string()]);
+    }
+
+    #[test]
+    fn on_click_programs_never_inherit_the_restart_handshake() {
+        // Regression (NUKE-171): a bar started by `tablero restart` passed its
+        // readiness socket path to every click, and `tablero tui` children then
+        // failed connecting to the long-gone socket before opening a panel.
+        let command = on_click_command(Path::new("/bin/true"), &[]);
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == crate::lifecycle::STARTUP_ENV && value.is_none());
+        assert!(
+            removed,
+            "on-click command must clear {}",
+            crate::lifecycle::STARTUP_ENV
+        );
     }
 }

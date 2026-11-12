@@ -21,6 +21,12 @@ use std::{
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Environment variable `tablero restart` uses to hand the replacement bar its
+/// one-shot readiness socket. The bar consumes and clears it at startup; it must
+/// never reach anything the bar launches (a `tablero tui` click would otherwise
+/// try to report readiness to a socket that no longer exists).
+pub const STARTUP_ENV: &str = "TABLERO_STARTUP_SOCKET";
+
 /// A control endpoint keyed by runtime directory, Wayland socket and instance.
 #[derive(Clone, Debug)]
 pub struct Identity {

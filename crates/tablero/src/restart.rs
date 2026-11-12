@@ -1,7 +1,8 @@
 //! Background replacement orchestration. Only the target socket can stop a bar.
 use std::{
     error::Error,
-    fs,
+    ffi::OsStr,
+    fs::{self, File},
     io::{self, BufRead, BufReader, Read},
     os::unix::net::UnixListener,
     path::{Path, PathBuf},
@@ -11,7 +12,7 @@ use std::{
 };
 use tablero::lifecycle::{self, Identity, Operation};
 
-pub(crate) const STARTUP_ENV: &str = "TABLERO_STARTUP_SOCKET";
+use tablero::lifecycle::STARTUP_ENV;
 const DEADLINE: Duration = Duration::from_secs(10);
 
 struct StartupSocket(PathBuf);
@@ -87,7 +88,12 @@ fn start_background(
         .env(STARTUP_ENV, &socket.0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(bar_log(name));
+    // Warnings (failed clicks, producer errors) are the point of the log, but
+    // env_logger only prints errors by default. An explicit RUST_LOG wins.
+    if std::env::var_os("RUST_LOG").is_none() {
+        command.env("RUST_LOG", "warn");
+    }
     if let Some(path) = path {
         command.arg("--config").arg(path);
     }
@@ -99,6 +105,48 @@ fn start_background(
         let _ = child.wait();
     }
     result.map_err(Into::into)
+}
+
+/// Where a background bar writes its stderr:
+/// `$XDG_STATE_HOME/tablero/<name>.log`, else `~/.local/state/tablero/<name>.log`.
+/// The instance name is already validated to `[A-Za-z0-9_-]{1,48}`.
+fn log_path_from(state_home: Option<&OsStr>, home: Option<&OsStr>, name: &str) -> Option<PathBuf> {
+    let base = match state_home.filter(|v| !v.is_empty()) {
+        Some(state) => PathBuf::from(state),
+        None => PathBuf::from(home.filter(|v| !v.is_empty())?).join(".local/state"),
+    };
+    Some(base.join("tablero").join(format!("{name}.log")))
+}
+
+/// Start a fresh log, keeping the previous run's as `<name>.log.old` so a crash
+/// is still readable after the restart that follows it. Bounded to two files.
+fn open_log(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    match fs::rename(path, path.with_extension("log.old")) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    File::create(path)
+}
+
+/// The replacement's stderr. Logging is best effort: an unwritable state
+/// directory must never block a restart, so it degrades to /dev/null.
+fn bar_log(name: &str) -> Stdio {
+    let path = log_path_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        name,
+    );
+    match path.map(|path| open_log(&path).map_err(|error| (path, error))) {
+        Some(Ok(file)) => file.into(),
+        Some(Err((path, error))) => {
+            eprintln!("tablero: not logging to {}: {error}", path.display());
+            Stdio::null()
+        }
+        None => Stdio::null(),
+    }
 }
 
 fn wait_ready(listener: &UnixListener, child: &mut Child, timeout: Duration) -> io::Result<()> {
@@ -159,6 +207,42 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(select_config(None, Some(&no_config)), None);
+    }
+
+    #[test]
+    fn bar_log_lives_in_the_xdg_state_dir_per_instance() {
+        assert_eq!(
+            log_path_from(
+                Some(OsStr::new("/state")),
+                Some(OsStr::new("/home/u")),
+                "dev"
+            ),
+            Some("/state/tablero/dev.log".into())
+        );
+        assert_eq!(
+            log_path_from(None, Some(OsStr::new("/home/u")), "default"),
+            Some("/home/u/.local/state/tablero/default.log".into())
+        );
+        // An exported-but-empty XDG_STATE_HOME is treated as unset.
+        assert_eq!(
+            log_path_from(Some(OsStr::new("")), Some(OsStr::new("/home/u")), "default"),
+            Some("/home/u/.local/state/tablero/default.log".into())
+        );
+        assert_eq!(log_path_from(None, None, "default"), None);
+    }
+
+    #[test]
+    fn opening_the_log_keeps_exactly_one_previous_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/tablero/default.log");
+        let old = path.with_extension("log.old");
+        for run in ["first", "second", "third"] {
+            let mut file = open_log(&path).unwrap();
+            file.write_all(run.as_bytes()).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "third");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "second");
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
     }
 
     #[test]

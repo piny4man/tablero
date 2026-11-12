@@ -70,6 +70,10 @@ reports invalid changes without replacing the working bar. If no instance is
 running, it reports an error and suggests `restart`. Adding a widget whose
 producer was not enabled at startup still requires `restart`.
 
+A bar started by `restart` logs to `$XDG_STATE_HOME/tablero/<instance>.log`
+(default `~/.local/state/tablero/default.log`), at `warn` unless `RUST_LOG`
+says otherwise. The previous run's log is kept as `<instance>.log.old`.
+
 Commands target only the **current Wayland session** (`XDG_RUNTIME_DIR` and
 `WAYLAND_DISPLAY`) and the selected instance name, which defaults to `default`.
 One bar process is allowed per name per session; a second normal launch reports
@@ -520,7 +524,8 @@ spawns the file directly (**no shell**) — typical use is
 - If a click shows the hand cursor but nothing happens, run with
   `RUST_LOG=tablero::command=info` (or `warn`): spawn failures and non-zero
   child exits are logged with the resolved path. Child stderr is inherited, so
-  script errors also appear next to tablero's logs.
+  script errors also appear next to tablero's logs. For a bar started by
+  `tablero restart`, check `~/.local/state/tablero/default.log`.
 
 #### Terminal programs in a floating panel
 
