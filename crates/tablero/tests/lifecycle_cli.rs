@@ -3,6 +3,8 @@ use std::process::{Command, Output};
 fn command(runtime: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tablero"))
         .env("XDG_RUNTIME_DIR", runtime)
+        // restart logs the bar here; never touch the real ~/.local/state.
+        .env("XDG_STATE_HOME", runtime.join("state"))
         .env("WAYLAND_DISPLAY", "tablero-test-no-compositor")
         .args(args)
         .output()
@@ -22,6 +24,9 @@ fn restart_reports_child_startup_failure_instead_of_success() {
     assert!(!result.status.success());
     assert!(stderr.contains("startup failed"), "{stderr}");
     assert!(!stderr.contains("not available"), "{stderr}");
+    // The replacement's own error is kept for diagnosis instead of /dev/null.
+    let log = std::fs::read_to_string(dir.path().join("state/tablero/default.log")).unwrap();
+    assert!(log.contains("wayland"), "{log}");
 }
 
 #[test]
@@ -116,6 +121,7 @@ fn restart_handshake_is_answered_only_by_the_bar() {
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_tablero"))
             .env("XDG_RUNTIME_DIR", dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
             .env("WAYLAND_DISPLAY", "tablero-test-no-compositor")
             .env("TABLERO_STARTUP_SOCKET", &socket)
             .args(args)
