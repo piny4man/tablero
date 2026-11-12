@@ -1,15 +1,22 @@
-//! Arch Linux package-update source, backed by anzen.
+//! Arch Linux package-update source.
 //!
-//! Each check runs `anzen updates --refresh --json` directly, without a shell,
-//! bounded by a timeout that kills the whole process group. `--refresh` syncs
-//! anzen's private copy of the sync databases, so the live databases are never
-//! touched and no partial upgrade is possible. The JSON report (schema 1)
-//! carries the repository, AUR and vendor lists and a status per source; any
-//! source that is not `ok` or `skipped` becomes a problem line, so a failed
-//! check is never shown as zero updates.
+//! Each check runs `anzen updates --refresh --json` when anzen is installed.
+//! `--refresh` syncs anzen's private copy of the sync databases, so the live
+//! databases are never touched and no partial upgrade is possible. The JSON
+//! report (schema 1) carries the repository, AUR and vendor lists and a status
+//! per source; any source that is not `ok` or `skipped` becomes a problem
+//! line, so a failed check is never shown as zero updates.
 //!
-//! Tablero only reads. Upgrading stays in `anzen upgrade`, which reviews and
-//! audits every package.
+//! Without anzen on `PATH`, the check falls back to `checkupdates`, which
+//! also syncs a private database copy, plus `paru -Qua` for the AUR when paru
+//! is installed. A failed AUR check is a problem line, not zero updates. The
+//! source is chosen on every check, so installing or removing anzen takes
+//! effect without a restart. Any anzen failure other than "not found" stays a
+//! failed check; it never silently switches source.
+//!
+//! Every command runs directly, without a shell, bounded by a timeout that
+//! kills its whole process group. Tablero only reads; upgrading stays in the
+//! package manager.
 
 use std::error::Error;
 use std::fmt;
@@ -18,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-use log::warn;
+use log::{info, warn};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde::Deserialize;
@@ -33,18 +40,22 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// The only `anzen updates --json` format this reader understands.
 const SCHEMA: u32 = 1;
-/// The arguments of every check.
+/// The arguments of every anzen check.
 pub const ANZEN_ARGS: [&str; 3] = ["updates", "--refresh", "--json"];
+/// The arguments of the fallback repository check.
+pub const CHECKUPDATES_ARGS: [&str; 1] = ["--nocolor"];
+/// The arguments of the fallback AUR check.
+pub const PARU_ARGS: [&str; 1] = ["-Qua"];
 
 /// A failure that leaves no trustworthy report.
 #[derive(Debug)]
 pub enum UpdatesError {
-    /// anzen could not be started.
+    /// A command could not be started.
     Spawn { program: PathBuf, source: io::Error },
-    /// anzen exceeded its execution deadline.
+    /// A command exceeded its execution deadline.
     Timeout { program: PathBuf },
-    /// anzen exited with a failure status. `--json` exits `0` whenever it
-    /// produced a report, so any other status means there is none.
+    /// A command exited with a status that means there is no report: anything
+    /// but `0` for anzen `--json`, anything but `0` or `2` for `checkupdates`.
     Failed {
         program: PathBuf,
         code: Option<i32>,
@@ -87,6 +98,13 @@ impl fmt::Display for UpdatesError {
                 "anzen report schema {schema} is not supported (expected {SCHEMA}); update tablero"
             ),
         }
+    }
+}
+
+impl UpdatesError {
+    /// Whether the program does not exist, as opposed to failing once run.
+    fn is_not_found(&self) -> bool {
+        matches!(self, Self::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
 }
 
@@ -307,20 +325,117 @@ pub async fn check_once(anzen: &Path, deadline: Duration) -> Result<PackageUpdat
     parse_report(&output.stdout)
 }
 
-/// Polls anzen for repository, AUR and vendor updates every five minutes.
+/// Parse `name current -> new` records, as printed by `checkupdates` and
+/// `paru -Qua`. Lines in any other shape are skipped.
+pub fn parse_update_lines(output: &[u8]) -> Vec<PackageUpdate> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let (installed, new_version) = line.trim().split_once(" -> ")?;
+            let (name, current_version) = installed.rsplit_once(' ')?;
+            Some(PackageUpdate::new(
+                name,
+                current_version,
+                new_version.trim(),
+            ))
+        })
+        .collect()
+}
+
+fn status_label(output: &Output) -> String {
+    output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string())
+}
+
+/// Run one fallback check: `checkupdates` for the repositories, then
+/// `paru -Qua` for the AUR.
+///
+/// `checkupdates` is required; its status `2` means no updates. paru is
+/// optional: when it is not installed the AUR is not checked. When it is
+/// installed but fails, the repository list is kept and the failure becomes
+/// a problem line, so the widget shows the count as incomplete.
+#[hotpath::measure]
+pub async fn check_fallback(
+    checkupdates: &Path,
+    paru: &Path,
+    deadline: Duration,
+) -> Result<PackageUpdates, UpdatesError> {
+    let output = command_output(checkupdates, &CHECKUPDATES_ARGS, deadline).await?;
+    let official = match output.status.code() {
+        Some(0) => parse_update_lines(&output.stdout),
+        Some(2) => Vec::new(),
+        code => {
+            return Err(UpdatesError::Failed {
+                program: checkupdates.to_path_buf(),
+                code,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+    };
+
+    let mut problems = Vec::new();
+    let aur = match command_output(paru, &PARU_ARGS, deadline).await {
+        Ok(output) if output.status.success() => parse_update_lines(&output.stdout),
+        // paru exits 1 with no output when nothing is pending.
+        Ok(output)
+            if output.status.code() == Some(1)
+                && output.stdout.trim_ascii().is_empty()
+                && output.stderr.trim_ascii().is_empty() =>
+        {
+            Vec::new()
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut problem = format!(
+                "AUR failed: paru exited with status {}",
+                status_label(&output)
+            );
+            if !stderr.trim().is_empty() {
+                problem.push_str(": ");
+                problem.push_str(stderr.trim());
+            }
+            problems.push(problem);
+            Vec::new()
+        }
+        Err(error) if error.is_not_found() => Vec::new(),
+        Err(error) => {
+            problems.push(format!("AUR failed: {error}"));
+            Vec::new()
+        }
+    };
+
+    Ok(PackageUpdates::new(official, aur).with_problems(problems))
+}
+
+/// Which program a check used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Anzen,
+    Fallback,
+}
+
+/// Polls for package updates every five minutes: anzen when installed,
+/// otherwise `checkupdates` and paru.
 pub struct UpdatesProducer {
     interval: Duration,
     command_timeout: Duration,
     anzen: PathBuf,
+    checkupdates: PathBuf,
+    paru: PathBuf,
 }
 
 impl UpdatesProducer {
-    /// Create the production update source, resolving `anzen` through PATH.
+    /// Create the production update source, resolving every program through
+    /// PATH.
     pub fn new() -> Self {
         Self {
             interval: DEFAULT_INTERVAL,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             anzen: PathBuf::from("anzen"),
+            checkupdates: PathBuf::from("checkupdates"),
+            paru: PathBuf::from("paru"),
         }
     }
 
@@ -338,10 +453,36 @@ impl UpdatesProducer {
         self
     }
 
-    /// Bound each check by `deadline` instead of the default minute.
+    /// Use other fallback executables, for tests or a non-PATH install.
+    pub fn with_fallback_programs(
+        mut self,
+        checkupdates: impl Into<PathBuf>,
+        paru: impl Into<PathBuf>,
+    ) -> Self {
+        self.checkupdates = checkupdates.into();
+        self.paru = paru.into();
+        self
+    }
+
+    /// Bound each command by `deadline` instead of the default minute.
     pub fn with_command_timeout(mut self, deadline: Duration) -> Self {
         self.command_timeout = deadline;
         self
+    }
+
+    /// Run one check: anzen, or the fallback when anzen is not installed.
+    pub async fn check(&self) -> Result<PackageUpdates, UpdatesError> {
+        self.check_source().await.1
+    }
+
+    async fn check_source(&self) -> (Source, Result<PackageUpdates, UpdatesError>) {
+        match check_once(&self.anzen, self.command_timeout).await {
+            Err(error) if error.is_not_found() => (
+                Source::Fallback,
+                check_fallback(&self.checkupdates, &self.paru, self.command_timeout).await,
+            ),
+            result => (Source::Anzen, result),
+        }
     }
 }
 
@@ -363,9 +504,23 @@ impl Producer for UpdatesProducer {
 
 async fn run(producer: Box<UpdatesProducer>, tx: MsgSender) -> ProducerResult {
     let mut ticker = interval(producer.interval);
+    let mut last_source = None;
     loop {
         ticker.tick().await;
-        let status = match check_once(&producer.anzen, producer.command_timeout).await {
+        let (source, result) = producer.check_source().await;
+        if last_source != Some(source) {
+            match source {
+                Source::Anzen => info!("updates: checking with {}", producer.anzen.display()),
+                Source::Fallback => info!(
+                    "updates: {} not found, checking with {} and {}",
+                    producer.anzen.display(),
+                    producer.checkupdates.display(),
+                    producer.paru.display()
+                ),
+            }
+            last_source = Some(source);
+        }
+        let status = match result {
             Ok(updates) => UpdatesStatus::Checked(updates),
             Err(error) => {
                 warn!("updates: {error}");

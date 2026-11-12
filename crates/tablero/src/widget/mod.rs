@@ -152,7 +152,7 @@ pub enum Msg {
     /// The power-profiles-daemon state, with an optional platform overlay;
     /// `None` means neither the daemon nor a known hardware backend is available.
     PowerProfiles(Option<PowerProfilesState>),
-    /// The latest `anzen updates` check, or why it could not run.
+    /// The latest package-update check, or why it could not run.
     Updates(UpdatesStatus),
     /// Whether the session's Hypridle daemon is currently running.
     Hypridle(Hypridle),
